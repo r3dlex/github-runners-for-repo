@@ -1,0 +1,13 @@
+services:
+  runner:
+    build:
+      context: ./runner
+      dockerfile: Dockerfile
+    environment:
+      - GITHUB_ACCESS_TOKEN=${GITHUB_ACCESS_TOKEN}
+      - GITHUB_REPOSITORY=${GITHUB_REPOSITORY}
+      - RUNNER_LABELS=${RUNNER_LABELS:-self-hosted,linux,x64}
+      - RUNNER_GROUP=${RUNNER_GROUP:-Default}
+    restart: unless-stopped
+    env_file:
+      - .env
