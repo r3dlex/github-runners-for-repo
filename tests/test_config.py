@@ -65,7 +65,10 @@ class TestLoadConfig:
         assert config.github_repository == "test/repo"
         assert config.runner_count == 3
 
-    def test_load_from_env_file(self, tmp_path):
+    def test_load_from_env_file(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("GITHUB_ACCESS_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+        monkeypatch.delenv("RUNNER_COUNT", raising=False)
         env_file = tmp_path / ".env"
         env_file.write_text(
             "GITHUB_ACCESS_TOKEN=ghp_filetest\n" "GITHUB_REPOSITORY=file/repo\n" "RUNNER_COUNT=2\n"
