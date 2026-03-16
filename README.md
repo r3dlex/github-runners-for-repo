@@ -58,13 +58,23 @@ All commands accept `--env-file` to specify a custom `.env` path.
 
 ## CI Pipelines
 
-Three GitHub Actions workflows run on every push to `main` and on pull requests — zero external dependencies required:
+Three GitHub Actions workflows run on every push to `main` and on pull requests — zero external dependencies required. Pipeline logic is extracted into `tools/pipeline_runner/`, a standalone Python package.
 
 | Workflow | What it does |
 |---|---|
 | **Lint** | Checks formatting and style with Ruff |
 | **Test** | Runs pytest with coverage across Python 3.11, 3.12, 3.13 |
 | **Build** | Builds the package, installs the wheel, and verifies the entry point |
+
+Run pipelines locally:
+
+```bash
+pip install ./tools/pipeline_runner
+pipeline-runner lint          # Check formatting and lint
+pipeline-runner test          # Run tests with coverage
+pipeline-runner build         # Build and verify package
+pipeline-runner all           # All stages in sequence
+```
 
 See [`specs/PIPELINES.md`](specs/PIPELINES.md) for design rationale.
 
@@ -73,6 +83,7 @@ See [`specs/PIPELINES.md`](specs/PIPELINES.md) for design rationale.
 ```
 github_runners_for_repo/   # Python package (CLI, config, GitHub API client, Docker manager)
 runner/                    # Dockerfile and container entrypoint (start.sh)
+tools/pipeline_runner/     # CI pipeline runner library (zero-dependency)
 tests/                     # Pytest suite (mocked, no live API calls)
 specs/                     # Architecture and pipeline documentation
 .github/workflows/         # CI pipelines (lint, test, build)
@@ -81,7 +92,14 @@ specs/                     # Architecture and pipeline documentation
 ## Development
 
 ```bash
-poetry install                # Install all dependencies
+poetry install                          # Install all dependencies
+pip install ./tools/pipeline_runner     # Install pipeline runner
+pipeline-runner all                     # Run full CI locally
+```
+
+Or run tools directly:
+
+```bash
 poetry run pytest             # Run tests
 poetry run pytest --cov       # Run tests with coverage
 poetry run ruff check .       # Lint

@@ -37,16 +37,23 @@ Communicate at the right level of detail:
 # Install dependencies
 poetry install
 
-# Run tests
-poetry run pytest
+# Install pipeline runner (for local CI)
+pip install ./tools/pipeline_runner
 
-# Run tests with coverage
+# Run full CI locally
+pipeline-runner all
+
+# Or run stages individually
+pipeline-runner lint
+pipeline-runner test
+pipeline-runner build
+
+# Run tests directly
+poetry run pytest
 poetry run pytest --cov=github_runners_for_repo
 
-# Lint
+# Lint / format directly
 poetry run ruff check .
-
-# Format
 poetry run ruff format .
 
 # Run the CLI
@@ -74,12 +81,26 @@ poetry run gh-runners status
 │   ├── config.py                # Configuration from env vars
 │   ├── github_api.py            # GitHub API interactions
 │   └── runner_manager.py        # Docker runner lifecycle
+├── tools/
+│   └── pipeline_runner/         # CI pipeline runner library
+│       ├── pyproject.toml
+│       └── pipeline_runner/
+│           ├── cli.py           # Pipeline CLI entry point
+│           ├── runner.py        # Subprocess helper
+│           ├── lint.py          # Lint stage
+│           ├── test.py          # Test stage
+│           └── build.py         # Build stage
 ├── tests/                       # Test suite
 │   ├── test_cli.py
 │   ├── test_config.py
 │   └── test_github_api.py
-└── specs/                       # Additional documentation
-    └── architecture.md
+├── specs/                       # Documentation
+│   ├── architecture.md
+│   └── PIPELINES.md
+└── .github/workflows/           # CI pipelines
+    ├── lint.yml
+    ├── test.yml
+    └── build.yml
 ```
 
 ### Environment Variables

@@ -19,11 +19,11 @@ jobs:
       - name: Install Poetry
         run: pipx install poetry
 
-      - name: Install dependencies
+      - name: Install project dependencies
         run: poetry install --only dev
 
-      - name: Check formatting
-        run: poetry run ruff format --check .
+      - name: Install pipeline-runner
+        run: pip install ./tools/pipeline_runner
 
       - name: Lint
-        run: poetry run ruff check .
+        run: pipeline-runner lint

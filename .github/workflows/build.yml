@@ -19,16 +19,14 @@ jobs:
       - name: Install Poetry
         run: pipx install poetry
 
-      - name: Install dependencies
+      - name: Install project dependencies
         run: poetry install
 
-      - name: Build package
-        run: poetry build
+      - name: Install pipeline-runner
+        run: pip install ./tools/pipeline_runner
 
-      - name: Verify package contents
-        run: |
-          pip install dist/*.whl
-          gh-runners --help
+      - name: Build
+        run: pipeline-runner build
 
       - uses: actions/upload-artifact@v4
         with:
