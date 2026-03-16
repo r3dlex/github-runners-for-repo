@@ -46,6 +46,7 @@ pipeline-runner all
 # Or run stages individually
 pipeline-runner lint
 pipeline-runner test
+pipeline-runner coverage
 pipeline-runner build
 
 # Run tests directly
@@ -89,6 +90,7 @@ poetry run gh-runners status
 │           ├── runner.py        # Subprocess helper
 │           ├── lint.py          # Lint stage
 │           ├── test.py          # Test stage
+│           ├── coverage.py     # Coverage stage
 │           └── build.py         # Build stage
 ├── tests/                       # Test suite
 │   ├── test_cli.py
@@ -100,6 +102,7 @@ poetry run gh-runners status
 └── .github/workflows/           # CI pipelines
     ├── lint.yml
     ├── test.yml
+    ├── coverage.yml
     └── build.yml
 ```
 

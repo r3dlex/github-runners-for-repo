@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import lint, test, build
+from . import lint, test, coverage, build
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -20,6 +20,13 @@ def main(argv: list[str] | None = None) -> None:
 
     subparsers.add_parser("lint", help="Check formatting and lint rules")
     subparsers.add_parser("test", help="Run test suite with coverage")
+    cov_parser = subparsers.add_parser("coverage", help="Run tests and enforce coverage threshold")
+    cov_parser.add_argument(
+        "--threshold",
+        type=int,
+        default=coverage.DEFAULT_THRESHOLD,
+        help=f"Minimum coverage percentage (default: {coverage.DEFAULT_THRESHOLD})",
+    )
     subparsers.add_parser("build", help="Build and verify the package")
     subparsers.add_parser("all", help="Run all stages in sequence")
 
@@ -27,9 +34,12 @@ def main(argv: list[str] | None = None) -> None:
     project_dir = args.project_dir
 
     stages = {
-        "lint": lint.run,
-        "test": test.run,
-        "build": build.run,
+        "lint": lambda d: lint.run(d),
+        "test": lambda d: test.run(d),
+        "coverage": lambda d: coverage.run(
+            d, threshold=args.threshold if args.stage == "coverage" else coverage.DEFAULT_THRESHOLD
+        ),
+        "build": lambda d: build.run(d),
     }
 
     if args.stage == "all":

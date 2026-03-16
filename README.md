@@ -58,22 +58,25 @@ All commands accept `--env-file` to specify a custom `.env` path.
 
 ## CI Pipelines
 
-Three GitHub Actions workflows run on every push to `main` and on pull requests — zero external dependencies required. Pipeline logic is extracted into `tools/pipeline_runner/`, a standalone Python package.
+Four GitHub Actions workflows run on every push to `main` and on pull requests — zero external dependencies required. Pipeline logic is extracted into `tools/pipeline_runner/`, a standalone Python package.
 
 | Workflow | What it does |
 |---|---|
 | **Lint** | Checks formatting and style with Ruff |
 | **Test** | Runs pytest with coverage across Python 3.11, 3.12, 3.13 |
+| **Coverage** | Enforces minimum 75% test coverage threshold |
 | **Build** | Builds the package, installs the wheel, and verifies the entry point |
 
 Run pipelines locally:
 
 ```bash
 pip install ./tools/pipeline_runner
-pipeline-runner lint          # Check formatting and lint
-pipeline-runner test          # Run tests with coverage
-pipeline-runner build         # Build and verify package
-pipeline-runner all           # All stages in sequence
+pipeline-runner lint                  # Check formatting and lint
+pipeline-runner test                  # Run tests with coverage
+pipeline-runner coverage              # Enforce coverage threshold (default 75%)
+pipeline-runner coverage --threshold 80  # Custom threshold
+pipeline-runner build                 # Build and verify package
+pipeline-runner all                   # All stages in sequence
 ```
 
 See [`specs/PIPELINES.md`](specs/PIPELINES.md) for design rationale.
@@ -86,7 +89,7 @@ runner/                    # Dockerfile and container entrypoint (start.sh)
 tools/pipeline_runner/     # CI pipeline runner library (zero-dependency)
 tests/                     # Pytest suite (mocked, no live API calls)
 specs/                     # Architecture and pipeline documentation
-.github/workflows/         # CI pipelines (lint, test, build)
+.github/workflows/         # CI pipelines (lint, test, coverage, build)
 ```
 
 ## Development

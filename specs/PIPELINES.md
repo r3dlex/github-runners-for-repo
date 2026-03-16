@@ -2,7 +2,7 @@
 
 ## Overview
 
-Three GitHub Actions workflows run on every push to `main` and on pull requests. All are zero-install: they use `actions/setup-python`, `pipx install poetry`, and `pip install ./tools/pipeline_runner` — no pre-configured runners or external services required.
+Four GitHub Actions workflows run on every push to `main` and on pull requests. All are zero-install: they use `actions/setup-python`, `pipx install poetry`, and `pip install ./tools/pipeline_runner` — no pre-configured runners or external services required.
 
 Pipeline logic lives in `tools/pipeline_runner/`, a standalone Python package that the workflows install and invoke via the `pipeline-runner` CLI.
 
@@ -14,8 +14,9 @@ A lightweight CLI that wraps CI stages into repeatable commands:
 |---|---|
 | `pipeline-runner lint` | `ruff format --check .` then `ruff check .` |
 | `pipeline-runner test` | `pytest --cov` with coverage report |
+| `pipeline-runner coverage` | `pytest --cov --cov-fail-under` with enforced threshold |
 | `pipeline-runner build` | `poetry build`, install wheel, verify `gh-runners --help` |
-| `pipeline-runner all` | All three stages in sequence, fails fast |
+| `pipeline-runner all` | All four stages in sequence, fails fast |
 
 ### Local usage
 
@@ -37,6 +38,7 @@ tools/pipeline_runner/
     ├── runner.py               # Subprocess helper
     ├── lint.py                 # Lint stage
     ├── test.py                 # Test stage
+    ├── coverage.py             # Coverage stage
     └── build.py                # Build stage
 ```
 
@@ -58,6 +60,14 @@ Runs the full test suite across Python versions.
 - **Matrix:** Python 3.11, 3.12, 3.13
 - **Fails on:** any test failure
 
+### Coverage (`coverage.yml`)
+
+Enforces a minimum test coverage threshold.
+
+- **Runs:** `pipeline-runner coverage --threshold 75`
+- **Python:** 3.11
+- **Fails on:** coverage below 75%
+
 ### Build (`build.yml`)
 
 Builds and validates the distributable package.
@@ -71,7 +81,10 @@ Builds and validates the distributable package.
 **Why extract a pipeline library?**
 Pipeline logic in YAML is hard to test, debug, and run locally. A Python package makes CI stages reproducible on any machine with `pip install ./tools/pipeline_runner && pipeline-runner all`.
 
-**Why three separate workflows?**
+**Why separate coverage from test?**
+The test workflow runs across a Python version matrix to catch compatibility issues. Coverage only needs to run once (on 3.11) and enforces a threshold gate — mixing them would either duplicate the gate or skip multi-version testing.
+
+**Why four separate workflows?**
 Each concern (style, correctness, packaging) has a distinct failure mode and fix path. Splitting them gives faster feedback — a lint failure doesn't block seeing test results.
 
 **Why `pipx install poetry`?**
