@@ -68,9 +68,7 @@ class TestLoadConfig:
     def test_load_from_env_file(self, tmp_path):
         env_file = tmp_path / ".env"
         env_file.write_text(
-            "GITHUB_ACCESS_TOKEN=ghp_filetest\n"
-            "GITHUB_REPOSITORY=file/repo\n"
-            "RUNNER_COUNT=2\n"
+            "GITHUB_ACCESS_TOKEN=ghp_filetest\n" "GITHUB_REPOSITORY=file/repo\n" "RUNNER_COUNT=2\n"
         )
         config = load_config(str(env_file))
         assert config.github_access_token == "ghp_filetest"

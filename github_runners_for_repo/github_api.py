@@ -24,13 +24,35 @@ def _headers(token: str) -> dict[str, str]:
     }
 
 
+def _check_repo_access(config: RunnerConfig) -> None:
+    """Verify the token can access the repository, raising a clear error if not."""
+    url = f"{GITHUB_API_BASE}/repos/{config.github_repository}"
+    resp = requests.get(url, headers=_headers(config.github_access_token), timeout=30)
+    if resp.status_code == 404:
+        raise GitHubAPIError(
+            f"Repository '{config.github_repository}' not found. Check that:\n"
+            "  1. GITHUB_REPOSITORY is correct (owner/repo, case-sensitive)\n"
+            "  2. Your token has access to this repository\n"
+            "  3. For fine-grained PATs: the token must be granted access to the specific repo\n"
+            "     with 'Administration: Read and write' permission",
+            status_code=404,
+        )
+    if resp.status_code == 401:
+        raise GitHubAPIError(
+            "Authentication failed. Your GITHUB_ACCESS_TOKEN is invalid or expired.",
+            status_code=401,
+        )
+
+
 def get_registration_token(config: RunnerConfig) -> str:
     """Obtain a runner registration token from the GitHub API."""
+    _check_repo_access(config)
     url = f"{GITHUB_API_BASE}/repos/{config.github_repository}/actions/runners/registration-token"
     resp = requests.post(url, headers=_headers(config.github_access_token), timeout=30)
     if resp.status_code != 201:
         raise GitHubAPIError(
-            f"Failed to get registration token: {resp.status_code} {resp.text}",
+            f"Failed to get registration token: {resp.status_code} {resp.text}\n"
+            "  Hint: your token may be missing the 'Administration: Read and write' permission",
             status_code=resp.status_code,
         )
     token = resp.json().get("token")

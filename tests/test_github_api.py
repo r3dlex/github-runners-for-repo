@@ -7,6 +7,7 @@ import pytest
 from github_runners_for_repo.config import RunnerConfig
 from github_runners_for_repo.github_api import (
     GitHubAPIError,
+    _check_repo_access,
     get_registration_token,
     list_runners,
     remove_runner,
@@ -29,9 +30,35 @@ class TestHeaders:
         assert "application/vnd.github.v3+json" in h["Accept"]
 
 
+class TestCheckRepoAccess:
+    @patch("github_runners_for_repo.github_api.requests.get")
+    def test_success(self, mock_get, config):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_get.return_value = mock_resp
+        _check_repo_access(config)  # should not raise
+
+    @patch("github_runners_for_repo.github_api.requests.get")
+    def test_repo_not_found(self, mock_get, config):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_get.return_value = mock_resp
+        with pytest.raises(GitHubAPIError, match="not found"):
+            _check_repo_access(config)
+
+    @patch("github_runners_for_repo.github_api.requests.get")
+    def test_auth_failure(self, mock_get, config):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_get.return_value = mock_resp
+        with pytest.raises(GitHubAPIError, match="Authentication failed"):
+            _check_repo_access(config)
+
+
 class TestGetRegistrationToken:
     @patch("github_runners_for_repo.github_api.requests.post")
-    def test_success(self, mock_post, config):
+    @patch("github_runners_for_repo.github_api._check_repo_access")
+    def test_success(self, mock_check, mock_post, config):
         mock_resp = MagicMock()
         mock_resp.status_code = 201
         mock_resp.json.return_value = {"token": "AABBC123"}
@@ -39,10 +66,12 @@ class TestGetRegistrationToken:
 
         token = get_registration_token(config)
         assert token == "AABBC123"
+        mock_check.assert_called_once_with(config)
         mock_post.assert_called_once()
 
     @patch("github_runners_for_repo.github_api.requests.post")
-    def test_api_failure(self, mock_post, config):
+    @patch("github_runners_for_repo.github_api._check_repo_access")
+    def test_api_failure(self, mock_check, mock_post, config):
         mock_resp = MagicMock()
         mock_resp.status_code = 403
         mock_resp.text = "Forbidden"
@@ -52,7 +81,8 @@ class TestGetRegistrationToken:
             get_registration_token(config)
 
     @patch("github_runners_for_repo.github_api.requests.post")
-    def test_missing_token_in_response(self, mock_post, config):
+    @patch("github_runners_for_repo.github_api._check_repo_access")
+    def test_missing_token_in_response(self, mock_check, mock_post, config):
         mock_resp = MagicMock()
         mock_resp.status_code = 201
         mock_resp.json.return_value = {}
