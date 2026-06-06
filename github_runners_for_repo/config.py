@@ -16,7 +16,7 @@ class RunnerConfig:
     github_repository: str = ""
     github_org: str | None = None
     runner_name_prefix: str = "runner"
-    runner_count: int = 1
+    runner_count: int = 4
     runner_labels: str = "self-hosted,linux,x64"
     runner_group: str = "Default"
     runner_image: str = "github-runner:latest"
@@ -78,7 +78,7 @@ def load_config(env_file: str | None = None) -> RunnerConfig:
         github_repository=os.getenv("GITHUB_REPOSITORY", ""),
         github_org=org,
         runner_name_prefix=os.getenv("RUNNER_NAME_PREFIX", "runner"),
-        runner_count=int(os.getenv("RUNNER_COUNT", "1")),
+        runner_count=int(os.getenv("RUNNER_COUNT", "4")),
         runner_labels=os.getenv("RUNNER_LABELS", "self-hosted,linux,x64"),
         runner_group=os.getenv("RUNNER_GROUP", "Default"),
         runner_image=os.getenv("RUNNER_IMAGE", "github-runner:latest"),
