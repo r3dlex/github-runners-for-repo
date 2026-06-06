@@ -128,8 +128,9 @@ uv run gh-runners build
 
 See `.env.example` for the full list. Key variables:
 
-- `GITHUB_ACCESS_TOKEN` — PAT with `repo` and `admin:org` scopes
-- `GITHUB_REPOSITORY` — Target repo in `owner/repo` format
+- `GITHUB_ACCESS_TOKEN` — PAT with `repo` and (for org-level) `admin:org` scopes
+- `GITHUB_ORG` — Target org slug for org-level runners (mutually exclusive with `GITHUB_REPOSITORY`)
+- `GITHUB_REPOSITORY` — Target repo in `owner/repo` format (mutually exclusive with `GITHUB_ORG`)
 
 ### Architecture
 

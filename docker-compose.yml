@@ -5,7 +5,8 @@ services:
       dockerfile: Dockerfile
     environment:
       - GITHUB_ACCESS_TOKEN=${GITHUB_ACCESS_TOKEN}
-      - GITHUB_REPOSITORY=${GITHUB_REPOSITORY}
+      - GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-}
+      - GITHUB_ORG=${GITHUB_ORG:-}
       - RUNNER_LABELS=${RUNNER_LABELS:-self-hosted,linux,x64}
       - RUNNER_GROUP=${RUNNER_GROUP:-Default}
     restart: unless-stopped

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project provides zero-install, containerized GitHub Actions self-hosted runners scoped to a specific repository. No software needs to be installed on the host machine beyond Docker and Python.
+This project provides zero-install, containerized GitHub Actions self-hosted runners scoped to a repository or organization. No software needs to be installed on the host machine beyond Docker and Python.
 
 ## Components
 
@@ -16,9 +16,9 @@ A Docker image based on Ubuntu 22.04 that includes:
 
 **Entrypoint (`start.sh`):**
 
-1. Reads `GITHUB_REPOSITORY` and `GITHUB_ACCESS_TOKEN` from environment
-2. Calls the GitHub API to obtain a short-lived registration token
-3. Configures the runner agent for the target repository
+1. Reads `GITHUB_ORG` (or `GITHUB_REPOSITORY` as fallback) and `GITHUB_ACCESS_TOKEN` from environment
+2. Calls the GitHub API at the matching endpoint to obtain a short-lived registration token
+3. Configures the runner agent for the target organization or repository
 4. Starts the runner agent in the foreground
 5. Traps `SIGINT`/`SIGTERM` to deregister the runner on shutdown
 
@@ -67,7 +67,7 @@ User runs `gh-runners stop`
 
 ## Security Considerations
 
-- The `GITHUB_ACCESS_TOKEN` (PAT) needs `repo` scope for repo-level runners
+- The `GITHUB_ACCESS_TOKEN` (PAT) needs `repo` scope for repo-level runners; org-level runners additionally need the `admin:org` scope (classic PAT) or `Administration: Read and write` permission on the org (fine-grained PAT)
 - Tokens are passed via environment variables, never baked into images
 - Registration tokens are short-lived (1 hour) and single-use
 - Runners deregister on shutdown to avoid stale entries
