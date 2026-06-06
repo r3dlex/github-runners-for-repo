@@ -27,9 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 COVERAGE_YML = REPO_ROOT / ".github" / "workflows" / "coverage.yml"
 
-PYPROJECT_FAIL_UNDER_RE = re.compile(
-    r"\[tool\.coverage\.report\][^\[]*?fail_under\s*=\s*(\d+)"
-)
+PYPROJECT_FAIL_UNDER_RE = re.compile(r"\[tool\.coverage\.report\][^\[]*?fail_under\s*=\s*(\d+)")
 # Phase B style: `pytest --cov-fail-under=95` or `--cov-fail-under 95`.
 WORKFLOW_COV_FAIL_UNDER_RE = re.compile(r"--cov-fail-under[= ](\d+)")
 # Phase A brownfield: `pipeline-runner coverage --threshold 75`.
@@ -80,8 +78,7 @@ def main() -> int:
         )
         return 1
     print(
-        f"Coverage threshold OK: {py} in pyproject.toml and "
-        f"the coverage workflow ({source})."
+        f"Coverage threshold OK: {py} in pyproject.toml and " f"the coverage workflow ({source})."
     )
     return 0
 

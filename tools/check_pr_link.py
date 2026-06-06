@@ -46,9 +46,7 @@ from typing import Sequence
 # A closing keyword followed by `#<digits>`, on a line by itself or after
 # whitespace. Trailing characters are tolerated (e.g. `Closes #42.`), but
 # a different word in between (`Closes  the  #42`) is not.
-CLOSING_KEYWORD_RE = re.compile(
-    r"(?im)^\s*(?:closes|fixes|resolves)\s+#(\d+)\b"
-)
+CLOSING_KEYWORD_RE = re.compile(r"(?im)^\s*(?:closes|fixes|resolves)\s+#(\d+)\b")
 
 
 def find_issue_number(body: str) -> int | None:

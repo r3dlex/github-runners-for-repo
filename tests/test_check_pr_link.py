@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
+import re
 
 from tools.check_pr_link import check, find_issue_number
 
@@ -70,6 +70,3 @@ def test_docstring_contains_ac21_phrases():
     assert "current issue state, not state at PR-open time" in doc
     assert "valid at open time" in doc
     assert re.search(r"current.*state at job run time", doc) is not None
-
-
-import re

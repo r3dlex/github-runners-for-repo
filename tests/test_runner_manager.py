@@ -76,9 +76,7 @@ class TestStartRunners:
 
     @patch("github_runners_for_repo.runner_manager.subprocess.run")
     @patch("github_runners_for_repo.runner_manager.get_registration_token")
-    def test_repo_format_invalid_exits(
-        self, mock_token, mock_run, config, capsys
-    ):
+    def test_repo_format_invalid_exits(self, mock_token, mock_run, config, capsys):
         bad = RunnerConfig(github_access_token="x", github_repository="noslash")
         with pytest.raises(SystemExit):
             start_runners(bad)
