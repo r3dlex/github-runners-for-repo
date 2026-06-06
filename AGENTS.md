@@ -162,6 +162,32 @@ add `actions/setup-node@v4` to the workflow.
 - 1 approving review is required; admins are not exempt.
 - All 8 CI checks must pass; no merges with red.
 - Run `uvx pre-commit run --all-files` before pushing.
-- uv is the only Python toolchain; do not introduce Poetry or a custom pipeline runner.
-- Architectural decisions live in `.archgate/adrs/` and are enforced by `archgate check`.
-- See [`docs/branch-protection.md`](docs/branch-protection.md) for the live policy, the rollback snippet, and the audit log. The 5 ADRs at `.archgate/adrs/` (ARCH-001..ARCH-005) are the source of truth for governance decisions.
+- uv is the only Python toolchain; do not introduce Poetry or `pipeline-runner`.
+- Architectural decisions live in `.archgate/adrs/` and are enforced by archgate.
+
+### Adding a new check or rule
+
+Governance changes go through the ADR process — never a one-line edit to a
+workflow or a hidden flag. The pattern is:
+
+1. **Author an ADR.** Create `.archgate/adrs/ARCH-NNN-<slug>.md` (decision
+   record) and a sibling `.archgate/adrs/ARCH-NNN-<slug>.rules.ts` (the
+   archgate-enforced rule). Follow the format used by the existing 5 ADRs
+   (see `ARCH-001-pr-only-and-issue-link.md` for the template: context,
+   decision, consequences). Use the next available `ARCH-NNN` number.
+2. **Add the workflow.** If the change introduces a new required check,
+   create `.github/workflows/<name>.yml` whose job name matches the ADR's
+   rule context exactly, then add that job name to the branch protection
+   required-status-checks list via
+   `gh api -X PATCH repos/:owner/:repo/branches/main/protection/required_status_checks`.
+3. **Wire pre-commit.** Mirror the check in `.pre-commit-config.yaml` so it
+   runs locally on `pre-commit` (or `pre-push` for heavy hooks like
+   `pytest --cov` and `pip-audit`). Keep the warm pre-commit budget ≤30s.
+4. **Update docs.** Reflect the new check in `AGENTS.md` and
+   `docs/branch-protection.md`, and reference the new ADR.
+
+The 5 ADRs currently in force are: `ARCH-001-pr-only-and-issue-link`,
+`ARCH-002-main-branch-protection` (single-maintainer caveat included),
+`ARCH-003-uv-only-toolchain`, `ARCH-004-coverage-floor-95`,
+`ARCH-005-stacked-pr-phasing`. See [`docs/branch-protection.md`](docs/branch-protection.md)
+for the live policy, the rollback snippet, and the audit log.
