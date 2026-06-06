@@ -26,4 +26,4 @@ jobs:
         run: pip install ./tools/pipeline_runner
 
       - name: Coverage
-        run: pipeline-runner coverage --threshold 75
+        run: pipeline-runner coverage --threshold 95
