@@ -106,6 +106,16 @@ class TestListRunners:
         assert len(runners) == 1
         assert runners[0]["name"] == "runner-1"
 
+    @patch("github_runners_for_repo.github_api.requests.get")
+    def test_non_200_raises(self, mock_get, config):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.text = "boom"
+        mock_get.return_value = mock_resp
+
+        with pytest.raises(GitHubAPIError, match="500"):
+            list_runners(config)
+
 
 class TestRemoveRunner:
     @patch("github_runners_for_repo.github_api.requests.delete")

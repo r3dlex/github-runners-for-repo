@@ -125,3 +125,27 @@ The system uses Docker containers running the official GitHub Actions runner age
 The Python module provides a CLI wrapper (`gh-runners`) for managing the container lifecycle via `docker compose`.
 
 See `specs/architecture.md` for more details.
+
+## TypeScript runtime for archgate
+
+archgate v0.43.0 ships a bundled TypeScript runtime (bun + node), so the
+`archgate` GH Actions job does not need a separate `actions/setup-node@v4`
+step. The commit message that first introduced `.github/workflows/archgate.yml`
+contains the marker `[archgate-runtime: bundled]` and the workflow file
+itself carries the same comment (`# archgate-runtime: bundled`). If
+archgate's runtime story changes (e.g., a future major version drops the
+bundled runtime), update both this section and the workflow comment, and
+add `actions/setup-node@v4` to the workflow.
+
+## Governance
+
+This repository's branch protection policy is documented in
+[`docs/branch-protection.md`](docs/branch-protection.md). The 5 ADRs at
+`.archgate/adrs/` (ARCH-001..ARCH-005) are the source of truth for
+governance decisions; they are loaded by `archgate check` and their
+`.rules.ts` companions are the live enforcement of those decisions.
+
+> **Interim notice (Phase A):** Poetry and the custom
+> `tools/pipeline_runner/` library are still in use on the branch. The
+> migration to `uv` lands in Phase B. Until then, `poetry run` and
+> `pipeline-runner <stage>` continue to work locally and in CI.

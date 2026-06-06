@@ -31,3 +31,6 @@ target-version = "py311"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.report]
+fail_under = 95

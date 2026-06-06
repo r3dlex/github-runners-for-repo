@@ -1,0 +1,10 @@
+# CODEOWNERS — required reviewers for the repository
+# See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Single-owner repo: every change is reviewed by the owner.
+# When a second maintainer joins, list both handles in the wildcard rule
+# and raise `required_approving_review_count` to 2 in the same ADR
+# amendment (ARCH-002 single-maintainer caveat, AC-20).
+
+# Default owners for everything in the repo
+* @r3dlex

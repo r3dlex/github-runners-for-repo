@@ -1,0 +1,20 @@
+# gitleaks baseline allowlist for the github-runners-for-repo project.
+#
+# This file ships with the `secrets-scan` workflow to prevent first-push
+# false positives on legitimate test fixtures and template content. Each
+# entry is auditable via `git log -- .gitleaks.toml`.
+#
+# Trade-off (per .omc/plans/ralplan-python-modernize-shiftleft.md R11):
+# gitleaks' default rule set is smaller than trufflehog's, so this
+# project accepts a narrower detection surface in exchange for the
+# pre-built gitleaks/gitleaks-action, TOML rules, and no SaaS dependency.
+
+title = "github-runners-for-repo gitleaks config"
+
+[allowlist]
+  description = "Allowlisted paths and patterns for the governance baseline"
+  paths = [
+    '''tests/fixtures/pr_link_fixtures.py''',
+    '''\.omc/specs/deep-interview-python-modernize-shiftleft\.md''',
+    '''\.env\.example''',
+  ]

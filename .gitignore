@@ -194,6 +194,10 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# OMC state and session data (stateless OMC folders are tracked; state/sessions are not)
+.omc/state/
+.omc/sessions/
+
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data

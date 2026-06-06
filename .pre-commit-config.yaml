@@ -1,0 +1,87 @@
+# .pre-commit-config.yaml
+# Mirrors the 8 GH Actions required checks locally.
+# Heavy hooks (pytest --cov, pip-audit) are staged on `pre-push` to keep
+# the inner commit loop fast. The speed budget is `pre-commit run --all-files`
+# <= 30s warm; `pre-push` <= 120s. (See R5 in
+# .omc/plans/ralplan-python-modernize-shiftleft.md.)
+#
+# All hooks use `language: system` so we do not pay for per-hook venvs -
+# the surrounding dev environment provides `uv`, `uvx`, `archgate`, etc.
+#
+# Bootstrap:
+#   uv tool install archgate
+#   uv sync
+#   uvx pre-commit install --hook-type pre-commit --hook-type pre-push
+#   uvx pre-commit run --all-files
+#
+# AC-14: the archgate workflow is invoked via `archgate check` (bundled
+# runtime, no `actions/setup-node@v4` step). The 8 hooks below mirror
+# the 8 required checks in the live policy (AC-2, AC-17).
+---
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+
+repos:
+  - repo: local
+    hooks:
+      - id: lint
+        name: lint (ruff check + format)
+        entry: bash -c 'uv run ruff check . && uv run ruff format --check .'
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: test
+        name: test (pytest)
+        entry: uv run pytest -q
+        language: system
+        pass_filenames: false
+        types: [python]
+        stages: [pre-commit, pre-push]
+
+      - id: coverage
+        name: coverage (pytest --cov, --cov-fail-under=95)
+        entry: bash -c 'uv run pytest --cov=github_runners_for_repo --cov-fail-under=95 -q && uv run python tools/check_cov_threshold_drift.py'
+        language: system
+        pass_filenames: false
+        types: [python]
+        # Heavy hook: stage on pre-push only.
+        stages: [pre-push]
+
+      - id: build
+        name: build (uv build)
+        entry: uv build
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: archgate
+        name: archgate (ADR compliance check)
+        entry: archgate check
+        language: system
+        pass_filenames: false
+        # archgate decides its own scope via .archgate/config.json.
+
+      - id: pr-issue-link
+        name: pr-issue-link (PR body references open issue)
+        entry: python tools/check_pr_link.py --pr-body "$PR_BODY"
+        language: system
+        pass_filenames: false
+        # Disabled at pre-commit time (no PR body yet); the GH Actions
+        # `pr-issue-link` workflow is the live enforcement point.
+
+      - id: ty
+        name: ty (Astral type checker)
+        entry: uv run ty check github_runners_for_repo
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: deptry-pip-audit
+        name: deptry + pip-audit
+        entry: bash -c 'uv run deptry . && uv run pip-audit'
+        language: system
+        pass_filenames: false
+        types: [python]
+        # Heavy hook: stage on pre-push only.
+        stages: [pre-push]
