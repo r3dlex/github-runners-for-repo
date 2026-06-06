@@ -1,0 +1,21 @@
+name: archgate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  archgate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install archgate
+        # archgate v0.43+ ships a bundled TypeScript runtime (bun + node),
+        # so no `actions/setup-node@v4` step is needed.
+        # archgate-runtime: bundled
+        run: |
+          curl -fsSL https://cli.archgate.dev/install.sh | bash
+      - name: archgate check
+        # archgate-runtime: bundled
+        run: archgate check
