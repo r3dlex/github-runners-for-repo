@@ -12,18 +12,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
         with:
-          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Install project dependencies
-        run: poetry install
-
-      - name: Install pipeline-runner
-        run: pip install ./tools/pipeline_runner
+      - name: Install dependencies
+        run: uv sync --frozen
 
       - name: Coverage
-        run: pipeline-runner coverage --threshold 95
+        run: uv run pytest --cov=github_runners_for_repo --cov-report=xml --cov-fail-under=95
+
+      - name: Coverage threshold drift guard (AC-22)
+        run: uv run python tools/check_cov_threshold_drift.py

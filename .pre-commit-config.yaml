@@ -64,11 +64,12 @@ repos:
 
       - id: pr-issue-link
         name: pr-issue-link (PR body references open issue)
-        entry: python tools/check_pr_link.py --pr-body "$PR_BODY"
+        entry: "bash -c 'if [ -z \"${PR_BODY:-}\" ]; then echo \"skipped: PR_BODY not set (pre-commit context)\"; exit 0; fi; python tools/check_pr_link.py --pr-body \"$PR_BODY\"'"
         language: system
         pass_filenames: false
-        # Disabled at pre-commit time (no PR body yet); the GH Actions
-        # `pr-issue-link` workflow is the live enforcement point.
+        # The pre-commit-time invocation is a no-op (no PR body yet). The
+        # GH Actions `pr-issue-link` workflow is the live enforcement
+        # point at PR-open / PR-push time.
 
       - id: ty
         name: ty (Astral type checker)

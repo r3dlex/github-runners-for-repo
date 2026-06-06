@@ -6,21 +6,21 @@ Containerized, zero-install GitHub Actions self-hosted runner manager scoped to 
 
 - Docker and Docker Compose
 - Python 3.11+
-- [Poetry](https://python-poetry.org/)
+- [uv](https://docs.astral.sh/uv/) (the only Python toolchain used by this project)
 - A GitHub Personal Access Token (PAT) with `repo` and `admin:org` scopes (classic PAT) or `Administration: Read and write` permission (fine-grained PAT)
 
 ## Quick Start
 
 ```bash
 # Install dependencies
-poetry install
+uv sync
 
 # Configure environment
 cp .env.example .env
 # Edit .env — set GITHUB_ACCESS_TOKEN and GITHUB_REPOSITORY at minimum
 
 # Start runners
-poetry run gh-runners start
+uv run gh-runners start
 ```
 
 ## Configuration
@@ -58,25 +58,45 @@ All commands accept `--env-file` to specify a custom `.env` path.
 
 ## CI Pipelines
 
-Four GitHub Actions workflows run on every push to `main` and on pull requests — zero external dependencies required. Pipeline logic is extracted into `tools/pipeline_runner/`, a standalone Python package.
+Seven GitHub Actions workflows run on every push to `main` and on pull requests — zero external dependencies required. All workflows use `uv` and run the same commands locally and in CI (no Poetry, no custom pipeline runner).
 
-| Workflow | What it does |
-|---|---|
-| **Lint** | Checks formatting and style with Ruff |
-| **Test** | Runs pytest with coverage across Python 3.11, 3.12, 3.13 |
-| **Coverage** | Enforces minimum 75% test coverage threshold |
-| **Build** | Builds the package, installs the wheel, and verifies the entry point |
+| Workflow | Required check | What it does |
+|---|---|---|
+| **Lint** | `lint` | `uv run ruff check .` + `uv run ruff format --check .` |
+| **Test** | `test` | `uv run pytest` across Python 3.11, 3.12, 3.13 |
+| **Coverage** | `coverage` | `uv run pytest --cov=... --cov-fail-under=95` + drift guard |
+| **Build** | `build` | `uv build` + entry-point verification |
+| **archgate** | `archgate` | `archgate check` against `.archgate/adrs/*.rules.ts` |
+| **pr-issue-link** | `pr-issue-link` | PR body must contain `Closes #N` / `Fixes #N` |
+| **ty** | `ty` | `uv run ty check github_runners_for_repo` |
+| **deptry-pip-audit** | `deptry-pip-audit` | `uv run deptry .` + `uv run pip-audit` |
 
-Run pipelines locally:
+All 8 required checks (the 7 above + `secrets-scan`) run on every PR. See
+[`docs/branch-protection.md`](docs/branch-protection.md) for the policy
+and the audit log.
+
+### Run pipelines locally
 
 ```bash
-pip install ./tools/pipeline_runner
-pipeline-runner lint                  # Check formatting and lint
-pipeline-runner test                  # Run tests with coverage
-pipeline-runner coverage              # Enforce coverage threshold (default 75%)
-pipeline-runner coverage --threshold 80  # Custom threshold
-pipeline-runner build                 # Build and verify package
-pipeline-runner all                   # All stages in sequence
+# Install archgate + project deps (one-time)
+uv tool install archgate
+uv sync
+uvx pre-commit install --hook-type pre-commit --hook-type pre-push
+
+# Mirror all 8 CI checks locally
+uvx pre-commit run --all-files                    # 6 fast hooks
+uvx pre-commit run --hook-stage pre-push --all-files   # + coverage + deptry-pip-audit
+
+# Or run tools directly
+uv run ruff check .              # Lint
+uv run ruff format .             # Format
+uv run pytest                    # Tests
+uv run pytest --cov=github_runners_for_repo --cov-fail-under=95
+uv run ty check github_runners_for_repo
+uv run deptry .
+uv run pip-audit
+uv build                         # Build the wheel
+archgate check                   # ADR compliance
 ```
 
 See [`specs/PIPELINES.md`](specs/PIPELINES.md) for design rationale.
@@ -86,27 +106,27 @@ See [`specs/PIPELINES.md`](specs/PIPELINES.md) for design rationale.
 ```
 github_runners_for_repo/   # Python package (CLI, config, GitHub API client, Docker manager)
 runner/                    # Dockerfile and container entrypoint (start.sh)
-tools/pipeline_runner/     # CI pipeline runner library (zero-dependency)
+tools/                     # check_pr_link.py + check_cov_threshold_drift.py
 tests/                     # Pytest suite (mocked, no live API calls)
 specs/                     # Architecture and pipeline documentation
-.github/workflows/         # CI pipelines (lint, test, coverage, build)
+.archgate/                 # ADRs + archgate rule type definitions
+.github/                   # CODEOWNERS + PR/issue templates + 7 GH Actions workflows
 ```
 
 ## Development
 
 ```bash
-poetry install                          # Install all dependencies
-pip install ./tools/pipeline_runner     # Install pipeline runner
-pipeline-runner all                     # Run full CI locally
+uv sync                            # Install all dependencies
+uvx pre-commit run --all-files     # Run all 8 CI checks locally
 ```
 
 Or run tools directly:
 
 ```bash
-poetry run pytest             # Run tests
-poetry run pytest --cov       # Run tests with coverage
-poetry run ruff check .       # Lint
-poetry run ruff format .      # Format
+uv run pytest             # Run tests
+uv run pytest --cov       # Run tests with coverage
+uv run ruff check .       # Lint
+uv run ruff format .      # Format
 ```
 
 ## License
