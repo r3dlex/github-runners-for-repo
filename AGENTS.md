@@ -23,45 +23,58 @@ Communicate at the right level of detail:
 
 ## Development Workflow
 
+### Bootstrap (one-time, on a fresh clone)
+
+```bash
+# Install archgate globally (provides `archgate check` for pre-commit + CI)
+uv tool install archgate
+
+# Install project + dev dependencies into a uv-managed venv
+uv sync
+
+# Install the pre-commit + pre-push hooks
+uvx pre-commit install --hook-type pre-commit --hook-type pre-push
+
+# Verify all 8 hooks pass on a clean tree
+uvx pre-commit run --all-files
+uvx pre-commit run --hook-stage pre-push --all-files
+```
+
 ### Step-by-Step Protocol
 
 1. **Understand** — Read the relevant code before changing it.
 2. **Change** — Make the minimal change that achieves the goal.
-3. **Test** — Run `poetry run pytest` (or the relevant test command). All tests must pass.
+3. **Test** — Run `uv run pytest` (or the relevant test command). All tests must pass.
 4. **Fix** — If tests fail, fix immediately. Do not commit until green.
 5. **Commit** — Only when tests pass. Use clear, concise commit messages.
+6. **Pre-commit** — `uvx pre-commit run --all-files` mirrors the 8 CI checks locally.
 
 ### Commands
 
 ```bash
 # Install dependencies
-poetry install
+uv sync
 
-# Install pipeline runner (for local CI)
-pip install ./tools/pipeline_runner
+# Run full CI locally (mirrors the 8 GH Actions checks)
+uvx pre-commit run --all-files
+uvx pre-commit run --hook-stage pre-push --all-files
 
-# Run full CI locally
-pipeline-runner all
-
-# Or run stages individually
-pipeline-runner lint
-pipeline-runner test
-pipeline-runner coverage
-pipeline-runner build
-
-# Run tests directly
-poetry run pytest
-poetry run pytest --cov=github_runners_for_repo
-
-# Lint / format directly
-poetry run ruff check .
-poetry run ruff format .
+# Or run tools directly
+uv run pytest
+uv run pytest --cov=github_runners_for_repo --cov-fail-under=95
+uv run ruff check .
+uv run ruff format .
+uv run ty check github_runners_for_repo
+uv run deptry .
+uv run pip-audit
+archgate check
 
 # Run the CLI
-poetry run gh-runners --help
-poetry run gh-runners start
-poetry run gh-runners stop
-poetry run gh-runners status
+uv run gh-runners --help
+uv run gh-runners start
+uv run gh-runners stop
+uv run gh-runners status
+uv run gh-runners build
 ```
 
 ### Project Structure
@@ -69,7 +82,8 @@ poetry run gh-runners status
 ```
 ├── AGENTS.md                    # This file — agent behavior config
 ├── CLAUDE.md                    # Points to AGENTS.md
-├── pyproject.toml               # Poetry project configuration
+├── pyproject.toml               # uv project configuration (PEP 621)
+├── uv.lock                      # Dependency lockfile (single source of truth)
 ├── docker-compose.yml           # Runner container orchestration
 ├── .env.example                 # Environment template (committed)
 ├── .env                         # Actual secrets (NOT committed)
@@ -83,27 +97,31 @@ poetry run gh-runners status
 │   ├── github_api.py            # GitHub API interactions
 │   └── runner_manager.py        # Docker runner lifecycle
 ├── tools/
-│   └── pipeline_runner/         # CI pipeline runner library
-│       ├── pyproject.toml
-│       └── pipeline_runner/
-│           ├── cli.py           # Pipeline CLI entry point
-│           ├── runner.py        # Subprocess helper
-│           ├── lint.py          # Lint stage
-│           ├── test.py          # Test stage
-│           ├── coverage.py     # Coverage stage
-│           └── build.py         # Build stage
+│   ├── check_pr_link.py         # AC-21: pr-issue-link CI script
+│   └── check_cov_threshold_drift.py  # AC-22: coverage drift guard
 ├── tests/                       # Test suite
 │   ├── test_cli.py
 │   ├── test_config.py
-│   └── test_github_api.py
+│   ├── test_github_api.py
+│   ├── test_runner_manager.py
+│   ├── test_check_pr_link.py
+│   └── test_check_cov_threshold_drift.py
 ├── specs/                       # Documentation
 │   ├── architecture.md
 │   └── PIPELINES.md
-└── .github/workflows/           # CI pipelines
-    ├── lint.yml
-    ├── test.yml
-    ├── coverage.yml
-    └── build.yml
+├── .archgate/
+│   ├── adrs/                    # ADR markdown + companion .rules.ts
+│   └── rules.d.ts               # archgate rule type definitions
+├── .github/
+│   ├── workflows/               # 7 GH Actions workflows (CI parity)
+│   ├── CODEOWNERS
+│   ├── PULL_REQUEST_TEMPLATE.md
+│   └── ISSUE_TEMPLATE/          # bug.md + feature.md
+├── .gitleaks.toml               # AC-19: secrets-scan baseline
+├── .pre-commit-config.yaml      # AC-14: 8 local hooks
+├── docs/
+│   └── branch-protection.md     # AC-1: policy + audit log
+└── .omc/                        # OMC artifacts (plans, specs, wiki, drafts, research)
 ```
 
 ### Environment Variables
@@ -139,13 +157,11 @@ add `actions/setup-node@v4` to the workflow.
 
 ## Governance
 
-This repository's branch protection policy is documented in
-[`docs/branch-protection.md`](docs/branch-protection.md). The 5 ADRs at
-`.archgate/adrs/` (ARCH-001..ARCH-005) are the source of truth for
-governance decisions; they are loaded by `archgate check` and their
-`.rules.ts` companions are the live enforcement of those decisions.
-
-> **Interim notice (Phase A):** Poetry and the custom
-> `tools/pipeline_runner/` library are still in use on the branch. The
-> migration to `uv` lands in Phase B. Until then, `poetry run` and
-> `pipeline-runner <stage>` continue to work locally and in CI.
+- All changes land via PR — no direct push to `main`.
+- Every PR must reference an open issue with `Closes #N` / `Fixes #N`.
+- 1 approving review is required; admins are not exempt.
+- All 8 CI checks must pass; no merges with red.
+- Run `uvx pre-commit run --all-files` before pushing.
+- uv is the only Python toolchain; do not introduce Poetry or a custom pipeline runner.
+- Architectural decisions live in `.archgate/adrs/` and are enforced by `archgate check`.
+- See [`docs/branch-protection.md`](docs/branch-protection.md) for the live policy, the rollback snippet, and the audit log. The 5 ADRs at `.archgate/adrs/` (ARCH-001..ARCH-005) are the source of truth for governance decisions.
