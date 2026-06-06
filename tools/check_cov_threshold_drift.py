@@ -77,9 +77,7 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    print(
-        f"Coverage threshold OK: {py} in pyproject.toml and " f"the coverage workflow ({source})."
-    )
+    print(f"Coverage threshold OK: {py} in pyproject.toml and the coverage workflow ({source}).")
     return 0
 
 

@@ -12,21 +12,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
         with:
-          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
 
-      - name: Install Poetry
-        run: pipx install poetry
-
-      - name: Install project dependencies
-        run: poetry install
-
-      - name: Install pipeline-runner
-        run: pip install ./tools/pipeline_runner
+      - name: Install dependencies
+        run: uv sync --frozen
 
       - name: Build
-        run: pipeline-runner build
+        run: uv build
+
+      - name: Verify entry point exists in built wheel
+        run: |
+          python -c "
+          import zipfile, sys
+          with zipfile.ZipFile('dist/' + [f for f in __import__('os').listdir('dist') if f.endswith('.whl')][0]) as z:
+              names = z.namelist()
+              entry = [n for n in names if n.endswith('github_runners_for_repo/cli.py')]
+              assert entry, 'cli.py not found in wheel'
+              print('entry point OK:', entry[0])
+          "
 
       - uses: actions/upload-artifact@v4
         with:

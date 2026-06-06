@@ -71,7 +71,7 @@ class TestLoadConfig:
         monkeypatch.delenv("RUNNER_COUNT", raising=False)
         env_file = tmp_path / ".env"
         env_file.write_text(
-            "GITHUB_ACCESS_TOKEN=ghp_filetest\n" "GITHUB_REPOSITORY=file/repo\n" "RUNNER_COUNT=2\n"
+            "GITHUB_ACCESS_TOKEN=ghp_filetest\nGITHUB_REPOSITORY=file/repo\nRUNNER_COUNT=2\n"
         )
         config = load_config(str(env_file))
         assert config.github_access_token == "ghp_filetest"
