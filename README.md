@@ -1,13 +1,13 @@
 # github-runners-for-repo
 
-Containerized, zero-install GitHub Actions self-hosted runner manager scoped to a single repository. No software needs to be installed on the host beyond Docker and Python.
+Containerized, zero-install GitHub Actions self-hosted runner manager scoped to a repository or organization. No software needs to be installed on the host beyond Docker and Python.
 
 ## Prerequisites
 
-- Docker and Docker Compose
+- Docker and Docker Compose (v2 plugin)
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) (the only Python toolchain used by this project)
-- A GitHub Personal Access Token (PAT) with `repo` and `admin:org` scopes (classic PAT) or `Administration: Read and write` permission (fine-grained PAT)
+- A GitHub Personal Access Token (PAT) with `repo` scope for repo-scoped runners; also add the `admin:org` scope (classic PAT) or `Administration: Read and write` permission for the org (fine-grained PAT) when targeting an organization
 
 ## Quick Start
 
@@ -17,23 +17,67 @@ uv sync
 
 # Configure environment
 cp .env.example .env
-# Edit .env — set GITHUB_ACCESS_TOKEN and GITHUB_REPOSITORY at minimum
+# Edit .env — set GITHUB_ACCESS_TOKEN and exactly one of GITHUB_ORG or GITHUB_REPOSITORY
 
 # Start runners
 uv run gh-runners start
 ```
 
+## Org-level runners
+
+Pick **org-level** when you want runners to serve every repository under an
+organization (for example, all repos under `r3dlex/*`). Pick **repo-level**
+when the runner should only see a single repository.
+
+| | Repo-level | Org-level |
+|---|---|---|
+| `GITHUB_REPOSITORY` | `owner/repo` | (leave empty) |
+| `GITHUB_ORG` | (leave empty) | `owner` |
+| Token scope required | `repo` (classic) or repo-scoped fine-grained | `repo` + `admin:org` (classic) OR `Administration: Read and write` for the org (fine-grained) |
+| Visible to | the one repo | every repo in the org (subject to runner-group restrictions) |
+| API path | `/repos/{owner}/{repo}/actions/runners/...` | `/orgs/{org}/actions/runners/...` |
+
+> **Label collision warning.** When you register org-level runners, every
+> `runs-on: self-hosted` workflow in any repo under the org that matches
+> your labels can start landing on these new runners — a silent behavior
+> change for repos that did not ask for them. The default label set
+> (`self-hosted,linux,x64,r3dlex-org`) includes a project-specific
+> opt-in label (`r3dlex-org`) so existing `runs-on: self-hosted` workflows
+> do **not** silently migrate. Update the opt-in label to match your
+> org, and migrate workflows with `runs-on: <your-label>` when you are
+> ready.
+
+> **Runner groups.** To restrict runner access to specific repos, create
+> a custom runner group in the org settings and set
+> `RUNNER_GROUP=<name>` in `.env`. Runners in the `Default` group are
+> available to every repo in the org.
+
+### Verification
+
+After `uv run gh-runners start` with `GITHUB_ORG=...`, confirm the
+runners are registered at the org level:
+
+```bash
+uv run gh-runners status
+gh api orgs/<your-org>/actions/runners | jq '.runners[] | {name, status, labels: [.labels[].name]}'
+```
+
+You should see `RUNNER_COUNT` runners with `status: "online"` and the
+labels from your `.env`.
+
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in the values:
+Copy `.env.example` to `.env` and fill in the values. `GITHUB_ORG` and
+`GITHUB_REPOSITORY` are mutually exclusive — set exactly one.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `GITHUB_ACCESS_TOKEN` | Yes | — | PAT with `repo` and `admin:org` scopes |
-| `GITHUB_REPOSITORY` | Yes | — | Target repo (`owner/repo`, case-sensitive) |
+| `GITHUB_ACCESS_TOKEN` | Yes | — | PAT with `repo` (and `admin:org` for org-level) scopes |
+| `GITHUB_ORG` | One of | — | Target org slug (case-sensitive) — mutually exclusive with `GITHUB_REPOSITORY` |
+| `GITHUB_REPOSITORY` | One of | — | Target repo (`owner/repo`, case-sensitive) — mutually exclusive with `GITHUB_ORG` |
 | `RUNNER_NAME_PREFIX` | No | `runner` | Prefix for runner names |
 | `RUNNER_COUNT` | No | `1` | Number of runner instances |
-| `RUNNER_LABELS` | No | `self-hosted,linux,x64` | Comma-separated labels |
+| `RUNNER_LABELS` | No | `self-hosted,linux,x64,r3dlex-org` | Comma-separated labels |
 | `RUNNER_GROUP` | No | `Default` | Runner group assignment |
 | `RUNNER_IMAGE` | No | `github-runner:latest` | Docker image name |
 
@@ -50,10 +94,10 @@ All commands accept `--env-file` to specify a custom `.env` path.
 
 ## How It Works
 
-1. The CLI validates configuration and verifies repository access via the GitHub API.
-2. A short-lived registration token is obtained from the GitHub API.
+1. The CLI validates configuration and verifies GitHub API access (org or repo, based on which env var is set).
+2. A short-lived registration token is obtained from the GitHub API at the appropriate endpoint.
 3. Docker Compose launches one or more containers from an Ubuntu 22.04-based image that includes the GitHub Actions runner agent (v2.321.0).
-4. Each container registers itself as an independent self-hosted runner scoped to the configured repository.
+4. Each container registers itself as an independent self-hosted runner scoped to the configured organization or repository.
 5. On shutdown, containers deregister cleanly via the GitHub API to prevent stale entries.
 
 ## CI Pipelines
