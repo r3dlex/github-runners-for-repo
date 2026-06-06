@@ -49,7 +49,7 @@ class TestRunnerConfig:
             github_repository="owner/repo",
         )
         assert config.runner_name_prefix == "runner"
-        assert config.runner_count == 1
+        assert config.runner_count == 4
         assert config.runner_labels == "self-hosted,linux,x64"
         assert config.runner_group == "Default"
 
@@ -82,7 +82,7 @@ class TestOrgScopeProperties:
     def test_org_default_values(self):
         config = RunnerConfig(github_access_token="ghp_t", github_org="r3dlex")
         assert config.runner_name_prefix == "runner"
-        assert config.runner_count == 1
+        assert config.runner_count == 4
         assert config.runner_labels == "self-hosted,linux,x64"
         assert config.runner_group == "Default"
 
@@ -133,6 +133,24 @@ class TestLoadConfig:
         assert config.github_org == "r3dlex"
         assert config.runner_scope == "org"
         assert config.api_path == "orgs/r3dlex/actions/runners"
+
+    def test_runner_count_default_is_4(self):
+        # The dataclass default for runner_count is 4 (per the lead's update).
+        config = RunnerConfig(github_access_token="ghp_t", github_repository="owner/repo")
+        assert config.runner_count == 4
+
+    def test_runner_count_env_overrides_default(self, monkeypatch, tmp_path):
+        # Explicit RUNNER_COUNT=2 in env overrides the new default of 4.
+        # Clear any host-leaked vars first; load_dotenv uses override=False
+        # so test isolation depends on a clean os.environ.
+        for var in ("GITHUB_ACCESS_TOKEN", "GITHUB_REPOSITORY", "GITHUB_ORG", "RUNNER_COUNT"):
+            monkeypatch.delenv(var, raising=False)
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "GITHUB_ACCESS_TOKEN=ghp_envtest\nGITHUB_REPOSITORY=test/repo\nRUNNER_COUNT=2\n"
+        )
+        config = load_config(str(env_file))
+        assert config.runner_count == 2
 
     def test_load_from_env_file(self, tmp_path, monkeypatch):
         monkeypatch.delenv("GITHUB_ACCESS_TOKEN", raising=False)
