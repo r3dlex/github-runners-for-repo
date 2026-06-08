@@ -7,8 +7,12 @@ on:
     branches: [main]
 
 jobs:
-  ty:
-    runs-on: ubuntu-latest
+  _ty-self-hosted:
+    name: "ty (self-hosted)"
+    runs-on: [self-hosted, ubuntu-latest]
+    continue-on-error: true
+    outputs:
+      passed: ${{ steps.mark.outputs.passed }}
     steps:
       - uses: actions/checkout@v4
 
@@ -22,4 +26,35 @@ jobs:
         run: uv sync --frozen
 
       - name: ty check
+        run: uv run ty check github_runners_for_repo
+
+      - id: mark
+        if: success()
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
+
+  ty:
+    name: "ty"
+    needs: _ty-self-hosted
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Route
+        run: echo "self-hosted passed=${{ needs._ty-self-hosted.outputs.passed }}"
+
+      - if: needs._ty-self-hosted.outputs.passed != 'true'
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        if: needs._ty-self-hosted.outputs.passed != 'true'
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        if: needs._ty-self-hosted.outputs.passed != 'true'
+        run: uv sync --frozen
+
+      - name: ty check
+        if: needs._ty-self-hosted.outputs.passed != 'true'
         run: uv run ty check github_runners_for_repo
