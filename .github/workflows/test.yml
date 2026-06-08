@@ -44,7 +44,7 @@ jobs:
         run: echo "passed=true" >> "$GITHUB_OUTPUT"
 
   test:
-    name: "Test"
+    name: "test"
     needs: [_test-self-hosted, _test-gate]
     if: always()
     runs-on: ubuntu-latest

@@ -36,7 +36,7 @@ jobs:
         run: echo "passed=true" >> "$GITHUB_OUTPUT"
 
   lint:
-    name: "Lint"
+    name: "lint"
     needs: _lint-self-hosted
     if: always()
     runs-on: ubuntu-latest

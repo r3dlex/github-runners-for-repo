@@ -52,7 +52,7 @@ jobs:
         run: echo "passed=true" >> "$GITHUB_OUTPUT"
 
   build:
-    name: "Build"
+    name: "build"
     needs: _build-self-hosted
     if: always()
     runs-on: ubuntu-latest

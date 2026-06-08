@@ -38,7 +38,7 @@ jobs:
         run: echo "passed=true" >> "$GITHUB_OUTPUT"
 
   coverage:
-    name: "Coverage"
+    name: "coverage"
     needs: _coverage-self-hosted
     if: always()
     runs-on: ubuntu-latest
