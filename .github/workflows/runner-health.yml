@@ -1,0 +1,15 @@
+name: runner-health
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  heartbeat:
+    runs-on: [self-hosted, ubuntu-latest]
+    timeout-minutes: 5
+    steps:
+      - run: echo "alive on $(hostname) at $(date -u +%FT%TZ)"
+      - run: uname -a
+      - run: docker --version || true
