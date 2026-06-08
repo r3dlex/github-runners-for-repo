@@ -71,10 +71,13 @@ archgate check
 
 # Run the CLI
 uv run gh-runners --help
-uv run gh-runners start
+uv run gh-runners provision
+uv run gh-runners install
+uv run gh-runners configure --name <NAME>
+uv run gh-runners start --service
 uv run gh-runners stop
 uv run gh-runners status
-uv run gh-runners build
+uv run gh-runners remove --name <NAME>
 ```
 
 ### Project Structure
@@ -84,18 +87,16 @@ uv run gh-runners build
 ├── CLAUDE.md                    # Points to AGENTS.md
 ├── pyproject.toml               # uv project configuration (PEP 621)
 ├── uv.lock                      # Dependency lockfile (single source of truth)
-├── docker-compose.yml           # Runner container orchestration
 ├── .env.example                 # Environment template (committed)
 ├── .env                         # Actual secrets (NOT committed)
-├── runner/
-│   ├── Dockerfile               # Runner container image
-│   └── start.sh                 # Container entrypoint script
 ├── github_runners_for_repo/     # Python package
 │   ├── __init__.py
-│   ├── cli.py                   # CLI entry point
+│   ├── cli.py                   # CLI entry point (provision/install/configure/start/stop/status/remove)
 │   ├── config.py                # Configuration from env vars
 │   ├── github_api.py            # GitHub API interactions
-│   └── runner_manager.py        # Docker runner lifecycle
+│   ├── runner_manager.py        # Native actions/runner binary lifecycle
+│   └── scripts/
+│       └── provision-host.sh    # Idempotent host toolchain provisioning (Node/npm, pipx)
 ├── tools/
 │   ├── check_pr_link.py         # AC-21: pr-issue-link CI script
 │   └── check_cov_threshold_drift.py  # AC-22: coverage drift guard
@@ -113,7 +114,7 @@ uv run gh-runners build
 │   ├── adrs/                    # ADR markdown + companion .rules.ts
 │   └── rules.d.ts               # archgate rule type definitions
 ├── .github/
-│   ├── workflows/               # 7 GH Actions workflows (CI parity)
+│   ├── workflows/               # 8 GH Actions workflows (CI parity)
 │   ├── CODEOWNERS
 │   ├── PULL_REQUEST_TEMPLATE.md
 │   └── ISSUE_TEMPLATE/          # bug.md + feature.md
@@ -131,17 +132,44 @@ See `.env.example` for the full list. Key variables:
 - `GITHUB_ACCESS_TOKEN` — PAT with `repo` and (for org-level) `admin:org` scopes
 - `GITHUB_ORG` — Target org slug for org-level runners (mutually exclusive with `GITHUB_REPOSITORY`)
 - `GITHUB_REPOSITORY` — Target repo in `owner/repo` format (mutually exclusive with `GITHUB_ORG`)
+- `RUNNER_LABELS` — Default `--labels` for `configure` (comma-separated)
+- `RUNNER_GROUP` — Default `--runner-group` for `configure` (org-level only)
 
 ### Architecture
 
-The system uses Docker containers running the official GitHub Actions runner agent. Each container:
+The CLI is a thin wrapper around the official `actions/runner` binary. Each
+runner lives in its own directory; the CLI is invoked once per directory to
+manage that single instance. To run N runners, create N directories and run
+the CLI in each. There is no Docker, no custom runner agent, and no
+`actions/runner-images` indirection.
 
-1. Obtains a registration token via the GitHub API
-2. Configures itself as a self-hosted runner for the target repo
-3. Runs the runner agent
-4. Deregisters on container shutdown (via signal traps)
+A self-hosted host needs the same toolchain a GitHub-hosted runner ships
+with (Node/npm, pipx); a bare host (fresh Colima VM, clean macOS box) does
+not have it, and jobs that call `npm`/`node` fail with `command not found`,
+silently falling back to the GitHub-hosted leg. `gh-runners provision`
+runs the bundled idempotent `scripts/provision-host.sh` to close that gap
+once per host. This is the permanent home of that lesson — do not delete
+it; if a host rebuild loses the toolchain, re-running `provision` restores
+it.
 
-The Python module provides a CLI wrapper (`gh-runners`) for managing the container lifecycle via `docker compose`.
+The flow for one runner:
+
+0. `gh-runners provision` — one-time per host; installs the toolchain
+   (Node/npm via NodeSource on Linux or Homebrew on macOS, npm global
+   prefix repointed to a user-writable dir on Linux, pip + pipx).
+1. `gh-runners install` — downloads and extracts the official
+   `actions-runner-<os>-<arch>-<ver>.tar.gz` from the GitHub release into
+   a target directory.
+2. `gh-runners configure` — fetches a JIT registration token from the
+   GitHub API, then invokes the binary's own `config.sh` with the
+   resolved `--url`, `--labels`, and `--runnergroup`.
+3. `gh-runners start` — runs `run.sh` in the foreground, or
+   `svc.sh install && svc.sh start` with `--service` (launchd on macOS,
+   systemd on Linux).
+4. `gh-runners stop` — runs `svc.sh stop && svc.sh uninstall` for
+   service-mode runners.
+5. `gh-runners status` / `gh-runners remove` — query and mutate the
+   runner list at the configured scope via the GitHub API.
 
 See `specs/architecture.md` for more details.
 
