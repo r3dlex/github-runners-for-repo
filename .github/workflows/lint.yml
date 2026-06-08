@@ -7,8 +7,12 @@ on:
     branches: [main]
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
+  _lint-self-hosted:
+    name: "Lint (self-hosted)"
+    runs-on: [self-hosted, ubuntu-latest]
+    continue-on-error: true
+    outputs:
+      passed: ${{ steps.mark.outputs.passed }}
     steps:
       - uses: actions/checkout@v4
 
@@ -25,4 +29,39 @@ jobs:
         run: uv run ruff check .
 
       - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - id: mark
+        if: success()
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
+
+  lint:
+    name: "Lint"
+    needs: _lint-self-hosted
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Route
+        run: echo "self-hosted passed=${{ needs._lint-self-hosted.outputs.passed }}"
+
+      - if: needs._lint-self-hosted.outputs.passed != 'true'
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        if: needs._lint-self-hosted.outputs.passed != 'true'
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        if: needs._lint-self-hosted.outputs.passed != 'true'
+        run: uv sync --frozen
+
+      - name: Ruff check
+        if: needs._lint-self-hosted.outputs.passed != 'true'
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        if: needs._lint-self-hosted.outputs.passed != 'true'
         run: uv run ruff format --check .
