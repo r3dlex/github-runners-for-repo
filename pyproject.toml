@@ -1,7 +1,7 @@
 [project]
 name = "github-runners-for-repo"
 version = "0.1.0"
-description = "Zero-install containerized GitHub Actions self-hosted runners for a specific repository"
+description = "CLI for installing, configuring, and running official GitHub Actions self-hosted runner binaries scoped to a repository or organization"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
