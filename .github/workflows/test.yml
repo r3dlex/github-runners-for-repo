@@ -11,6 +11,10 @@ jobs:
     name: "Test (self-hosted)"
     runs-on: [self-hosted, ubuntu-latest]
     timeout-minutes: 30
+    # Self-hosted is the preferred leg; the canonical job falls back to a
+    # GitHub-hosted runner when it fails, so a failure here must not fail
+    # the overall run.
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
