@@ -76,7 +76,7 @@ Copy `.env.example` to `.env` and fill in the values. `GITHUB_ORG` and
 | `GITHUB_ORG` | One of | — | Target org slug (case-sensitive) — mutually exclusive with `GITHUB_REPOSITORY` |
 | `GITHUB_REPOSITORY` | One of | — | Target repo (`owner/repo`, case-sensitive) — mutually exclusive with `GITHUB_ORG` |
 | `RUNNER_NAME_PREFIX` | No | `runner` | Prefix for runner names |
-| `RUNNER_COUNT` | No | `1` | Number of runner instances |
+| `RUNNER_COUNT` | No | `4` | Number of runner instances |
 | `RUNNER_LABELS` | No | `self-hosted,linux,x64,r3dlex-org` | Comma-separated labels |
 | `RUNNER_GROUP` | No | `Default` | Runner group assignment |
 | `RUNNER_IMAGE` | No | `github-runner:latest` | Docker image name |

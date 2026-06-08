@@ -7,9 +7,15 @@ on:
     branches: [main]
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  _build-self-hosted:
+    name: "Build (self-hosted)"
+    runs-on: [self-hosted, ubuntu-latest]
+    continue-on-error: true
+    outputs:
+      passed: ${{ steps.mark.outputs.passed }}
     steps:
+      - run: rm -rf dist/ || true
+
       - uses: actions/checkout@v4
 
       - name: Install uv
@@ -26,7 +32,7 @@ jobs:
 
       - name: Verify entry point exists in built wheel
         run: |
-          python -c "
+          uv run python -c "
           import zipfile, sys
           with zipfile.ZipFile('dist/' + [f for f in __import__('os').listdir('dist') if f.endswith('.whl')][0]) as z:
               names = z.namelist()
@@ -36,6 +42,56 @@ jobs:
           "
 
       - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: dist
+          path: dist/
+
+      - id: mark
+        if: success()
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: "build"
+    needs: _build-self-hosted
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Route
+        run: echo "self-hosted passed=${{ needs._build-self-hosted.outputs.passed }}"
+
+      - if: needs._build-self-hosted.outputs.passed != 'true'
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        if: needs._build-self-hosted.outputs.passed != 'true'
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        if: needs._build-self-hosted.outputs.passed != 'true'
+        run: uv sync --frozen
+
+      - name: Build
+        if: needs._build-self-hosted.outputs.passed != 'true'
+        run: uv build
+
+      - name: Verify entry point exists in built wheel
+        if: needs._build-self-hosted.outputs.passed != 'true'
+        run: |
+          uv run python -c "
+          import zipfile, sys
+          with zipfile.ZipFile('dist/' + [f for f in __import__('os').listdir('dist') if f.endswith('.whl')][0]) as z:
+              names = z.namelist()
+              entry = [n for n in names if n.endswith('github_runners_for_repo/cli.py')]
+              assert entry, 'cli.py not found in wheel'
+              print('entry point OK:', entry[0])
+          "
+
+      - if: needs._build-self-hosted.outputs.passed != 'true'
+        uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
