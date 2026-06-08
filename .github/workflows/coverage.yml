@@ -7,9 +7,15 @@ on:
     branches: [main]
 
 jobs:
-  coverage:
-    runs-on: ubuntu-latest
+  _coverage-self-hosted:
+    name: "Coverage (self-hosted)"
+    runs-on: [self-hosted, ubuntu-latest]
+    continue-on-error: true
+    outputs:
+      passed: ${{ steps.mark.outputs.passed }}
     steps:
+      - run: rm -rf .coverage coverage.xml || true
+
       - uses: actions/checkout@v4
 
       - name: Install uv
@@ -25,4 +31,39 @@ jobs:
         run: uv run pytest --cov=github_runners_for_repo --cov-report=xml --cov-fail-under=95
 
       - name: Coverage threshold drift guard (AC-22)
+        run: uv run python tools/check_cov_threshold_drift.py
+
+      - id: mark
+        if: success()
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
+
+  coverage:
+    name: "Coverage"
+    needs: _coverage-self-hosted
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Route
+        run: echo "self-hosted passed=${{ needs._coverage-self-hosted.outputs.passed }}"
+
+      - if: needs._coverage-self-hosted.outputs.passed != 'true'
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        if: needs._coverage-self-hosted.outputs.passed != 'true'
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        if: needs._coverage-self-hosted.outputs.passed != 'true'
+        run: uv sync --frozen
+
+      - name: Coverage
+        if: needs._coverage-self-hosted.outputs.passed != 'true'
+        run: uv run pytest --cov=github_runners_for_repo --cov-report=xml --cov-fail-under=95
+
+      - name: Coverage threshold drift guard (AC-22)
+        if: needs._coverage-self-hosted.outputs.passed != 'true'
         run: uv run python tools/check_cov_threshold_drift.py
