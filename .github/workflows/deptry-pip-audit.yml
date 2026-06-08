@@ -7,8 +7,12 @@ on:
     branches: [main]
 
 jobs:
-  deptry-pip-audit:
-    runs-on: ubuntu-latest
+  _deptry-pip-audit-self-hosted:
+    name: "deptry-pip-audit (self-hosted)"
+    runs-on: [self-hosted, ubuntu-latest]
+    continue-on-error: true
+    outputs:
+      passed: ${{ steps.mark.outputs.passed }}
     steps:
       - uses: actions/checkout@v4
 
@@ -25,4 +29,39 @@ jobs:
         run: uv run deptry .
 
       - name: pip-audit
+        run: uv run pip-audit
+
+      - id: mark
+        if: success()
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
+
+  deptry-pip-audit:
+    name: "deptry-pip-audit"
+    needs: _deptry-pip-audit-self-hosted
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Route
+        run: echo "self-hosted passed=${{ needs._deptry-pip-audit-self-hosted.outputs.passed }}"
+
+      - if: needs._deptry-pip-audit-self-hosted.outputs.passed != 'true'
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        if: needs._deptry-pip-audit-self-hosted.outputs.passed != 'true'
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        if: needs._deptry-pip-audit-self-hosted.outputs.passed != 'true'
+        run: uv sync --frozen
+
+      - name: deptry
+        if: needs._deptry-pip-audit-self-hosted.outputs.passed != 'true'
+        run: uv run deptry .
+
+      - name: pip-audit
+        if: needs._deptry-pip-audit-self-hosted.outputs.passed != 'true'
         run: uv run pip-audit
