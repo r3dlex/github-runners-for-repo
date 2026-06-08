@@ -6,8 +6,12 @@ on:
     branches: [main]
 
 jobs:
-  archgate:
-    runs-on: ubuntu-latest
+  _archgate-self-hosted:
+    name: "archgate (self-hosted)"
+    runs-on: [self-hosted, ubuntu-latest]
+    continue-on-error: true
+    outputs:
+      passed: ${{ steps.mark.outputs.passed }}
     steps:
       - uses: actions/checkout@v4
       - name: Setup archgate
@@ -16,5 +20,30 @@ jobs:
         # archgate-runtime: bundled
         uses: archgate/setup-action@v1
       - name: archgate check
+        # archgate-runtime: bundled
+        run: archgate check
+      - id: mark
+        if: success()
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
+
+  archgate:
+    name: "archgate"
+    needs: _archgate-self-hosted
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Route
+        run: echo "self-hosted passed=${{ needs._archgate-self-hosted.outputs.passed }}"
+
+      - if: needs._archgate-self-hosted.outputs.passed != 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup archgate
+        if: needs._archgate-self-hosted.outputs.passed != 'true'
+        # archgate-runtime: bundled
+        uses: archgate/setup-action@v1
+
+      - name: archgate check
+        if: needs._archgate-self-hosted.outputs.passed != 'true'
         # archgate-runtime: bundled
         run: archgate check
