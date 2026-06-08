@@ -32,7 +32,7 @@ jobs:
 
       - name: Verify entry point exists in built wheel
         run: |
-          python -c "
+          uv run python -c "
           import zipfile, sys
           with zipfile.ZipFile('dist/' + [f for f in __import__('os').listdir('dist') if f.endswith('.whl')][0]) as z:
               names = z.namelist()
@@ -81,7 +81,7 @@ jobs:
       - name: Verify entry point exists in built wheel
         if: needs._build-self-hosted.outputs.passed != 'true'
         run: |
-          python -c "
+          uv run python -c "
           import zipfile, sys
           with zipfile.ZipFile('dist/' + [f for f in __import__('os').listdir('dist') if f.endswith('.whl')][0]) as z:
               names = z.namelist()
