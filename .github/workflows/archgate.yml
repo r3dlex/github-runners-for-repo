@@ -14,21 +14,24 @@ jobs:
       passed: ${{ steps.mark.outputs.passed }}
     steps:
       - uses: actions/checkout@v4
-      - name: Route unsupported self-hosted archgate runtime
-        if: runner.os == 'Linux' && runner.arch != 'X64'
-        run: echo "archgate setup supports Linux x86_64 only; falling back to canonical check"
+      # archgate v0.43+ ships a bundled TypeScript runtime (bun + node),
+      # so no `actions/setup-node@v4` step is needed.
+      # archgate-runtime: bundled
+      #
+      # Linux/ARM64 has no upstream archgate release binary. The
+      # self-hosted runner host provisioning script builds the native
+      # binary from source and installs it to $HOME/.archgate/bin/archgate,
+      # which is on the runner's PATH (see the runner's .path file).
+      # For other platforms the official setup-action downloads the
+      # platform binary into the same location.
       - name: Setup archgate
         if: runner.os != 'Linux' || runner.arch == 'X64'
-        # archgate v0.43+ ships a bundled TypeScript runtime (bun + node),
-        # so no `actions/setup-node@v4` step is needed.
-        # archgate-runtime: bundled
         uses: archgate/setup-action@v1
       - name: archgate check
-        if: runner.os != 'Linux' || runner.arch == 'X64'
         # archgate-runtime: bundled
         run: archgate check
       - id: mark
-        if: success() && (runner.os != 'Linux' || runner.arch == 'X64')
+        if: success()
         run: echo "passed=true" >> "$GITHUB_OUTPUT"
 
   archgate:

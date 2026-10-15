@@ -184,6 +184,36 @@ archgate's runtime story changes (e.g., a future major version drops the
 bundled runtime), update both this section and the workflow comment, and
 add `actions/setup-node@v4` to the workflow.
 
+## archgate on Linux/ARM64
+
+The upstream archgate project ships release binaries only for
+`darwin/arm64`, `linux/x64`, and `win32/x64` — there is no
+`linux/arm64` build. The self-hosted Linux runners (`r3dlex-runner-3`
+and `r3dlex-runner-4` on the Colima VM) are `aarch64`, so the official
+install script (`https://cli.archgate.dev/install-unix`) and the npm
+shim both hard-reject that platform.
+
+`scripts/provision-host.sh` works around this by building archgate from
+source on linux/arm64:
+
+1. Install [Bun](https://bun.sh) (the build toolchain archgate uses).
+2. `git clone --depth 1 --branch $ARCHGATE_VERSION https://github.com/archgate/cli.git`
+3. `bun install` (pulls archgate's npm deps into the cloned tree).
+4. `bun build src/cli.ts --compile --bytecode --outfile ~/.archgate/bin/archgate`
+   — Bun's `--compile` produces a self-contained native binary, so the
+   result runs without a Bun runtime at job time.
+
+The resulting binary is installed to `~/.archgate/bin/archgate` and
+the runner's `.path` file is updated to include that directory (plus
+`~/.local/bin` for `uv` and `~/.bun/bin` for the build toolchain).
+
+The `.github/workflows/archgate.yml` workflow skips the
+`archgate/setup-action@v1` step on linux/arm64 (it would fail) and runs
+`archgate check` directly using the pre-installed binary, which is on
+the runner's PATH via the `.path` file. On every other platform
+(macOS, linux/x64) the setup-action still downloads the upstream
+release binary, so behavior there is unchanged.
+
 ## Governance
 
 - All changes land via PR — no direct push to `main`.
