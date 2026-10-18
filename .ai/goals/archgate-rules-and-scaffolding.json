@@ -1,0 +1,49 @@
+{
+  "implementation_ready": true,
+  "id": "archgate-rules-and-scaffolding",
+  "issue_ref": "https://github.com/r3dlex/github-runners-for-repo/issues/25",
+  "context": "This repo's archgate rule set compiles five .archgate/adrs/ARCH-00x.rules.ts files. Each of those files opens with `/// <reference path=\"../rules.d.ts\" />` and closes with `} satisfies RuleSet;`, where `Severity`, `GrepMatch`, and `RuleSet` are declared as ambient types in `.archgate/rules.d.ts`. The same repo also has untracked .ai/ ai-catapult v3 scaffolding, three governance docs (RULES.md, PLANS.md, CONTRIBUTING.md), and operational OMC/OMX run-state files (handoffs, plans, specs, project-memory.json, hud-config, update-check) that are not covered by the existing .gitignore.",
+  "root_causes": [
+    "The ambient declaration file `.archgate/rules.d.ts` declares the `RuleSet`, `Severity`, and `GrepMatch` types referenced by all five tracked `.archgate/adrs/ARCH-00x.rules.ts` files (each opens with `/// <reference path=\"../rules.d.ts\" />` and closes with `} satisfies RuleSet;`). archgate's own bundled runtime ships ambient types and so does not need the file at runtime — verified: with `.archgate/rules.d.ts` moved aside, `archgate check` still exits 0 with 5/5 rules passing (file since restored, sha256 534d9e8209b870e29a4679a3d908b6e331010bf21233f2331614c68c59914616). What does need the file on a fresh clone is any TypeScript-aware editor or standalone type-checker resolving the triple-slash references. No CI step runs `tsc`/`bunx tsc`/`tsc --noEmit` or any other TypeScript type-check outside archgate's bundled runtime (verified by grep against .github/workflows/*.y*ml — no hits for `tsc`, `bunx tsc`, `--noEmit`, or `type-check`); the consumer of `.archgate/rules.d.ts` is human-author TypeScript tooling, not CI. Committing the file preserves the type-resolution chain for the five tracked rule files on fresh clones.",
+    "The repo's tracked `.gitignore` predates the OMC/OMX directory layout: it only excludes `.omc/state/` and `.omc/sessions/`. The 14+ operational files currently untracked (`.omc/handoffs/*`, `.omc/plans/*`, `.omc/specs/*`, `.omc/project-memory.json`, `.omc/template-version.json`, `.omx/hud-config.json`, `.omx/setup-scope.json`, `.omx/state/update-check.json`) are one `git add -A` away from being committed."
+  ],
+  "evidence": [
+    "VERIFY: `ls -la .archgate/rules.d.ts` returned `644  .archgate/rules.d.ts  2.0K` — file exists on disk but is not tracked. `git ls-files --error-unmatch .archgate/rules.d.ts` returned `error: pathspec '.archgate/rules.d.ts' did not match any file(s) known to git`. `grep -c 'reference path=\"../rules.d.ts\"' .archgate/adrs/*.rules.ts` returned 1 for each of the 5 ARCH-00x rules files. `grep -c 'satisfies RuleSet' .archgate/adrs/*.rules.ts` returned 1 for each of the 5 ARCH-00x rules files. File sha256: `534d9e8209b870e29a4679a3d908b6e331010bf21233f2331614c68c59914616`.",
+    "Retracted claim: the earlier draft root cause asserted that archgate's TS compiler step would fail without the file. That is FALSE — verified empirically: with `.archgate/rules.d.ts` moved aside, `archgate check` exits 0 with all 5 rules passing (`{\"pass\":true,\"total\":5,\"passed\":5,\"failed\":0,...}`); archgate v0.43.0 bundles its own ambient types and does not need the file. CI consumption check: `grep -rEn 'tsc|bunx|--noEmit|type-check' .github/workflows/*.y*ml` returned no matches; the only workflow that touches `.archgate/` is `.github/workflows/archgate.yml` (lines 30-32 self-hosted and 54-57 GH-hosted), and it only runs `archgate check`. The `ty` workflow at `.github/workflows/ty.yml:25,49` runs `uv run ty check github_runners_for_repo` — the Astral Python type checker against the Python package, not TypeScript.",
+    "Precedent: `.omc/plans/migration-repo-audit.md` documents the same ambient-declaration pattern for the `kontor` repo — archgate ambient declaration files must be tracked alongside the rule files they declare types for so that the triple-slash `/// <reference>` chain resolves on fresh clones.",
+    "VERIFY: `git status --porcelain --untracked-files=all .omc .omx` listed 18 untracked entries: `.omc/.gitignore`, 8 `.omc/handoffs/*.md`, 3 `.omc/plans/*.md`, 1 `.omc/specs/*.md`, `.omc/project-memory.json`, `.omc/template-version.json`, `.omx/hud-config.json`, `.omx/setup-scope.json`, `.omx/state/update-check.json` — none of which are excluded by the tracked `.gitignore`.",
+    "Scaffolding present on disk but untracked: `.ai/matrix.json`, `.ai/workflows/repo-workflow.json`, `.ai/handoff/init-ai-repo-handoff.md`, `.ai/traceability/graph.json`, `.ai/init/repo-profile.json`, `.ai/init/sdlc-path.md`, `.ai/phases/0-bootstrap/README.md`, `.ai/phases/1-spec/README.md`, `.ai/phases/2-implement/README.md`, `.ai/phases/3-verify/README.md`.",
+    "Governance docs present on disk but untracked: `RULES.md`, `PLANS.md`, `CONTRIBUTING.md`."
+  ],
+  "solutions": [
+    "Track the existing-on-disk `.archgate/rules.d.ts` and the entire `.ai/**` tree (matrix.json, workflows/, handoff/, traceability/, init/, phases/) plus `RULES.md`, `PLANS.md`, `CONTRIBUTING.md` and the inner `.omc/.gitignore` — `git add` only, no content changes to rule files or scaffolding docs.",
+    "Extend the tracked `.gitignore` with `.omc/handoffs/`, `.omc/project-memory.json`, `.omc/template-version.json`, `.omx/`. Keep `.omc/state/` and `.omc/sessions/` (already present). Remove the previously proposed `.omc/plans/` and `.omc/specs/` rules — plans and specs under `.omc/` are project content here and ARE tracked (verified: `.omc/plans/ralplan-python-modernize-shiftleft.md` is tracked). Drop the `!.omc/skills/**` negation (it was a vacuous no-op since `.omc/` itself is never ignored wholesale) and replace it with a plain comment recording that `.omc/skills/**` remains the documented committable exception for project-scoped skills."
+  ],
+  "acceptance_criteria": [
+    "`archgate check` exits 0 on a clean clone — all five `.archgate/adrs/ARCH-00x.rules.ts` files type-resolve against the now-tracked `.archgate/rules.d.ts`.",
+    "`git ls-files .archgate/rules.d.ts` prints `.archgate/rules.d.ts` (file is tracked).",
+    "`git ls-files .ai/matrix.json` and `git ls-files RULES.md` and `git ls-files PLANS.md` and `git ls-files CONTRIBUTING.md` all print their respective paths (scaffolding and governance docs are tracked).",
+    "`git ls-files .omc/plans/ralplan-python-modernize-shiftleft.md` and `git ls-files .omc/specs/deep-interview-python-modernize-shiftleft.md` both print their respective paths (proven that the previously proposed `.omc/plans/` and `.omc/specs/` ignores would have hidden tracked project content).",
+    "`git check-ignore -q .omx/hud-config.json` exits 0 (operational OMX state is ignored).",
+    "`git check-ignore -q .omx/setup-scope.json` exits 0 (operational OMX setup is ignored).",
+    "`git check-ignore -q .omx/state/update-check.json` exits 0 (operational OMX state is ignored).",
+    "`git check-ignore -q .omc/handoffs/team-plan-org-runners.md` exits 0 (operational OMC handoffs are ignored).",
+    "`git check-ignore -q .omc/project-memory.json` exits 0 (operational OMC memory is ignored).",
+    "`git check-ignore -q .omc/template-version.json` exits 0 (operational OMC template version is ignored).",
+    "`git ls-files -i -c --exclude-standard` returns only `.omc/wiki/README.md` (the pre-existing tracked-but-ignored entry handled by the inner `.omc/.gitignore`); no `.omc/plans/` or `.omc/specs/` entries.",
+    "`git status --porcelain --untracked-files=all .omc .omx .archgate` lists only the intended-for-commit `.omc/.gitignore` (no `.archgate/rules.d.ts`, no `.omc/handoffs/`, no `.omc/project-memory.json`, no `.omc/template-version.json`, no `.omx/` entries).",
+    "Real measured test coverage is **99%** (280 statements, 1 miss at `github_runners_for_repo/cli.py:158`, 104 tests passed) — measured via `uv run coverage run -m pytest -q && uv run coverage report -m`; `coverage_percent` here is the test-suite floor, not a diff-scope claim.",
+    "All 8 GitHub required checks are green on the resulting PR."
+  ],
+  "scope": [
+    "IN: add `.archgate/rules.d.ts`, `.ai/**`, `RULES.md`, `PLANS.md`, `CONTRIBUTING.md`, and `.omc/.gitignore` as tracked files (with content edits limited to factual corrections in `.ai/matrix.json` typo, `.ai/init/sdlc-path.md` hook count, `PLANS.md` branch state, and `RULES.md` §3 fallback carve-out).",
+    "IN: extend tracked `.gitignore` to ignore `.omc/handoffs/`, `.omc/project-memory.json`, `.omc/template-version.json`, `.omx/`. Do NOT add ignores for `.omc/plans/` or `.omc/specs/` (those are project content here).",
+    "OUT: any change to branch protection, `.github/workflows/*.yml`, `pyproject.toml`, lockfiles, or the contents of any rule file.",
+    "OUT: any deletion of existing operational files in `.omc/` or `.omx/`.",
+    "OUT: any re-architecture of the `.ai/` tree."
+  ],
+  "verification": [
+    "pytest -q"
+  ],
+  "coverage_percent": 99
+}

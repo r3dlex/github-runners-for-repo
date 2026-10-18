@@ -1,0 +1,124 @@
+{
+  "version": "1",
+  "name": "github-runners-for-repo.workflow",
+  "description": "Workflow manifest for the github-runners-for-repo brownfield tooling repository. References the canonical 8-check GH Actions pipeline declared in .github/workflows/. autobahn consumes this manifest as the source of truth for required work products and gate inputs.",
+  "work_intake": {
+    "channel": "github_pull_request",
+    "hosted_tracker": false,
+    "issue_required": true,
+    "issue_link_pragmas": ["Closes #N", "Fixes #N"],
+    "enforced_by": "ARCH-001-pr-only-and-issue-link"
+  },
+  "phases": [
+    {
+      "id": "phase-1-bootstrap",
+      "name": "Bootstrap",
+      "description": "Inspect repo, identify stack, capture brownfield profile. Produces .ai/init/* and .ai/matrix.json.",
+      "produces": [
+        ".ai/init/repo-profile.json",
+        ".ai/init/sdlc-path.md",
+        ".ai/matrix.json"
+      ],
+      "consumes": []
+    },
+    {
+      "id": "phase-2-spec-and-plan",
+      "name": "Spec & Plan",
+      "description": "Convert intent into a spec and a sequenced plan. For brownfield repos with no hosted tracker, plan lives in the PR description and tracks in .omc/plans.",
+      "produces": [
+        ".ai/specs/",
+        "PLANS.md"
+      ],
+      "consumes": [".ai/init/repo-profile.json"]
+    },
+    {
+      "id": "phase-3-implement",
+      "name": "Implement",
+      "description": "Make the change with the smallest viable diff. Mirror CI locally via pre-commit.",
+      "produces": ["code changes", "tests", "AGENTS.md updates"],
+      "consumes": [".ai/specs/", "PLANS.md"]
+    },
+    {
+      "id": "phase-4-verify-and-ship",
+      "name": "Verify & Ship",
+      "description": "Run all 8 CI checks, ensure coverage stays >=95%, merge via admin --squash on the merge-deadlock pattern.",
+      "produces": ["merged PR"],
+      "consumes": ["code changes", "tests"]
+    }
+  ],
+  "ci": {
+    "provider": "github_actions",
+    "workflows_dir": ".github/workflows",
+    "required_checks": [
+      {
+        "name": "lint",
+        "file": ".github/workflows/lint.yml",
+        "command": "uv run ruff check . && uv run ruff format --check ."
+      },
+      {
+        "name": "test",
+        "file": ".github/workflows/test.yml",
+        "command": "uv run pytest",
+        "matrix": ["3.11", "3.12", "3.13"]
+      },
+      {
+        "name": "coverage",
+        "file": ".github/workflows/coverage.yml",
+        "command": "uv run pytest --cov=github_runners_for_repo --cov-fail-under=95",
+        "threshold": 95
+      },
+      {
+        "name": "build",
+        "file": ".github/workflows/build.yml",
+        "command": "uv build"
+      },
+      {
+        "name": "archgate",
+        "file": ".github/workflows/archgate.yml",
+        "command": "archgate check"
+      },
+      {
+        "name": "pr-issue-link",
+        "file": ".github/workflows/pr-issue-link.yml",
+        "command": "tools/check_pr_link.py"
+      },
+      {
+        "name": "ty",
+        "file": ".github/workflows/ty.yml",
+        "command": "uv run ty check github_runners_for_repo"
+      },
+      {
+        "name": "deptry-pip-audit",
+        "file": ".github/workflows/deptry-pip-audit.yml",
+        "command": "uv run deptry . && uv run pip-audit"
+      }
+    ],
+    "optional_checks": [
+      {
+        "name": "secrets-scan",
+        "file": ".github/workflows/secrets-scan.yml",
+        "command": "gitleaks"
+      }
+    ]
+  },
+  "governance": {
+    "adrs_dir": ".archgate/adrs",
+    "adrs_in_force": [
+      "ARCH-001-pr-only-and-issue-link",
+      "ARCH-002-main-branch-protection",
+      "ARCH-003-uv-only-toolchain",
+      "ARCH-004-coverage-floor-95",
+      "ARCH-005-stacked-pr-phasing"
+    ],
+    "single_owner": true,
+    "merge_deadlock_workaround": {
+      "pattern": "temp-relax enforce_admins -> admin --squash merge -> restore",
+      "rationale": "Single-owner repos hit self-approval blocks on the only reviewer. Workaround documented in .omc/project-memory.json (merge-deadlock-pattern)."
+    }
+  },
+  "toolchain": {
+    "primary": "uv",
+    "excluded": ["poetry", "pipenv", "pipeline-runner"],
+    "adr_enforcing": "ARCH-003-uv-only-toolchain"
+  }
+}

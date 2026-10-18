@@ -1,0 +1,6 @@
+{
+  "version": "1",
+  "description": "Traceability graph for github-runners-for-repo. Starts empty; populated as work products (specs, plans, code, tests, ADRs) flow through autobahn phases. Edge kinds: derives-from, satisfies, blocks, supersedes, references.",
+  "nodes": [],
+  "edges": []
+}

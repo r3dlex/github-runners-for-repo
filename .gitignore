@@ -180,6 +180,12 @@ cython_debug/
 # OMC state and session data (stateless OMC folders are tracked; state/sessions are not)
 .omc/state/
 .omc/sessions/
+.omc/handoffs/
+.omc/project-memory.json
+.omc/template-version.json
+.omx/
+# .omc/skills/** is the committable exception for project-scoped skills; it stays
+# trackable because .omc/ itself is never ignored wholesale.
 
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to

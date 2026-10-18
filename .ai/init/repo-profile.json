@@ -1,0 +1,64 @@
+{
+  "version": "1",
+  "profile_kind": "brownfield",
+  "schema_version": "ai-catapult-init/v3",
+  "captured_at": "2026-10-18",
+  "captured_by": "ai-catapult:ai-catapult-init",
+  "repository": {
+    "name": "github-runners-for-repo",
+    "kind": "tooling",
+    "primary_language": "python",
+    "python_toolchain": "uv",
+    "build_backend": "hatchling",
+    "min_python": "3.11"
+  },
+  "ci": {
+    "provider": "github_actions",
+    "workflows_dir": ".github/workflows",
+    "required_check_count": 8,
+    "coverage_floor": 95,
+    "branch_protection": {
+      "branch": "main",
+      "required_reviews": 1,
+      "admins_exempt": false,
+      "required_status_checks": [
+        "lint",
+        "test",
+        "coverage",
+        "build",
+        "archgate",
+        "pr-issue-link",
+        "ty",
+        "deptry-pip-audit"
+      ]
+    }
+  },
+  "governance": {
+    "archgate": {
+      "enabled": true,
+      "adrs_dir": ".archgate/adrs",
+      "in_force": [
+        "ARCH-001-pr-only-and-issue-link",
+        "ARCH-002-main-branch-protection",
+        "ARCH-003-uv-only-toolchain",
+        "ARCH-004-coverage-floor-95",
+        "ARCH-005-stacked-pr-phasing"
+      ]
+    },
+    "single_owner": true,
+    "hosted_tracker": false
+  },
+  "operational_state": {
+    "omc_ignored": true,
+    "omx_ignored": true,
+    "exception": ".omc/skills/** is committable per global CLAUDE.md"
+  },
+  "autobahn_ready": true,
+  "notes": [
+    "Brownfield — existing tracked AGENTS.md is comprehensive; init did not rewrite it.",
+    "Custom GH runners fleet tooling; Linux/ARM64 (Colima VM) + macOS runners managed.",
+    "archgate has no upstream linux/arm64 binary; build-from-source path documented in AGENTS.md and scripts/provision-host.sh.",
+    "Single-owner repo uses the merge-deadlock workaround (temp-relax enforce_admins -> admin --squash -> restore) when self-approvals block the only reviewer.",
+    ".archgate/rules.d.ts is the active uncommitted target for the next autobahn run."
+  ]
+}
