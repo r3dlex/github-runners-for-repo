@@ -1,0 +1,80 @@
+{
+  "version": "1",
+  "repository": {
+    "name": "github-runners-for-repo",
+    "kind": "tooling",
+    "primary_language": "python",
+    "python_toolchain": "uv",
+    "package_manager": "uv",
+    "build_backend": "hatchling",
+    "runtime_versions": {
+      "python": ">=3.11",
+      "ci_matrix": ["3.11", "3.12", "3.13"]
+    },
+    "lint": ["ruff check", "ruff format"],
+    "type_check": ["ty"],
+    "test": "pytest",
+    "coverage_threshold": 95,
+    "branch_protection": {
+      "required_reviews": 1,
+      "required_checks": [
+        "lint",
+        "test",
+        "coverage",
+        "build",
+        "archgate",
+        "pr-issue-link",
+        "ty",
+        "deptry-pip-audit"
+      ],
+      "admins_exempt": false
+    },
+    "single_owner": true
+  },
+  "tiers": [
+    {
+      "name": "tooling",
+      "description": "Repo IS a tool — a CLI that wraps actions/runner for self-hosted GitHub Actions. The product is the executable itself (`gh-runners`).",
+      "shape": "cli",
+      "entry_points": ["github_runners_for_repo.cli:main"],
+      "ships_as": ["wheel"],
+      "consumers": ["human operators", "CI orchestrators"],
+      "evidence": ["pyproject.toml scripts", "README Quick Start", "specs/architecture.md"]
+    },
+    {
+      "name": "library",
+      "description": "Internal callable surface exposed as `github_runners_for_repo` for programmatic use or testing of the underlying GitHub API + runner manager logic.",
+      "shape": "package",
+      "entry_points": [
+        "github_runners_for_repo.cli",
+        "github_runners_for_repo.config",
+        "github_runners_for_repo.github_api",
+        "github_runners_for_repo.runner_manager"
+      ],
+      "consumers": ["internal tests", "operator scripts"],
+      "evidence": ["tests/", "github_runners_for_repo/"]
+    },
+    {
+      "name": "infra",
+      "description": "Operates a self-hosted runner fleet — machines, systemd/launchd services, scheduled jobs, GH API tokens. State lives in env files, runner directories, and GitHub registration tokens.",
+      "shape": "ops",
+      "entry_points": [
+        "scripts/provision-host.sh",
+        "gh-runners provision|install|configure|start|stop|status|remove"
+      ],
+      "consumers": ["self-hosted GitHub Actions fleet", "r3dlex org runners"],
+      "evidence": [
+        "github_runners_for_repo/scripts/provision-host.sh",
+        "docs/branch-protection.md",
+        "specs/PIPELINES.md"
+      ]
+    }
+  ],
+  "profiles": {
+    "brownfield": true,
+    "autobahn_ready": true,
+    "language_pack": null,
+    "hosted_tracker": false,
+    "work_intake": "PR description (Closes #N)"
+  }
+}

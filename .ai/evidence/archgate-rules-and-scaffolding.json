@@ -1,0 +1,11 @@
+{
+  "goal_id": "archgate-rules-and-scaffolding",
+  "green": {
+    "command": "git check-ignore -q .omc/handoffs/foo.md",
+    "exit_code": 0
+  },
+  "red": {
+    "command": "git check-ignore -q .omc/handoffs/foo.md",
+    "exit_code": 1
+  }
+}
