@@ -41,6 +41,15 @@
 #
 # A path that is in use is NEVER deleted, at any tier. Tier 3 prunes
 # everything it can safely prune; it does not prune in-use paths.
+#
+# ## It only ever deletes
+#
+# This routine runs as root. It never creates or moves anything: it only
+# removes files and directories, so it cannot leave a root-owned artefact
+# under a runner home. That matters — a root-owned _work tree makes every
+# job fail with a permission error while the runner still looks healthy.
+# Anything that has to be created under a runner home is created by
+# install-disk-cleanup.sh, as the runner user, and verified there.
 set -uo pipefail
 
 # --- filesystem pressure thresholds (percent used) ---

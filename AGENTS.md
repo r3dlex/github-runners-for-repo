@@ -259,6 +259,17 @@ The installer is idempotent and **must never stop the `actions.runner.*`
 services**: a routine install takes no runner offline. It updates each
 runner's `.path` file the same way `provision-host.sh` does.
 
+**Everything the install creates under a runner home belongs to the runner
+user.** The runner service runs as a non-root user, and a root-owned
+`_work` tree makes every job fail with `Access to the path ... is denied`
+while the runner still looks healthy — the job is assigned and zero steps
+run, which is easily mistaken for a billing problem. The installer derives
+that user from the runner home (never a hardcoded name), chowns the runner
+home recursively, and verifies that the user can write into `_work`; it
+fails closed if it cannot. The cleanup routine only ever deletes, so it
+never leaves a root-owned artefact behind — **do not add a `mkdir` under a
+runner home to the sweep.**
+
 Every job in `.github/workflows/` sets `timeout-minutes` explicitly — 30 for
 test/build/lint work, 5 for the health heartbeat and the verdict gate.
 GitHub's default is 360 minutes, and with only two Linux runners one hung

@@ -104,6 +104,24 @@ routine install must not take a runner offline. On macOS it installs
 nothing (systemd timers are Linux-only), but the routine itself is
 portable and runs there too.
 
+### Runner ownership
+
+The runner service runs as a non-root user, and it has to be able to write
+into its own work directory. When a root-run install creates that
+directory — when the work tree is bind-mounted onto the data disk, for
+instance — the directories end up root-owned and every job dies within
+about three seconds with `Access to the path ... is denied`. The runner
+still looks healthy, because it accepted the job and then failed to write
+its work directory: the job is assigned and no step ever runs, which is
+easy to mistake for a billing problem.
+
+The installer therefore derives the owning user from the runner home
+(never a hardcoded name), hands the whole runner home back to that user
+recursively, and then verifies that the user can actually write into the
+work directory. If it cannot, the install fails instead of reporting
+success. The cleanup routine itself only ever deletes, so it cannot leave
+a root-owned artefact behind.
+
 ### Job timeouts
 
 GitHub's default job timeout is 360 minutes. With only two Linux runners,
