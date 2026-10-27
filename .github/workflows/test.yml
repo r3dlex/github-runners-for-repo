@@ -40,6 +40,7 @@ jobs:
     needs: _test-self-hosted
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       passed: ${{ steps.check.outputs.passed }}
     steps:
@@ -52,6 +53,7 @@ jobs:
     needs: [_test-self-hosted, _test-gate]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

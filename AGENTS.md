@@ -96,7 +96,9 @@ uv run gh-runners remove --name <NAME>
 │   ├── github_api.py            # GitHub API interactions
 │   ├── runner_manager.py        # Native actions/runner binary lifecycle
 │   └── scripts/
-│       └── provision-host.sh    # Idempotent host toolchain provisioning (Node/npm, pipx)
+│       ├── provision-host.sh    # Idempotent host toolchain provisioning (Node/npm, pipx)
+│       ├── cleanup-host-disk.sh # Pressure-adaptive disk reclaim routine (timer-driven)
+│       └── install-disk-cleanup.sh  # Installs the routine + its two systemd units
 ├── tools/
 │   ├── check_pr_link.py         # AC-21: pr-issue-link CI script
 │   └── check_cov_threshold_drift.py  # AC-22: coverage drift guard
@@ -213,6 +215,60 @@ The `.github/workflows/archgate.yml` workflow skips the
 the runner's PATH via the `.path` file. On every other platform
 (macOS, linux/x64) the setup-action still downloads the upstream
 release binary, so behavior there is unchanged.
+
+## Runner host disk management
+
+The self-hosted Linux runners (`r3dlex-runner-3` and `r3dlex-runner-4`) live
+in a Colima VM with a 19G root filesystem and a 98G data disk at
+`/mnt/lima-colima`. The root is the bottleneck: it carries the OS, the
+toolchain, the runner binaries and every package cache. When it filled, both
+runners went offline and jobs wedged in post-cleanup.
+
+Two mitigations are in place, and both are tracked here:
+
+1. **The runner `_work` directory is bind-mounted onto the data disk**
+   (`/dev/vdb1` → `<runner-home>/actions-runner-linux{,-2}/_work`). The 98G
+   disk sat nearly empty while the 19G root filled.
+2. **`github_runners_for_repo/scripts/cleanup-host-disk.sh` runs every 15
+   minutes**, driven by `runner-disk-cleanup.timer` and installed by
+   `github_runners_for_repo/scripts/install-disk-cleanup.sh`. The timer is a
+   fixed heartbeat; the work is pressure-adaptive — below `WATCH_PCT` (60%)
+   nothing is swept, and above it the routine escalates through tiers that
+   halve the age thresholds and, at the top tier, prune everything that is
+   not in use. Each pass re-measures the disk and escalates again if it is
+   still over `TARGET_PCT`.
+
+**The safety model is mtime-based, deliberately.** The VM has neither `lsof`
+nor `fuser`, so the routine decides whether a directory belongs to a live job
+by mtime alone — the runner writes into an active job's checkout
+continuously, so a live job's directory is never stale by mtime. On Linux it
+also reads the open files and working directories of live `Runner.Worker`
+processes straight out of `/proc` and treats every path under them as in use.
+**Do not shorten the age thresholds and do not add an `lsof` dependency** — a
+live job's checkout is protected by that rule, and the wrong threshold
+deletes work in progress.
+
+The host copy lives at `/usr/local/bin/runner-disk-cleanup.sh` on the VM and
+is the one proven under real disk pressure. `cleanup-host-disk.sh` in this
+repository is the portable, repo-tracked copy: the same logic with the
+host-specific paths parameterised (`RUNNER_HOMES`, `HOME_DIR`, `DATA_MOUNT`)
+so it also runs on the macOS runners and in CI. **Keep the two in sync** —
+when the host copy changes, port the change here, and the other way round.
+
+The installer is idempotent and **must never stop the `actions.runner.*`
+services**: a routine install takes no runner offline. It updates each
+runner's `.path` file the same way `provision-host.sh` does.
+
+Every job in `.github/workflows/` sets `timeout-minutes` explicitly — 30 for
+test/build/lint work, 5 for the health heartbeat and the verdict gate.
+GitHub's default is 360 minutes, and with only two Linux runners one hung
+job can occupy a runner for six hours.
+
+GitHub-hosted runners **cannot start for private repositories** in this org:
+the Actions spending limit is exhausted ("The job was not started because
+recent account payments have failed or your spending limit needs to be
+increased."). Public repositories are unaffected. For private repos the
+self-hosted fleet is the only working path.
 
 ## Governance
 

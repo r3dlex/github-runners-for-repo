@@ -10,6 +10,7 @@ jobs:
   _lint-self-hosted:
     name: "Lint (self-hosted)"
     runs-on: [self-hosted, ubuntu-latest]
+    timeout-minutes: 30
     continue-on-error: true
     outputs:
       passed: ${{ steps.mark.outputs.passed }}
@@ -40,6 +41,7 @@ jobs:
     needs: _lint-self-hosted
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Route
         run: echo "self-hosted passed=${{ needs._lint-self-hosted.outputs.passed }}"

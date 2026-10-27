@@ -10,6 +10,7 @@ jobs:
   _build-self-hosted:
     name: "Build (self-hosted)"
     runs-on: [self-hosted, ubuntu-latest]
+    timeout-minutes: 30
     continue-on-error: true
     outputs:
       passed: ${{ steps.mark.outputs.passed }}
@@ -56,6 +57,7 @@ jobs:
     needs: _build-self-hosted
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Route
         run: echo "self-hosted passed=${{ needs._build-self-hosted.outputs.passed }}"

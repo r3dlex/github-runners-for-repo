@@ -55,6 +55,75 @@ Run this once on each host before `configure` / `start`. It is the
 permanent home of the "self-hosted host needs the toolchain too" lesson —
 re-running after a host rebuild restores the toolchain.
 
+## Host disk management
+
+A self-hosted runner host fills up. The Linux runners live in a Colima VM
+with two filesystems: a 19G root (`/dev/root`) and a 98G data disk
+(`/dev/vdb1`, mounted at `/mnt/lima-colima`). The 19G root is the
+bottleneck — it carries the OS, the toolchain, the runner binaries and
+every package cache, and it is the one that fills first. When it filled,
+both Linux runners went offline, jobs wedged in post-cleanup, and the whole
+org stalled.
+
+Two things keep that from happening again:
+
+- **The runner's `_work` directory is bind-mounted onto the data disk.** The
+  98G disk sat nearly empty while the 19G root filled, so the work area
+  (checkouts, downloaded actions, the tool cache) is mounted on the data
+  disk instead of the root. The two filesystems then fill independently and
+  the root is no longer competing with the checkouts.
+- **A cleanup routine runs every 15 minutes.** `runner-disk-cleanup.timer`
+  fires `runner-disk-cleanup.service` on that heartbeat. The timer is fixed
+  but the work is pressure-adaptive: below 60% disk usage nothing is swept,
+  and above it the routine escalates through tiers (watch, elevated,
+  critical) that halve the age thresholds and, at the top tier, prune
+  everything that is not in use. After each pass the disk is re-measured,
+  and the routine escalates again if it is still over target — one pass is
+  never assumed to be enough.
+
+### What the routine will not delete
+
+The VM has neither `lsof` nor `fuser`, so the routine decides whether a
+directory belongs to a live job by mtime alone: the runner writes into an
+active job's checkout continuously, so a live job's directory is never
+stale by mtime. On Linux it additionally reads the open files and working
+directories of every live `Runner.Worker` process straight out of `/proc`,
+and any path under them counts as in use regardless of age. **A path that
+is in use is never deleted, at any tier.**
+
+### Installing it
+
+```bash
+github_runners_for_repo/scripts/install-disk-cleanup.sh    # Linux
+```
+
+The installer is idempotent: it installs the script to
+`/usr/local/bin/runner-disk-cleanup.sh`, writes the two systemd units, and
+enables the timer. It never stops the `actions.runner.*` services — a
+routine install must not take a runner offline. On macOS it installs
+nothing (systemd timers are Linux-only), but the routine itself is
+portable and runs there too.
+
+### Job timeouts
+
+GitHub's default job timeout is 360 minutes. With only two Linux runners,
+one hung job can occupy a runner for six hours. Every job in
+`.github/workflows/` therefore sets `timeout-minutes` explicitly: 30
+minutes for test/build/lint work, 5 minutes for the health heartbeat and
+the verdict gate.
+
+### GitHub-hosted runners cannot start for private repos
+
+The org's Actions spending limit is exhausted, so GitHub-hosted runners
+refuse to start for **private** repositories:
+
+> The job was not started because recent account payments have failed or
+> your spending limit needs to be increased.
+
+Public repositories (including this one) are unaffected. For private repos
+the self-hosted fleet is the only working path — which is why the runners
+have to stay online, and why the disk routine and the job timeouts matter.
+
 ## Quick Start
 
 ```bash
@@ -215,6 +284,7 @@ See [`specs/PIPELINES.md`](specs/PIPELINES.md) for design rationale.
 
 ```
 github_runners_for_repo/   # Python package (CLI, config, GitHub API client, runner manager)
+  scripts/                 # provision-host.sh (toolchain) + disk cleanup routine and its installer
 tools/                     # check_pr_link.py + check_cov_threshold_drift.py
 tests/                     # Pytest suite (mocked, no live API calls)
 specs/                     # Architecture and pipeline documentation
