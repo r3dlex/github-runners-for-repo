@@ -23,8 +23,17 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
+      # The interpreter is pinned on purpose. Left unpinned, `uv` picks the
+      # NEWEST CPython on the runner, and pip-api 0.0.34 (via pip-audit
+      # 2.10.1) vendors a pyparsing 2.x that imports `sre_constants` —
+      # removed in Python 3.15 — so the audit dies with ModuleNotFoundError.
+      # 3.12 is also exactly the interpreter the hosted leg runs, so the two
+      # legs stay true substitutes for each other.
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
       - name: Install dependencies
-        run: uv sync --frozen
+        run: uv sync --frozen --python 3.12
 
       - name: Ruff check
         run: uv run ruff check .
@@ -56,9 +65,19 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
+      # The interpreter is pinned on purpose. Left unpinned, `uv` picks the
+      # NEWEST CPython on the runner, and pip-api 0.0.34 (via pip-audit
+      # 2.10.1) vendors a pyparsing 2.x that imports `sre_constants` —
+      # removed in Python 3.15 — so the audit dies with ModuleNotFoundError.
+      # 3.12 is also exactly the interpreter the hosted leg runs, so the two
+      # legs stay true substitutes for each other.
+      - name: Install Python 3.12
+        if: needs._lint-self-hosted.outputs.passed != 'true'
+        run: uv python install 3.12
+
       - name: Install dependencies
         if: needs._lint-self-hosted.outputs.passed != 'true'
-        run: uv sync --frozen
+        run: uv sync --frozen --python 3.12
 
       - name: Ruff check
         if: needs._lint-self-hosted.outputs.passed != 'true'
