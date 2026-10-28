@@ -373,6 +373,12 @@ is_stale() {
 remove_file() {
   local target="$1" label="$2"
   is_in_use "$target" && { log "skipped (in use) $target"; return 1; }
+  # Re-collect immediately before the destructive step: the set collected at
+  # the top of the pass is a snapshot, and a job that started since it was
+  # taken holds this path RIGHT NOW. The decision is made on a set that is
+  # current at the moment of the deletion.
+  collect_inuse
+  is_in_use "$target" && { log "skipped (in use) $target"; return 1; }
   if [ "$DRY_RUN" = "1" ]; then
     log "would prune $label $target"
     return 0
@@ -389,6 +395,15 @@ try_remove() {
   # The age window is ALWAYS checked. There is no "prune regardless of age"
   # mode: the window is what keeps a live job's checkout alive.
   is_stale "$target" "$window" || return 1
+  # Re-collect immediately before the destructive step. The set collected at
+  # the top of the pass is a snapshot taken BEFORE the sweep started, so a
+  # job that picked up a checkout while the sweep was running is not in it:
+  # without this refresh the sweep would delete the checkout of a job that
+  # is running RIGHT NOW. The refresh costs one /proc scan per path that is
+  # actually about to be deleted, so the cost tracks the deletions and not
+  # the number of candidates that were examined.
+  collect_inuse
+  is_in_use "$target" && { log "skipped (in use) $target"; return 1; }
   if [ "$DRY_RUN" = "1" ]; then
     log "would prune $label $target"
     return 0

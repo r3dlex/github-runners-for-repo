@@ -621,3 +621,176 @@ class TestRunnerOwnerDerivation:
             check=False,
         )
         assert result.stdout.strip() == current_user
+
+
+class TestInUseSnapshot:
+    """NEW-7: the liveness check is re-evaluated, not a one-shot snapshot.
+
+    The set of live paths is collected at the top of a pass. A job that
+    picks up a checkout AFTER that snapshot is not in the set, so a sweep
+    that decides on the snapshot alone deletes the checkout of a job that
+    is running right now. The check therefore has to be re-run immediately
+    before every destructive step.
+    """
+
+    @staticmethod
+    def _sweep_with_late_liveness(home: Path, tmp_path: Path, live: Path, tier: int = 3) -> str:
+        """Sweep in which `live` becomes held AFTER the pass snapshot.
+
+        `collect_inuse` is replaced with a deterministic double: the first
+        call — the snapshot taken at the top of the pass — reports nothing,
+        every later call reports `live` as held by a running job. A sweep
+        that decides on the snapshot alone removes the checkout; a sweep
+        that re-collects immediately before the destructive step keeps it.
+        """
+        script = "\n".join(
+            [
+                'source "$CLEANUP_SCRIPT"',
+                "_calls=0",
+                "collect_inuse() {",
+                "  _calls=$((_calls + 1))",
+                '  if [ "$_calls" -ge 2 ]; then',
+                '    INUSE_PATHS=("$LIVE_CHECKOUT")',
+                "  else",
+                "    INUSE_PATHS=()",
+                "  fi",
+                "}",
+                "collect_inuse",
+                'prune_runner_work "$RUNNER_HOME" "$TIER"',
+            ]
+        )
+        env = _env(home, tmp_path)
+        env.update(
+            {
+                "CLEANUP_SCRIPT": str(SCRIPT),
+                "RUNNER_HOME": str(home),
+                "TIER": str(tier),
+                "LIVE_CHECKOUT": str(live),
+            }
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"sweep failed: {result.stderr}"
+        return result.stdout
+
+    def test_a_checkout_that_becomes_live_after_the_snapshot_survives(
+        self, runner_home: Path, tmp_path: Path
+    ) -> None:
+        """A job that starts during the pass must keep its checkout."""
+        checkout = runner_home / "_work" / "late-repo"
+        checkout.mkdir()
+        (checkout / "file.txt").write_text("work in progress")
+        # Old enough that only the liveness check can save it.
+        _age(checkout, 30)
+
+        output = self._sweep_with_late_liveness(runner_home, tmp_path, checkout, tier=3)
+
+        assert checkout.exists(), (
+            "a checkout that a running job picked up during the sweep must "
+            f"not be deleted: {output}"
+        )
+
+    def test_a_file_held_open_by_a_live_process_protects_the_checkout(
+        self, runner_home: Path, tmp_path: Path
+    ) -> None:
+        """Protection comes from HOLDING the path, not from naming it.
+
+        The holder's working directory is somewhere else and its command
+        line mentions nothing about the checkout: the only thing that ties
+        it to the checkout is the open file descriptor, which is what the
+        /proc (Linux) and lsof (macOS) scans look for.
+        """
+        checkout = runner_home / "_work" / "fd-repo"
+        checkout.mkdir()
+        target = checkout / "artifact.bin"
+        target.write_text("build output")
+        _age(checkout, 30)
+
+        holder = subprocess.Popen(
+            ["bash", "-c", 'exec 9<"$1"; sleep 30', "_", str(target)],
+            cwd=tmp_path,
+        )
+        try:
+            time.sleep(0.5)
+            output = _sweep(runner_home, tmp_path, tier=3)
+        finally:
+            holder.terminate()
+            holder.wait()
+
+        assert checkout.exists(), (
+            f"a checkout whose file is held open by a live process must not be pruned: {output}"
+        )
+
+    def test_a_process_that_only_names_the_path_does_not_protect_it(
+        self, runner_home: Path, tmp_path: Path
+    ) -> None:
+        """The detection is not a command-line match.
+
+        A process whose command line mentions the checkout but holds
+        nothing open in it is not a live job. Documenting this pins the
+        contract: protection comes from the working directory or an open
+        descriptor, so the scan cannot be fooled into protecting a stale
+        checkout by name.
+        """
+        checkout = runner_home / "_work" / "named-repo"
+        checkout.mkdir()
+        _age(checkout, 30)
+
+        holder = subprocess.Popen(
+            ["bash", "-c", "sleep 30", "_", str(checkout)],
+            cwd=tmp_path,
+        )
+        try:
+            time.sleep(0.5)
+            output = _sweep(runner_home, tmp_path, tier=3)
+        finally:
+            holder.terminate()
+            holder.wait()
+
+        assert not checkout.exists(), (
+            "a checkout that nothing holds open is prunable even when a "
+            f"process mentions it on its command line: {output}"
+        )
+
+
+class TestSweepExclusions:
+    """NEW-7: the runner's own directories are excluded BEFORE the prune.
+
+    The exclusion is a `continue` in the candidate loop, so the directory
+    is never handed to the pruner at all — not "offered and then skipped".
+    """
+
+    @staticmethod
+    def _excluded(runner_home: Path) -> list[str]:
+        return ["_tool", "_actions", "_temp", "_PipelineMapping", "_update"]
+
+    def test_the_runner_s_own_directories_are_never_offered_to_the_pruner(
+        self, runner_home: Path, tmp_path: Path
+    ) -> None:
+        """Every excluded directory survives, and is never even considered.
+
+        The directories are left empty on purpose: the routine prunes the
+        CHILDREN of _temp, _tool and _actions by design (per-job temp dirs,
+        tool cache, action versions), so only the roots themselves are
+        excluded. An empty, stale root is exactly what the checkout loop
+        would delete if the exclusion were missing.
+        """
+        for name in self._excluded(runner_home):
+            directory = runner_home / "_work" / name
+            directory.mkdir(parents=True, exist_ok=True)
+            _age(directory, 30)
+
+        output = _sweep(runner_home, tmp_path, tier=3)
+
+        for name in self._excluded(runner_home):
+            directory = runner_home / "_work" / name
+            assert directory.exists(), f"{name} must never be pruned"
+            assert str(directory) not in output, (
+                f"{name} must be excluded before the destructive step, not "
+                f"offered to it and skipped afterwards: {output}"
+            )

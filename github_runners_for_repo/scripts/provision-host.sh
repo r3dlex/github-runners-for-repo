@@ -63,24 +63,104 @@ ensure_user_path_in_shell_rc() {
   done
 }
 
+# True when the fragment is already in the runner's .path file.
+#
+# The file holds one PATH fragment per line and colons are allowed inside a
+# line, so the lines are folded into one colon-separated stream before the
+# match: a fragment that ends a line has no colon after it and a plain
+# whole-file match cannot see it, so the fragment is prepended again on
+# every provision run and the file grows by a line each time.
+#
+# Same test as scripts/install-disk-cleanup.sh uses for the install
+# directory.
+path_file_has() {
+  local path_file="$1" fragment="$2"
+  grep -Fxq -- "$fragment" "$path_file" 2>/dev/null && return 0
+  case ":$(tr '\n' ':' <"$path_file" 2>/dev/null):" in
+    *":${fragment}:"*) return 0 ;;
+  esac
+  return 1
+}
+
+# The home parents that are scanned for runner homes, one per line.
+#
+# Only the parent of THIS platform is scanned by default: on macOS /home is
+# an autofs mount, and a glob under it blocks until the automounter gives
+# up, so a provision that scans both parents hangs on the macOS runners.
+# The macOS runners live under /Users, the Linux fleet under /home.
+home_parents() {
+  local -a parents=()
+  if [ -n "${RUNNER_HOME_PARENTS:-}" ]; then
+    read -r -a parents <<<"$RUNNER_HOME_PARENTS" || true
+  elif [ "$(uname -s)" = "Darwin" ]; then
+    parents=(/Users)
+  else
+    parents=(/home)
+  fi
+  [ "${#parents[@]}" -gt 0 ] || return 0
+  printf '%s\n' "${parents[@]}"
+}
+
 ensure_user_path_in_runner() {
   # The actions-runner service uses the .path file in the runner dir to
   # set PATH. Prepend our user-local bin dirs so the service can find
   # uv, bun, and archgate.
-  local runner_dir
-  for runner_dir in "$HOME/actions-runner"*; do
+  #
+  # The runner home is NOT necessarily under $HOME. A root-run provision has
+  # HOME=/root, while the fleet's Linux runners live in the guest user's
+  # home (/home/<user>/actions-runner*), so the old "$HOME"/actions-runner*
+  # glob matched nothing and the runner's .path file was NEVER updated — the
+  # same class of defect as the gh PATH guard, one level up.
+  #
+  # The runner homes are enumerated explicitly instead:
+  #
+  #   - $RUNNER_HOMES, the space separated list the disk cleanup routine
+  #     uses, when the operator sets it;
+  #   - the runner dirs directly under $HOME (the macOS layout, where the
+  #     runner and its owner share a home);
+  #   - the runner dirs one level below a home parent (the Linux fleet
+  #     layout: /home/<user>/actions-runner*). The parents are overridable
+  #     with $RUNNER_HOME_PARENTS for hosts that keep their homes elsewhere.
+  #
+  # Only the home parent of THIS platform is scanned: on macOS /home is an
+  # autofs mount, and a glob under it blocks until the automounter gives up,
+  # so the provision would hang there. On macOS the runners live under
+  # /Users, on Linux under /home.
+  #
+  # The bin dirs are derived from the OWNER's home — the directory above the
+  # runner dir — and not from $HOME, so the entries point at the tools the
+  # user the runner runs as actually has. When the provision runs as that
+  # user the two are the same directory.
+  local runner_dir owner_home current d path_file
+  local -a runner_dirs=() bin_dirs=() missing=()
+
+  if [ -n "${RUNNER_HOMES:-}" ]; then
+    read -r -a runner_dirs <<<"$RUNNER_HOMES" || true
+  fi
+  for d in "$HOME"/actions-runner*; do
+    runner_dirs+=("$d")
+  done
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    for runner_dir in "$d"/*/actions-runner*; do
+      runner_dirs+=("$runner_dir")
+    done
+  done < <(home_parents)
+
+  for runner_dir in "${runner_dirs[@]}"; do
     [ -d "$runner_dir" ] || continue
-    local path_file="$runner_dir/.path"
+    path_file="$runner_dir/.path"
     [ -f "$path_file" ] || continue
-    local current
+    owner_home="$(dirname "$runner_dir")"
+    bin_dirs=(
+      "$owner_home/.local/bin"
+      "$owner_home/.bun/bin"
+      "$owner_home/.archgate/bin"
+    )
     current="$(cat "$path_file" 2>/dev/null || true)"
-    local missing=()
-    local d
-    for d in "${USER_BIN_DIRS[@]}"; do
-      case ":${current}:" in
-        *":${d}:"*) ;;
-        *) missing+=("$d") ;;
-      esac
+    missing=()
+    for d in "${bin_dirs[@]}"; do
+      path_file_has "$path_file" "$d" || missing+=("$d")
     done
     if [ "${#missing[@]}" -gt 0 ]; then
       local prepend
