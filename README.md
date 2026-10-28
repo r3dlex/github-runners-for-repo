@@ -77,19 +77,54 @@ Two things keep that from happening again:
   but the work is pressure-adaptive: below 60% disk usage nothing is swept,
   and above it the routine escalates through tiers (watch, elevated,
   critical) that halve the age thresholds and, at the top tier, prune
-  everything that is not in use. After each pass the disk is re-measured,
-  and the routine escalates again if it is still over target — one pass is
-  never assumed to be enough.
+  everything that is older than the age floor and not in use. After each
+  pass the disk is re-measured, and the routine escalates one tier and
+  sweeps again if it is still over target — one pass is never assumed to
+  be enough. The two filesystems are scored, tiered and escalated
+  separately: a full root filesystem never makes the sweep more aggressive
+  with the data disk that holds the checkouts.
 
 ### What the routine will not delete
 
-The VM has neither `lsof` nor `fuser`, so the routine decides whether a
-directory belongs to a live job by mtime alone: the runner writes into an
-active job's checkout continuously, so a live job's directory is never
-stale by mtime. On Linux it additionally reads the open files and working
-directories of every live `Runner.Worker` process straight out of `/proc`,
-and any path under them counts as in use regardless of age. **A path that
-is in use is never deleted, at any tier.**
+Two independent rules keep a live job's checkout alive, and both apply at
+every tier:
+
+- **The age floor.** The runner writes into an active job's checkout
+  continuously, so a live job's directory is never stale by mtime. The
+  floor is never zero — the top tier prunes what is older than one hour
+  (one day for the daily caches), not everything it can reach.
+- **The liveness scan.** On Linux the routine reads the working directory
+  and the open files of *every* live process straight out of `/proc` (it
+  falls back to `lsof` elsewhere), and any path under a watched root counts
+  as in use regardless of age. `actions/runner` never changes its own
+  working directory, so the process that holds a checkout is the child it
+  spawned — `node`, `git`, `bash`. A process whose working directory is a
+  checkout's direct parent holds every checkout below it and protects them
+  all.
+
+**A path that is in use is never deleted, at any tier.** The in-use set is
+re-collected at the start of every pass, so a job that starts while an
+earlier pass is running is protected by the next one.
+
+### Repairing a bricked action
+
+The runner marks a downloaded action with a watermark file *next to* the
+action's version directory (`_work/_actions/<owner>/<repo>/v1.completed`
+beside `.../v1/`). If the version directory is swept away and the
+watermark is left behind, `actions/checkout` skips the download, the action
+manifest is missing, and the step fails — forever, because nothing else
+removes the watermark. The routine therefore deletes a watermark exactly
+when its version directory is gone, which makes the runner download the
+action again on the next job.
+
+### Not running twice at once
+
+The routine takes an exclusive `flock` on `/run/runner-disk-cleanup.lock`.
+The weekly `runner-cleanup.service` on the same host prunes the work tree
+as well and has no in-use guard of its own, so **both units must take the
+same lock**: systemd serialises a unit against itself, never against a
+differently named one. The weekly unit lives outside this repository — the
+lock file is the contract between the two.
 
 ### Installing it
 
@@ -103,6 +138,16 @@ enables the timer. It never stops the `actions.runner.*` services — a
 routine install must not take a runner offline. On macOS it installs
 nothing (systemd timers are Linux-only), but the routine itself is
 portable and runs there too.
+
+The host copy at `/usr/local/bin/runner-disk-cleanup.sh` is the one that
+has been proven under real disk pressure, so the installer refuses to
+overwrite a host script whose content differs from the repository copy
+unless you pass `--force`. With `--force` the previous host script is
+backed up to `runner-disk-cleanup.sh.bak` first:
+
+```bash
+github_runners_for_repo/scripts/install-disk-cleanup.sh --force
+```
 
 ### Runner ownership
 
@@ -118,9 +163,19 @@ easy to mistake for a billing problem.
 The installer therefore derives the owning user from the runner home
 (never a hardcoded name), hands the whole runner home back to that user
 recursively, and then verifies that the user can actually write into the
-work directory. If it cannot, the install fails instead of reporting
-success. The cleanup routine itself only ever deletes, so it cannot leave
-a root-owned artefact behind.
+runner home, `_work`, `_work/_tool`, `_work/_temp`, `_work/_actions` and
+`_diag` — a root-owned `_actions` or `_diag` produces the same
+"assigned, zero steps" failure as a root-owned `_work`. If it cannot, the
+install fails instead of reporting success. The runner's credential files
+are tightened to `0600` while the installer is there, so no other user on
+the host can read or rewrite them. The cleanup routine itself only ever
+deletes, so it cannot leave a root-owned artefact behind.
+
+Each runner's `.path` file is updated atomically — written to a temporary
+file and renamed — and as the runner user, so the runner never reads a
+half-written or root-owned path file. The install directory is added
+exactly once: the file is checked line by line, because that is the format
+the installer writes it in.
 
 ### Job timeouts
 
@@ -304,7 +359,7 @@ See [`specs/PIPELINES.md`](specs/PIPELINES.md) for design rationale.
 github_runners_for_repo/   # Python package (CLI, config, GitHub API client, runner manager)
   scripts/                 # provision-host.sh (toolchain) + disk cleanup routine and its installer
 tools/                     # check_pr_link.py + check_cov_threshold_drift.py
-tests/                     # Pytest suite (mocked, no live API calls)
+tests/                     # Pytest suite (mocked, no live API calls, sandbox tests for the shell scripts)
 specs/                     # Architecture and pipeline documentation
 .archgate/                 # ADRs + archgate rule type definitions
 .github/                   # CODEOWNERS + PR/issue templates + 8 GH Actions workflows

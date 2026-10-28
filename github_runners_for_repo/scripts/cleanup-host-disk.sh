@@ -22,25 +22,51 @@
 #   tier 1  watch      (WATCH..ELEVATED)    standard age thresholds
 #   tier 2  elevated   (ELEVATED..CRITICAL) half the thresholds, caches purged
 #                                            regardless of age
-#   tier 3  critical   (>= CRITICAL)        everything not in use is pruned
+#   tier 3  critical   (>= CRITICAL)        the one-unit floor: anything older
+#                                            than an hour (a day for the
+#                                            daily caches) that is not in use
+#
+# Tier 3 does NOT mean "prune regardless of age". The age floor is what
+# protects a live job's checkout: the runner writes into it continuously, so
+# a checkout that is minutes old is never swept, no matter how full the disk
+# is.
 #
 # After a pass, the script re-measures. If the filesystem is still above
 # TARGET_PCT it escalates one tier and sweeps again, up to MAX_PASSES times.
 # That closed loop is what keeps a busy afternoon from filling the disk: one
 # pass is never assumed to be enough.
 #
+# Each filesystem is scored, tiered AND escalated on its own. Root pressure
+# never raises the tier that is applied to the data disk holding the
+# checkouts, and data-disk pressure never raises the tier applied to the
+# root filesystem's caches.
+#
 # ## Safety
 #
 # The VM has neither lsof nor fuser, so liveness is decided two ways:
 #
 #   1. mtime — the runner writes into an active job's checkout continuously, so
-#      a live job's directory is never stale by mtime.
-#   2. /proc — the open files and working directories of every live
-#      Runner.Worker process are read directly, and any path under them is
-#      treated as in use regardless of age.
+#      a live job's directory is never stale by mtime. The age window is
+#      never zero, so this backstop always runs.
+#   2. /proc — the working directory and open files of EVERY live process
+#      are read directly, and any path under a watched root is treated as in
+#      use regardless of age. actions/runner never changes its own working
+#      directory (it sets the child's instead), so the process that holds a
+#      checkout is the child the runner spawned — node, git, bash. Matching
+#      on the runner's own command line would protect nothing.
 #
-# A path that is in use is NEVER deleted, at any tier. Tier 3 prunes
-# everything it can safely prune; it does not prune in-use paths.
+# A path that is in use is NEVER deleted, at any tier. A live process that
+# holds a path's DIRECT PARENT also protects it: a process whose working
+# directory is the _work root holds every checkout below it. The check stops
+# at one level, because the runner's own process holds the runner home and
+# walking all the way up would disable the sweep entirely.
+#
+# ## Mutual exclusion
+#
+# The routine takes an exclusive flock on LOCK_FILE. The weekly
+# runner-cleanup.service on the same host prunes _work as well and has no
+# in-use guard of its own, so both units must take the SAME lock: systemd
+# serialises a unit against itself, never against a differently named one.
 #
 # ## It only ever deletes
 #
@@ -60,6 +86,11 @@ TARGET_PCT="${TARGET_PCT:-70}"    # aim to get back under this
 ELEVATED_PCT="${ELEVATED_PCT:-75}"
 CRITICAL_PCT="${CRITICAL_PCT:-85}"
 MAX_PASSES="${MAX_PASSES:-3}"
+
+# The mutual-exclusion lock. This routine and the weekly runner-cleanup
+# service on the same host must take the SAME lock file, otherwise they can
+# prune the work tree at the same time.
+LOCK_FILE="${LOCK_FILE:-/run/runner-disk-cleanup.lock}"
 
 # --- base age thresholds ---
 BASE_STALE_HOURS="${BASE_STALE_HOURS:-6}"
@@ -116,6 +147,10 @@ fi
 # (macOS runners, CI) the work is scored on the filesystem that holds it.
 DATA_MOUNT="${DATA_MOUNT:-/mnt/lima-colima}"
 
+# The directory whose stale regular files are reclaimed. A knob so the
+# routine can be exercised against a sandbox instead of the real /tmp.
+TMP_DIR="${TMP_DIR:-/tmp}"
+
 # The roots this routine is allowed to touch: the runner homes and the home
 # that owns the caches. Used to keep the in-use set small.
 WATCH_ROOTS=()
@@ -155,24 +190,33 @@ under_watched_root() {
 
 INUSE_PATHS=()
 
-# Linux: read the working directory and open files of every live runner
-# process straight out of /proc.
+# Linux: read the working directory and open files of EVERY live process
+# straight out of /proc.
+#
+# There is deliberately no command-line filter here. actions/runner never
+# calls Directory.SetCurrentDirectory, so the runner process itself does not
+# hold the checkout; the child it spawns (node, git, bash) inherits the
+# checkout as its working directory. Filtering on "Runner.Worker" therefore
+# protected nothing at all — at tier 3 that meant a live job's checkout
+# could be deleted out from under it.
+#
+# Every path under a watched root is kept; everything else is dropped, so the
+# in-use set stays small no matter how many processes the host runs.
 collect_inuse_proc() {
-  local d pid cmd target fd
+  local d target fd
   for d in /proc/[0-9]*; do
-    pid="${d#/proc/}"
-    cmd="$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null)" || continue
-    case "$cmd" in
-      *Runner.Worker* | *Runner.Listener*) ;;
-      *) continue ;;
-    esac
     target="$(readlink "$d/cwd" 2>/dev/null)" || target=""
-    [ -n "$target" ] && INUSE_PATHS+=("$target")
+    if [ -n "$target" ] && under_watched_root "$target"; then
+      INUSE_PATHS+=("$target")
+    fi
     for fd in "$d"/fd/*; do
       target="$(readlink "$fd" 2>/dev/null)" || continue
       case "$target" in
-        /*) INUSE_PATHS+=("$target") ;;
+        /*) ;;
+        *) continue ;;
       esac
+      under_watched_root "$target" || continue
+      INUSE_PATHS+=("$target")
     done
   done
 }
@@ -201,8 +245,16 @@ collect_inuse() {
 }
 
 # A candidate is in use if any live path is equal to it or lives beneath it.
+# A live path that is the candidate's DIRECT PARENT also protects it: a
+# process whose working directory is the _work root holds every checkout
+# below it, and without this rule that checkout was reported as prunable
+# while a job was running in it.
+#
+# Only ONE level up is checked. The runner's own process holds the runner
+# home, so walking all the way to the root of the watched tree would mark
+# every candidate in use and disable the sweep entirely.
 is_in_use() {
-  local cand="$1" p physical
+  local cand="$1" p physical parent physical_parent
   # Compare on a slash-normalised candidate. The checkout glob ("$work"/*/)
   # yields a trailing slash, and "/work/repo/" does not prefix-match
   # "/work/repo/file" — without this the guard silently misses a live job's
@@ -214,14 +266,19 @@ is_in_use() {
   if [ -d "$cand" ]; then
     physical="$(cd "$cand" 2>/dev/null && pwd -P)" || physical=""
   fi
+  parent="$(dirname "$cand")"
+  physical_parent=""
+  [ -n "$physical" ] && physical_parent="$(dirname "$physical")"
   for p in "${INUSE_PATHS[@]:-}"; do
     [ -n "$p" ] || continue
     case "$p" in
       "$cand" | "$cand"/*) return 0 ;;
+      "$parent") return 0 ;;
     esac
     if [ -n "$physical" ]; then
       case "$p" in
         "$physical" | "$physical"/*) return 0 ;;
+        "$physical_parent") return 0 ;;
       esac
     fi
   done
@@ -265,29 +322,38 @@ tier_for_pct() {
 }
 
 # Age threshold for a tier. Tier 0 keeps the base value (unused), tier 1 keeps
-# it, tier 2 halves it, tier 3 drops it to 0 (prune anything not in use).
-scaled_hours() {
-  local base="$1" tier="$2"
+# it, tier 2 halves it, tier 3 floors it at ONE unit of the caller's window
+# (an hour for the checkout windows, a day for the daily caches).
+#
+# The floor is never zero. A zero window means "prune regardless of age":
+# find -newermt "-0 days" matches nothing, so every path looks stale and the
+# mtime backstop disappears — at tier 3 that deleted live jobs' checkouts.
+# One unit is safely below the job timeout, so a live job's checkout is
+# always inside the protected window.
+scaled_age() {
+  local base="$1" tier="$2" n
   case "$tier" in
-    2) echo $(( base / 2 )) ;;
-    3) echo 0 ;;
-    *) echo "$base" ;;
+    2) n=$(( base / 2 )) ;;
+    3) n=1 ;;
+    *) n="$base" ;;
   esac
-}
-
-scaled_days() {
-  local base="$1" tier="$2"
-  case "$tier" in
-    2) echo $(( base / 2 )) ;;
-    3) echo 0 ;;
-    *) echo "$base" ;;
-  esac
+  [ "$n" -lt 1 ] && n=1
+  echo "$n"
 }
 
 # ------------------------------------------------------------------- sweeping
 
+# True when the directory holds nothing newer than the window, i.e. it is
+# old enough to prune.
 is_stale() {
-  local dir="$1" window="$2"
+  local dir="$1" window="$2" num="${2%% *}"
+  # A zero (or unparseable) window would make every path look stale and
+  # remove the mtime backstop entirely. Fail closed instead: such a window
+  # never prunes anything.
+  case "$num" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [ "$num" -ge 1 ] || return 1
   [ -n "$(find "$dir" -newermt "-${window}" -print -quit 2>/dev/null)" ] && return 1
   return 0
 }
@@ -309,11 +375,9 @@ try_remove() {
   local target="$1" window="$2" label="$3"
   # Never remove something a live job holds, at any tier.
   is_in_use "$target" && { log "skipped (in use) $target"; return 1; }
-  # A window of 0 (in any unit) means "prune regardless of age" (tier 3).
-  local num="${window%% *}"
-  if [ "$num" != "0" ]; then
-    is_stale "$target" "$window" || return 1
-  fi
+  # The age window is ALWAYS checked. There is no "prune regardless of age"
+  # mode: the window is what keeps a live job's checkout alive.
+  is_stale "$target" "$window" || return 1
   if [ "$DRY_RUN" = "1" ]; then
     log "would prune $label $target"
     return 0
@@ -331,15 +395,40 @@ prune_at_depth() {
   done < <(find "$parent" -mindepth "$mind" -maxdepth "$maxd" -type d -print0 2>/dev/null)
 }
 
+# Delete the action watermarks whose version directory is gone.
+#
+# The runner writes the watermark for a downloaded action as a SIBLING file
+# next to the version directory: _work/_actions/<owner>/<repo>/v1.completed
+# next to _work/_actions/<owner>/<repo>/v1/. The version directory is a
+# directory, so a sweep that only prunes directories removes v1/ and leaves
+# v1.completed behind.
+#
+# That orphan bricks actions/checkout permanently: the runner sees the
+# watermark, skips the download, and the action manifest is missing, so the
+# step fails. It never self-heals — the runner never removes the watermark
+# and the sweep never removed one. So the watermark is removed exactly when
+# its version directory is gone, which makes the runner download the action
+# again on the next job.
+prune_orphan_action_markers() {
+  local actions_root="$1" marker version_dir
+  [ -d "$actions_root" ] || return 0
+  while IFS= read -r -d '' marker; do
+    version_dir="${marker%.completed}"
+    # Still has its version directory: the watermark is doing its job.
+    [ -d "$version_dir" ] && continue
+    remove_file "$marker" "action-marker"
+  done < <(find "$actions_root" -mindepth 3 -maxdepth 3 -type f -name '*.completed' -print0 2>/dev/null)
+}
+
 prune_runner_work() {
   local home="$1" tier="$2" work="$1/_work" d name
   [ -d "$work" ] || return 0
 
   local stale_h action_d tool_d diag_d
-  stale_h="$(scaled_hours "$BASE_STALE_HOURS" "$tier")"
-  action_d="$(scaled_days "$BASE_ACTIONS_DAYS" "$tier")"
-  tool_d="$(scaled_days "$BASE_TOOL_DAYS" "$tier")"
-  diag_d="$(scaled_days "$BASE_DIAG_DAYS" "$tier")"
+  stale_h="$(scaled_age "$BASE_STALE_HOURS" "$tier")"
+  action_d="$(scaled_age "$BASE_ACTIONS_DAYS" "$tier")"
+  tool_d="$(scaled_age "$BASE_TOOL_DAYS" "$tier")"
+  diag_d="$(scaled_age "$BASE_DIAG_DAYS" "$tier")"
 
   # Repo checkouts: _work/<repo>/. Never the runner's own bookkeeping.
   for d in "$work"/*/; do
@@ -363,12 +452,8 @@ prune_runner_work() {
   # Runner worker logs: _diag/*.log.
   if [ -d "$home/_diag" ]; then
     while IFS= read -r -d '' d; do
-      if [ "$diag_d" = "0" ]; then
-        remove_file "$d" "log"
-      else
-        is_stale "$d" "${diag_d} days" || continue
-        remove_file "$d" "log"
-      fi
+      is_stale "$d" "${diag_d} days" || continue
+      remove_file "$d" "log"
     done < <(find "$home/_diag" -maxdepth 1 -type f -name '*.log' -print0 2>/dev/null)
   fi
 
@@ -380,7 +465,7 @@ prune_runner_work() {
 
 prune_caches() {
   local tier="$1" c cache_d
-  cache_d="$(scaled_days "$BASE_CACHE_DAYS" "$tier")"
+  cache_d="$(scaled_age "$BASE_CACHE_DAYS" "$tier")"
 
   for c in "$HOME_DIR/.cache/pip" "$HOME_DIR/.cache/uv" "$HOME_DIR/.npm/_cacache" \
            "$HOME_DIR/.bun/install/cache" "$HOME_DIR/.cache/pre-commit" \
@@ -402,14 +487,44 @@ prune_caches() {
   fi
 }
 
+# The system-level prune.
+#
+# $1 is the tier of the ROOT filesystem (journal, apt, /tmp live there) and
+# $2 is the tier of the DATA filesystem (docker's storage lives there). The
+# two are kept apart on purpose: root pressure must not make the sweep
+# aggressive with the data disk that holds the checkouts, and vice versa.
+#
+# Every destructive step is behind the dry-run guard. "docker image prune
+# -af" removes EVERY unused image, so an unguarded call in a routine that
+# fires every 15 minutes is a foot-gun, not a cleanup.
 prune_system() {
-  local tier="$1" tmp_d
-  tmp_d="$(scaled_days "$BASE_TMP_DAYS" "$tier")"
+  local root_tier="$1" data_tier="$2" tmp_d
+  tmp_d="$(scaled_age "$BASE_TMP_DAYS" "$root_tier")"
 
   # These are always safe and always worth doing: they are bounded and cheap.
-  journalctl --vacuum-size="$JOURNAL_MAX" >/dev/null 2>&1 || true
-  apt-get clean >/dev/null 2>&1 || true
-  rm -rf /var/lib/apt/lists/* >/dev/null 2>&1 || true
+  if [ "$DRY_RUN" = "1" ]; then
+    log "would vacuum the journal to $JOURNAL_MAX"
+  else
+    journalctl --vacuum-size="$JOURNAL_MAX" >/dev/null 2>&1 || true
+  fi
+
+  if [ "$DRY_RUN" = "1" ]; then
+    log "would clean the apt cache"
+  else
+    apt-get clean >/dev/null 2>&1 || true
+  fi
+
+  # The package INDEX is only dropped from tier 2 up. Dropping it on every
+  # tick empties the index, and the next "apt-get install" then fails with
+  # "Unable to locate package" until somebody runs "apt-get update".
+  # "apt-get clean" alone reclaims most of the space anyway.
+  if [ "$root_tier" -ge 2 ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+      log "would drop the apt package lists"
+    else
+      rm -rf /var/lib/apt/lists/* >/dev/null 2>&1 || true
+    fi
+  fi
 
   # Crash dumps.
   if [ -d /var/lib/systemd/coredump ]; then
@@ -420,17 +535,28 @@ prune_system() {
     fi
   fi
 
-  # Old regular files in /tmp (never sockets, never directories).
-  if [ -d /tmp ]; then
+  # Old regular files in the temporary directory (never sockets, never
+  # directories).
+  if [ -d "$TMP_DIR" ]; then
     while IFS= read -r -d '' d; do
       [ -f "$d" ] || continue
       remove_file "$d" "tmp"
-    done < <(find /tmp -maxdepth 1 -type f -mtime "+${tmp_d}" -print0 2>/dev/null)
+    done < <(find "$TMP_DIR" -maxdepth 1 -type f -mtime "+${tmp_d}" -print0 2>/dev/null)
   fi
 
-  # Docker lives on the data disk, but prune so the data disk cannot fill.
+  # Docker's storage lives on the data disk, so docker is pruned at the DATA
+  # tier: a full root filesystem must not wipe every unused image.
   if command -v docker >/dev/null 2>&1; then
-    if [ "$tier" -ge 2 ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+      if [ "$data_tier" -ge 2 ]; then
+        log "would prune unused docker images (older than $DOCKER_AGE)"
+        log "would prune unused docker build cache (older than $DOCKER_AGE)"
+        log "would prune stopped docker containers (older than $DOCKER_AGE)"
+      else
+        log "would prune dangling docker images"
+        log "would prune dangling docker build cache"
+      fi
+    elif [ "$data_tier" -ge 2 ]; then
       docker image prune -af --filter "until=${DOCKER_AGE}" >/dev/null 2>&1 || true
       docker builder prune -af --filter "until=${DOCKER_AGE}" >/dev/null 2>&1 || true
       docker container prune -f --filter "until=${DOCKER_AGE}" >/dev/null 2>&1 || true
@@ -443,42 +569,88 @@ prune_system() {
 
 # ----------------------------------------------------------------- main cycle
 
+# The tier a pass runs at. The tier is CARRIED across passes and escalates by
+# one while the filesystem is still over target, so a busy afternoon keeps
+# pushing even when the percentage does not move. It never drops below the
+# tier the current pressure implies, and never rises above tier 3.
+#
+# Each filesystem has its own carried tier: root pressure must not escalate
+# the sweep of the data disk that holds the checkouts.
+escalate_tier() {
+  local previous="$1" current="$2" next
+  # No pressure at all: nothing to escalate, and nothing to sweep.
+  if [ "$current" -le 0 ]; then echo 0; return; fi
+  next=$(( previous + 1 ))
+  [ "$next" -gt 3 ] && next=3
+  [ "$current" -gt "$next" ] && next="$current"
+  echo "$next"
+}
+
+# Take the mutual-exclusion lock. Returns non-zero (and does not exit) when
+# the lock is already held by another cleanup run — the weekly
+# runner-cleanup.service on this host prunes the work tree too and has no
+# in-use guard of its own.
+acquire_lock() {
+  if ! command -v flock >/dev/null 2>&1; then
+    log "WARN: flock is unavailable; running without mutual exclusion"
+    return 0
+  fi
+  # Check that the lock file can be created before handing it to exec: a
+  # failed exec redirection is reported by the shell itself and cannot be
+  # silenced, so it is checked (and reported) before it can happen.
+  if ! touch "$LOCK_FILE" 2>/dev/null; then
+    log "WARN: cannot open the lock file $LOCK_FILE; running without mutual exclusion"
+    return 0
+  fi
+  if ! exec 9>"$LOCK_FILE" 2>/dev/null; then
+    log "WARN: cannot open the lock file $LOCK_FILE; running without mutual exclusion"
+    return 0
+  fi
+  if ! flock -n 9; then
+    log "another disk-cleanup run holds $LOCK_FILE; skipping this tick"
+    return 1
+  fi
+  return 0
+}
+
 sweep_once() {
-  local tier="$1"
+  local data_tier="$1" root_tier="$2"
   local root_pct data_pct
   root_pct="$(pct_for_path /)"
   data_pct="$(work_pct)"
 
-  # Each filesystem is scored on its own pressure, and swept at its own tier.
-  local work_tier cache_tier
-  work_tier="$(tier_for_pct "$data_pct")"
-  cache_tier="$(tier_for_pct "$root_pct")"
+  log "sweep root=${root_pct}% (root tier $root_tier) data=${data_pct}% (data tier $data_tier)"
 
-  log "sweep tier=$tier root=${root_pct}% (cache tier $cache_tier) data=${data_pct}% (work tier $work_tier)"
+  local home
+  for home in "${RUNNER_HOME_LIST[@]:-}"; do
+    [ -n "$home" ] || continue
+    if [ ! -d "$home" ]; then
+      log "WARN: runner home $home does not exist; skipping it"
+      continue
+    fi
+    if [ "$data_tier" -ge 1 ]; then
+      prune_runner_work "$home" "$data_tier"
+    fi
+    # Repair orphaned action watermarks at EVERY tier, including tier 0: a
+    # watermark whose version directory is gone makes actions/checkout skip
+    # the download forever, and that must not wait for disk pressure.
+    prune_orphan_action_markers "$home/_work/_actions"
+  done
 
-  if [ "$work_tier" -ge 1 ]; then
-    local home
-    for home in "${RUNNER_HOME_LIST[@]:-}"; do
-      [ -n "$home" ] || continue
-      [ -d "$home" ] || continue
-      prune_runner_work "$home" "$work_tier"
-    done
+  if [ "$root_tier" -ge 1 ]; then
+    prune_caches "$root_tier"
   fi
 
-  if [ "$cache_tier" -ge 1 ]; then
-    prune_caches "$cache_tier"
-  fi
-
-  prune_system "$tier"
+  prune_system "$root_tier" "$data_tier"
 }
 
 main() {
-  collect_inuse
-
-  local root_pct data_pct worst_tier pass
+  local root_pct data_pct pass
+  local root_tier data_tier
   local start_root start_data
 
   if [ "$STATUS_ONLY" = "1" ]; then
+    collect_inuse
     root_pct="$(pct_for_path /)"
     data_pct="$(work_pct)"
     log "status: root=${root_pct}% (tier $(tier_for_pct "$root_pct")) data=${data_pct}% (tier $(tier_for_pct "$data_pct")) inuse_paths=${#INUSE_PATHS[@]}"
@@ -486,27 +658,36 @@ main() {
     return 0
   fi
 
+  # Mutual exclusion: never run at the same time as another cleanup run on
+  # this host.
+  acquire_lock || return 0
+
+  root_tier=0
+  data_tier=0
+
   for pass in $(seq 1 "$MAX_PASSES"); do
     root_pct="$(pct_for_path /)"
     data_pct="$(work_pct)"
 
-    worst_tier=0
-    [ "$root_pct" -ge "$WATCH_PCT" ] && worst_tier=1
-    [ "$root_pct" -ge "$ELEVATED_PCT" ] && worst_tier=2
-    [ "$root_pct" -ge "$CRITICAL_PCT" ] && worst_tier=3
-    [ "$data_pct" -ge "$ELEVATED_PCT" ] && worst_tier=2
-    [ "$data_pct" -ge "$CRITICAL_PCT" ] && worst_tier=3
+    # Each filesystem keeps its own tier, escalated independently.
+    root_tier="$(escalate_tier "$root_tier" "$(tier_for_pct "$root_pct")")"
+    data_tier="$(escalate_tier "$data_tier" "$(tier_for_pct "$data_pct")")"
 
-    if [ "$worst_tier" -eq 0 ]; then
+    if [ "$root_tier" -eq 0 ] && [ "$data_tier" -eq 0 ]; then
       # Nothing to do. Still run the bounded, always-safe system prune so
       # journal/apt do not creep, but skip every cache and checkout sweep.
-      prune_system 0
+      sweep_once 0 0
       return 0
     fi
 
+    # The in-use set is re-collected at the top of EVERY pass: a job that
+    # starts while an earlier pass is running must be protected by the next
+    # one, not by a snapshot taken before the first pass began.
+    collect_inuse
+
     start_root="$root_pct"
     start_data="$data_pct"
-    sweep_once "$worst_tier"
+    sweep_once "$data_tier" "$root_tier"
 
     root_pct="$(pct_for_path /)"
     data_pct="$(work_pct)"
@@ -530,4 +711,9 @@ main() {
   fi
 }
 
-main "$@"
+# Run the routine when the script is executed. When it is sourced — the
+# sandbox tests do that to exercise the sweep functions in isolation —
+# nothing runs on its own.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
