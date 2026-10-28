@@ -16,6 +16,15 @@
 #     default /usr prefix is root-owned and breaks `npm install -g` with
 #     EACCES for the non-root runner user)
 #   - pip + pipx (for Python tooling installed globally on the host)
+#   - The GitHub CLI (gh). The GitHub-hosted images ship it pre-installed;
+#     a bare self-hosted host does not, so a workflow that calls `gh api`
+#     dies with "gh: command not found" (exit code 127) while the runner
+#     itself looks healthy. On Linux the official release tarball is
+#     installed to /usr/local/bin/gh — the architecture the host runs on
+#     (arm64 or amd64) — which is root-owned and on the default GitHub
+#     Actions job PATH. The release is pinned and the download is checked
+#     against a recorded sha256 before it is unpacked: the binary ends up
+#     root-owned and world executable, so every job on the host runs it.
 #   - uv (the Python package manager — installed by the official astral
 #     installer to ~/.local/bin/uv and added to the user's shell rc)
 #   - bun (the TypeScript runtime archgate is built with)
@@ -32,16 +41,96 @@ set -euo pipefail
 NODE_MAJOR="${NODE_MAJOR:-22}"
 NPM_PREFIX="${NPM_PREFIX:-/usr/local}"
 ARCHGATE_VERSION="${ARCHGATE_VERSION:-v0.60.0}"
+# Where the GitHub CLI is installed and which release is installed. The
+# release is PINNED: the sha256 of the asset is recorded in this file and
+# the download is verified against it, so the install is reproducible and
+# a tampered tarball never reaches /usr/local/bin. A pinned release that
+# has no recorded digest stops the install. Set GH_VERSION=latest to
+# follow the newest release instead — a release that is named in advance
+# has no recorded digest yet, so its digest comes from the upstream
+# checksum file, which is a weaker guarantee because it arrives from the
+# same origin as the tarball.
+GH_INSTALL_PATH="${GH_INSTALL_PATH:-/usr/local/bin/gh}"
+GH_VERSION="${GH_VERSION:-v2.103.3}"
 
 log() { printf '[provision] %s\n' "$*"; }
 
-SUDO=""
-if [ "$(id -u)" -ne 0 ]; then
-  SUDO="sudo"
+# The command used to escalate to root for the writes that need it. It is
+# empty when the script already runs as root. It can be pinned from the
+# environment — the tests set it to "env" so an install can run into a
+# temporary directory without a password prompt.
+SUDO="${SUDO:-sudo}"
+if [ "$(id -u)" -eq 0 ] && [ "$SUDO" = "sudo" ]; then
+  SUDO=""
 fi
+
+# Whether the escalation command is a real sudo. The flags that belong to
+# sudo are only passed to it: a pinned escalation command — the tests pin
+# $SUDO to "env" — is not sudo and does not know them.
+is_sudo() {
+  [ "${1##*/}" = "sudo" ]
+}
+
+# Run a command as root when the script is not root already.
+#
+# The escalation is chosen HERE instead of being interpolated into the
+# command line: an empty $SUDO used to leave the sudo flags behind, so
+# `curl … | $SUDO -E bash -` became `-E bash -` and the shell reported
+# "-E: command not found" every time the script ran as root — which is
+# how `gh-runners provision` is normally run.
+run_privileged() {
+  if [ -n "$SUDO" ]; then
+    if is_sudo "$SUDO"; then
+      # -n: a non-interactive provision must fail instead of hanging on a
+      # password prompt.
+      "$SUDO" -n "$@"
+    else
+      "$SUDO" "$@"
+    fi
+  else
+    "$@"
+  fi
+}
+
+# Pipe a remote install script into bash.
+#
+# `sudo -E` keeps the environment (the NodeSource script needs it), and
+# the flag only exists when there is a sudo to hand it to. `-n` makes the
+# escalation non-interactive: a provision that is not watched cannot
+# answer a password prompt.
+run_remote_script() {
+  if [ -n "$SUDO" ]; then
+    if is_sudo "$SUDO"; then
+      "$SUDO" -n -E bash -
+    else
+      "$SUDO" bash -
+    fi
+  else
+    bash -
+  fi
+}
+
+# Put back the EXIT trap that was in place before one of this script's
+# own was installed.
+#
+# `trap - EXIT` clears EVERY EXIT trap, so a caller that registered a
+# cleanup of its own would lose it. The trap has to be restored BEFORE
+# the script exits, not from inside the EXIT handler: a trap that is
+# registered while the EXIT trap runs is never run itself.
+restore_exit_trap() {
+  trap - EXIT
+  if [ -n "${1:-}" ]; then
+    eval "$1"
+  fi
+}
 
 uname_s="$(uname -s)"
 uname_m="$(uname -m)"
+
+# The PATH a GitHub Actions job gets by default. gh has to resolve from
+# it, not just from the installer's PATH: the job runs as the runner
+# user.
+DEFAULT_JOB_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # user-local bin dirs that must end up on the runner's PATH
 USER_BIN_DIRS=(
@@ -96,8 +185,8 @@ ensure_node_linux() {
     log "node $(node --version) / npm $(npm --version) already present"
   else
     log "installing Node.js ${NODE_MAJOR}.x via NodeSource"
-    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | $SUDO -E bash -
-    $SUDO apt-get install -y nodejs
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | run_remote_script
+    run_privileged apt-get install -y nodejs
   fi
 
   # The default npm prefix (/usr) is root-owned, so `npm install -g` fails
@@ -106,8 +195,8 @@ ensure_node_linux() {
   local user group
   user="$(id -un)"
   group="$(id -gn)"
-  $SUDO mkdir -p "${NPM_PREFIX}/lib/node_modules" "${NPM_PREFIX}/bin"
-  $SUDO chown -R "${user}:${group}" "${NPM_PREFIX}/lib/node_modules" "${NPM_PREFIX}/bin"
+  run_privileged mkdir -p "${NPM_PREFIX}/lib/node_modules" "${NPM_PREFIX}/bin"
+  run_privileged chown -R "${user}:${group}" "${NPM_PREFIX}/lib/node_modules" "${NPM_PREFIX}/bin"
   npm config set prefix "${NPM_PREFIX}"
   log "npm global prefix set to ${NPM_PREFIX} (owned by ${user})"
 }
@@ -131,7 +220,7 @@ ensure_pipx_linux() {
     return
   fi
   log "installing python3-pip + pipx"
-  $SUDO apt-get install -y python3-pip pipx
+  run_privileged apt-get install -y python3-pip pipx
   pipx ensurepath >/dev/null 2>&1 || true
 }
 
@@ -147,6 +236,277 @@ ensure_pipx_macos() {
   else
     log "WARN: Homebrew not found; skipping pipx"
   fi
+}
+
+# The GitHub CLI release to install. The version is pinned by default; the
+# release API is only consulted when GH_VERSION asks for "latest".
+#
+# A failed lookup returns non-zero instead of exiting: the caller decides
+# whether an unreachable release API is fatal (no gh installed) or not (a
+# usable gh is already there and must be kept).
+gh_version() {
+  if [ -n "$GH_VERSION" ] && [ "$GH_VERSION" != "latest" ]; then
+    printf '%s' "${GH_VERSION#v}"
+    return
+  fi
+  local tag
+  # A failed lookup must not abort the script here: the empty tag is
+  # reported with a message of its own below.
+  tag="$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest \
+    | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' \
+    | head -1 || true)"
+  if [ -z "$tag" ]; then
+    return 1
+  fi
+  printf '%s' "$tag"
+}
+
+# The numeric core of a version string. "2.103.3" comes out of "v2.103.3",
+# "2.103.3" and "gh version 2.103.3 (2026-01-01)" alike, so the installed
+# binary and the requested release can be compared.
+version_core() {
+  printf '%s' "${1:-}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
+}
+
+# The version of the gh binary that is already installed, empty when there
+# is none or when it cannot be run.
+installed_gh_version() {
+  [ -x "$GH_INSTALL_PATH" ] || return 0
+  local out
+  out="$("$GH_INSTALL_PATH" --version 2>/dev/null | head -1 || true)"
+  version_core "$out"
+}
+
+# The asset architecture for the host. The CLI publishes linux_arm64 and
+# linux_amd64; the runner fleet is aarch64.
+gh_linux_arch() {
+  case "$uname_m" in
+    aarch64 | arm64) printf 'arm64' ;;
+    x86_64 | amd64) printf 'amd64' ;;
+    *)
+      log "ERROR: unsupported architecture '$uname_m' for the GitHub CLI install"
+      exit 1
+      ;;
+  esac
+}
+
+# The sha256 of the pinned release assets, keyed by version and
+# architecture.
+#
+# These digests are the ones upstream publishes in
+# gh_<version>_checksums.txt, recorded here so the download is checked
+# against a constant this repository controls. A checksum file fetched
+# from the same origin as the tarball proves nothing on its own: it can
+# be tampered with together with the asset it describes.
+#
+# A version that is not listed here has no trusted digest. An explicitly
+# pinned release then stops the install until its digest is added — that
+# is the point of pinning. Only a "latest" request, which names no
+# release in advance, may fall back to the upstream checksum file.
+gh_expected_sha256() {
+  local version="$1" arch="$2"
+  case "${version}-${arch}" in
+    2.103.3-arm64)
+      printf 'ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63'
+      ;;
+    2.103.3-amd64)
+      printf '4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# The sha256 of a file. GNU coreutils and the BSD tools spell this
+# differently and the script runs on both.
+file_sha256() {
+  local file="$1" out
+  if command -v sha256sum >/dev/null 2>&1; then
+    out="$(sha256sum "$file")" || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    out="$(shasum -a 256 "$file")" || return 1
+  else
+    log "ERROR: no sha256sum or shasum on this host; cannot verify the download"
+    return 1
+  fi
+  # Both print "<digest>  <file>"; the digest is the first field.
+  printf '%s' "${out%% *}"
+}
+
+# The sha256 upstream publishes for an asset, read from the release's
+# checksum file. This is corroboration only — the file arrives from the
+# same origin as the asset. Fails when the file cannot be fetched or has
+# no entry for the asset.
+upstream_sha256() {
+  local tmpdir="$1" version="$2" asset="$3" sums candidate digest name
+  sums="$tmpdir/checksums.txt"
+  if ! curl -fsSL \
+    "https://github.com/cli/cli/releases/download/v${version}/gh_${version}_checksums.txt" \
+    -o "$sums"; then
+    return 1
+  fi
+  while IFS= read -r candidate; do
+    # The line is "<digest>  <asset>"; the asset name has to match
+    # exactly, a prefix is not enough.
+    read -r digest name <<<"$candidate"
+    if [ "$name" = "$asset" ]; then
+      printf '%s' "$digest"
+      return 0
+    fi
+  done <"$sums"
+  return 1
+}
+
+# Verify a downloaded release asset before anything is unpacked.
+#
+# The digest that decides is the constant recorded in this file; the
+# upstream checksum file only corroborates it. Fails closed — a missing
+# digest, an unreadable file or a mismatch all stop the install before
+# the archive is unpacked and before the binary is written.
+#
+# $6 is the release that was ASKED for: "v2.103.3" or "latest". Only a
+# "latest" request may fall back to the upstream checksum file. A pinned
+# release that has no recorded digest stops the install, because that is
+# what pinning it means — the next maintainer action, bumping GH_VERSION,
+# must not silently swap the trust anchor for one that arrives from the
+# same origin as the tarball.
+verify_gh_asset() {
+  local tmpdir="$1" file="$2" version="$3" arch="$4" asset="$5" requested="$6"
+  local actual expected upstream
+  if ! actual="$(file_sha256 "$file")"; then
+    log "ERROR: could not compute the sha256 of $asset"
+    return 1
+  fi
+
+  expected="$(gh_expected_sha256 "$version" "$arch" || true)"
+
+  if [ -z "$expected" ] && [ "$requested" != "latest" ]; then
+    log "ERROR: no pinned sha256 for the GitHub CLI ${version} ${arch} asset"
+    log "ERROR: add the digest to gh_expected_sha256 for ${version} ${arch}, or set GH_VERSION=latest to follow the upstream checksum file"
+    return 1
+  fi
+
+  upstream="$(upstream_sha256 "$tmpdir" "$version" "$asset" || true)"
+
+  if [ -z "$expected" ]; then
+    # A "latest" request names no release in advance, so there is no
+    # constant to check against. The upstream checksum file is then the
+    # only anchor left, and it arrives from the same origin as the asset
+    # — a weaker guarantee, so it is said out loud.
+    if [ -z "$upstream" ]; then
+      log "ERROR: no pinned sha256 for the GitHub CLI ${version} ${arch} asset and no upstream checksum for it"
+      log "ERROR: add the digest to gh_expected_sha256, or pin GH_VERSION to a release that has one"
+      return 1
+    fi
+    log "WARN: the GitHub CLI ${version} ${arch} release is not pinned; the digest comes from the upstream checksum file"
+    expected="$upstream"
+  fi
+
+  # The digest that decides.
+  if [ "$actual" != "$expected" ]; then
+    log "ERROR: sha256 mismatch for $asset"
+    log "ERROR: expected $expected"
+    log "ERROR: got      $actual"
+    return 1
+  fi
+
+  # Corroboration: the upstream checksum file has to agree with the digest
+  # the install just checked the download against.
+  if [ -z "$upstream" ]; then
+    log "WARN: could not read the upstream checksum file for $asset; the pinned digest was used"
+  elif [ "$upstream" != "$expected" ]; then
+    log "ERROR: the upstream checksum file disagrees with the sha256 for $asset"
+    log "ERROR: upstream $upstream, expected $expected"
+    return 1
+  fi
+
+  log "verified: $asset matches sha256 $actual"
+}
+
+# Install the GitHub CLI from the official release tarball.
+#
+# The GitHub-hosted images ship gh pre-installed; a bare self-hosted host
+# does not, so a workflow that calls `gh api` dies with "gh: command not
+# found" (exit code 127) while the runner itself looks healthy. The binary
+# goes to /usr/local/bin/gh — root-owned, world executable and on the
+# default GitHub Actions job PATH — so the non-root runner user can run it.
+#
+# The installed binary is compared against the requested release: an gh that
+# is already the requested version is left alone (the host may have been
+# provisioned by hand), a different one is replaced.
+#
+# The download is verified against the pinned sha256 before it is unpacked.
+# Everything the host runs as root is worth verifying: this binary ends up
+# world executable and shared by every job on the fleet.
+ensure_gh_linux() {
+  local installed
+  installed="$(installed_gh_version)"
+
+  local version
+  version="$(gh_version)" || version=""
+  if [ -z "$version" ]; then
+    if [ -n "$installed" ]; then
+      # The release API is unreachable but a working gh is installed: keep
+      # it rather than failing the provisioning of an otherwise good host.
+      log "WARN: could not read the latest GitHub CLI release; keeping gh $installed at $GH_INSTALL_PATH"
+      return
+    fi
+    log "ERROR: could not read the latest GitHub CLI release from the GitHub API"
+    exit 1
+  fi
+
+  local arch asset url tmpdir binary
+  arch="$(gh_linux_arch)"
+  asset="gh_${version}_linux_${arch}.tar.gz"
+  url="https://github.com/cli/cli/releases/download/v${version}/${asset}"
+
+  if [ -n "$installed" ]; then
+    if [ "$(version_core "$installed")" = "$(version_core "$version")" ]; then
+      log "gh $installed already present at $GH_INSTALL_PATH"
+      return
+    fi
+    log "updating GitHub CLI ${installed} -> ${version} (${asset})"
+  else
+    log "installing GitHub CLI ${version} (${asset})"
+  fi
+
+  tmpdir="$(mktemp -d)"
+  # The cleanup trap is removed again below. Only the trap this function
+  # installed is removed: the one that was in place before is put back, so
+  # sourcing this script does not swallow a cleanup the caller registered.
+  local previous_exit_trap
+  previous_exit_trap="$(trap -p EXIT)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmpdir'" EXIT
+  curl -fsSL "$url" -o "$tmpdir/$asset"
+  if ! verify_gh_asset "$tmpdir" "$tmpdir/$asset" "$version" "$arch" "$asset" "$GH_VERSION"; then
+    log "ERROR: refusing to install an unverified GitHub CLI"
+    # The caller's trap has to be back in place before the script leaves,
+    # or the cleanup it registered never runs.
+    restore_exit_trap "$previous_exit_trap"
+    rm -rf "$tmpdir"
+    exit 1
+  fi
+  tar -xzf "$tmpdir/$asset" -C "$tmpdir"
+  # The upstream tarball holds one directory named after the asset, with
+  # the binary in bin/. The path is spelled out: `find` would match any
+  # archive member called "gh" and its traversal order is not guaranteed.
+  binary="$tmpdir/gh_${version}_linux_${arch}/bin/gh"
+  if [ ! -f "$binary" ]; then
+    log "ERROR: $asset does not contain a gh binary"
+    restore_exit_trap "$previous_exit_trap"
+    rm -rf "$tmpdir"
+    exit 1
+  fi
+  # `install` creates the file as its invoking user and runs under sudo, so
+  # the result is root-owned with the mode the runner needs. The target
+  # directory is not guaranteed to exist on a bare host.
+  run_privileged mkdir -p "$(dirname "$GH_INSTALL_PATH")"
+  run_privileged install -m 0755 "$binary" "$GH_INSTALL_PATH"
+  restore_exit_trap "$previous_exit_trap"
+  rm -rf "$tmpdir"
+  log "gh $("$GH_INSTALL_PATH" --version | head -1) installed to $GH_INSTALL_PATH"
 }
 
 ensure_uv() {
@@ -205,27 +565,122 @@ ensure_archgate() {
   fi
 }
 
-case "$uname_s" in
-  Linux)
-    $SUDO apt-get update -y
-    ensure_node_linux
-    ensure_pipx_linux
-    ;;
-  Darwin)
-    ensure_node_macos
-    ensure_pipx_macos
-    ;;
-  *)
-    log "ERROR: unsupported OS '$uname_s' (expected Linux or Darwin)"
+# Run a command as another user.
+#
+# The escalation command is the pinned $SUDO, so a sandbox that pins it
+# does not escalate at all. Only a real sudo can become another user; any
+# other escalation command runs the command as the invoking user. Root
+# still needs sudo for this — becoming another user is the one thing it
+# cannot do on its own — and it is non-interactive so a missing password
+# fails the install instead of hanging on a prompt.
+as_user() {
+  local user="$1"
+  shift
+  if [ "$(id -un)" = "$user" ]; then
+    "$@"
+    return
+  fi
+  local escalate="$SUDO"
+  if [ -z "$escalate" ]; then
+    escalate="sudo"
+  fi
+  if is_sudo "$escalate"; then
+    "$escalate" -n -u "$user" -- "$@"
+  else
+    "$escalate" "$@"
+  fi
+}
+
+# The user the runner service runs as. It is the owner of the runner home
+# — never hardcoded, the same way install-disk-cleanup.sh does it — and
+# never derived from $HOME either: provisioning runs as root, and root's
+# home holds no runner directory, so a $HOME-based lookup always fell
+# back to root and the "the runner user can run gh" check verified root
+# instead of the user a job actually runs as.
+#
+# Falls back to the user the script runs as when there is no runner home
+# yet.
+runner_user() {
+  local runner_dir owner
+  for runner_dir in "$HOME"/actions-runner*; do
+    [ -d "$runner_dir" ] || continue
+    owner="$(stat -c '%U' "$runner_dir" 2>/dev/null || true)"
+    if [ -z "$owner" ]; then
+      owner="$(stat -f '%Su' "$runner_dir" 2>/dev/null || true)"
+    fi
+    # An id with no passwd entry comes back as UNKNOWN; fall back to the
+    # user the script runs as.
+    if [ -n "$owner" ] && [ "$owner" != "UNKNOWN" ]; then
+      printf '%s' "$owner"
+      return
+    fi
+  done
+  id -un
+}
+
+# Assert that the runner user can really run gh. The binary is root-owned
+# and world executable by construction, but the job still dies with "gh:
+# command not found" when the PATH that carries it is not the one the job
+# gets — so the check runs gh under the default job PATH, as the runner
+# user.
+#
+# The check runs as that user and not as root: root bypasses the mode
+# bits, so a root-only check would pass for a binary the runner user
+# cannot execute.
+verify_gh_runnable() {
+  if [ "$uname_s" != "Linux" ]; then
+    # gh is installed by this script on Linux only; there is nothing to
+    # verify on a macOS host.
+    return
+  fi
+  local user
+  user="$(runner_user)"
+  if as_user "$user" env PATH="$DEFAULT_JOB_PATH" gh --version >/dev/null 2>&1; then
+    log "verified: $user can run gh"
+  else
+    log "ERROR: $user cannot run gh"
+    log "ERROR: jobs that call 'gh api' would fail with 'gh: command not found'"
     exit 1
-    ;;
-esac
+  fi
+}
 
-ensure_uv
-ensure_bun
-ensure_archgate
+main() {
+  case "$uname_s" in
+    Linux)
+      run_privileged apt-get update -y
+      ensure_node_linux
+      ensure_pipx_linux
+      ensure_gh_linux
+      ;;
+    Darwin)
+      ensure_node_macos
+      ensure_pipx_macos
+      ;;
+    *)
+      log "ERROR: unsupported OS '$uname_s' (expected Linux or Darwin)"
+      exit 1
+      ;;
+  esac
 
-ensure_user_path_in_shell_rc
-ensure_user_path_in_runner
+  ensure_uv
+  ensure_bun
+  ensure_archgate
 
-log "host provisioning complete (uv, bun, archgate on PATH)"
+  ensure_user_path_in_shell_rc
+  ensure_user_path_in_runner
+
+  verify_gh_runnable
+
+  local summary="uv, bun, archgate"
+  if [ "$uname_s" = "Linux" ]; then
+    summary="$summary, gh"
+  fi
+  log "host provisioning complete ($summary on PATH)"
+}
+
+# Run the provisioning when the script is executed. When it is sourced — the
+# tests do that to exercise the individual installers in isolation —
+# nothing runs on its own.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
