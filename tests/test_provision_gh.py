@@ -535,9 +535,7 @@ class TestArchitecture:
         assert result.returncode != 0
         assert "unsupported architecture" in result.stderr
 
-    def test_the_production_path_reports_the_unsupported_architecture(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_production_path_reports_the_unsupported_architecture(self, tmp_path: Path) -> None:
         """The install itself has to say WHY it gave up."""
         env = _sandbox(tmp_path)
         script = f'source "{SCRIPT}"; uname_m=sparc64; ensure_gh_linux'
