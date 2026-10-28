@@ -10,6 +10,7 @@ jobs:
   _ty-self-hosted:
     name: "ty (self-hosted)"
     runs-on: [self-hosted, ubuntu-latest]
+    timeout-minutes: 30
     continue-on-error: true
     outputs:
       passed: ${{ steps.mark.outputs.passed }}
@@ -22,8 +23,17 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
+      # The interpreter is pinned on purpose. Left unpinned, `uv` picks the
+      # NEWEST CPython on the runner, and pip-api 0.0.34 (via pip-audit
+      # 2.10.1) vendors a pyparsing 2.x that imports `sre_constants` —
+      # removed in Python 3.15 — so the audit dies with ModuleNotFoundError.
+      # 3.12 is also exactly the interpreter the hosted leg runs, so the two
+      # legs stay true substitutes for each other.
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
       - name: Install dependencies
-        run: uv sync --frozen
+        run: uv sync --frozen --python 3.12
 
       - name: ty check
         run: uv run ty check github_runners_for_repo
@@ -37,6 +47,7 @@ jobs:
     needs: _ty-self-hosted
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Route
         run: echo "self-hosted passed=${{ needs._ty-self-hosted.outputs.passed }}"
@@ -51,9 +62,19 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
+      # The interpreter is pinned on purpose. Left unpinned, `uv` picks the
+      # NEWEST CPython on the runner, and pip-api 0.0.34 (via pip-audit
+      # 2.10.1) vendors a pyparsing 2.x that imports `sre_constants` —
+      # removed in Python 3.15 — so the audit dies with ModuleNotFoundError.
+      # 3.12 is also exactly the interpreter the hosted leg runs, so the two
+      # legs stay true substitutes for each other.
+      - name: Install Python 3.12
+        if: needs._ty-self-hosted.outputs.passed != 'true'
+        run: uv python install 3.12
+
       - name: Install dependencies
         if: needs._ty-self-hosted.outputs.passed != 'true'
-        run: uv sync --frozen
+        run: uv sync --frozen --python 3.12
 
       - name: ty check
         if: needs._ty-self-hosted.outputs.passed != 'true'

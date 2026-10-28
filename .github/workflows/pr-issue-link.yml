@@ -8,6 +8,7 @@ jobs:
   _pr-issue-link-self-hosted:
     name: "pr-issue-link (self-hosted)"
     runs-on: [self-hosted, ubuntu-latest]
+    timeout-minutes: 30
     continue-on-error: true
     outputs:
       passed: ${{ steps.mark.outputs.passed }}
@@ -61,6 +62,7 @@ jobs:
     needs: _pr-issue-link-self-hosted
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Route
         run: echo "self-hosted passed=${{ needs._pr-issue-link-self-hosted.outputs.passed }}"

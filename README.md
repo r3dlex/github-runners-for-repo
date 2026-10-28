@@ -55,6 +55,192 @@ Run this once on each host before `configure` / `start`. It is the
 permanent home of the "self-hosted host needs the toolchain too" lesson —
 re-running after a host rebuild restores the toolchain.
 
+## Host disk management
+
+A self-hosted runner host fills up. The Linux runners live in a Colima VM
+with two filesystems: a 19G root (`/dev/root`) and a 98G data disk
+(`/dev/vdb1`, mounted at `/mnt/lima-colima`). The 19G root is the
+bottleneck — it carries the OS, the toolchain, the runner binaries and
+every package cache, and it is the one that fills first. When it filled,
+both Linux runners went offline, jobs wedged in post-cleanup, and the whole
+org stalled.
+
+Two things keep that from happening again:
+
+- **The runner's `_work` directory is bind-mounted onto the data disk.** The
+  98G disk sat nearly empty while the 19G root filled, so the work area
+  (checkouts, downloaded actions, the tool cache) is mounted on the data
+  disk instead of the root. The two filesystems then fill independently and
+  the root is no longer competing with the checkouts.
+- **A cleanup routine runs every 15 minutes.** `runner-disk-cleanup.timer`
+  fires `runner-disk-cleanup.service` on that heartbeat. The timer is fixed
+  but the work is pressure-adaptive: below 60% disk usage nothing is swept,
+  and above it the routine escalates through tiers (watch, elevated,
+  critical) that halve the age thresholds and, at the top tier, prune
+  everything that is older than the age floor and not in use. After each
+  pass the disk is re-measured, and the routine escalates one tier and
+  sweeps again if it is still over target — one pass is never assumed to
+  be enough. The two filesystems are scored, tiered and escalated
+  separately: a full root filesystem never makes the sweep more aggressive
+  with the data disk that holds the checkouts.
+
+### What the routine will not delete
+
+Two independent rules keep a live job's checkout alive, and both apply at
+every tier:
+
+- **The age floor.** The runner writes into an active job's checkout
+  continuously, so a live job's directory is never stale by mtime. The
+  floor is never zero — the top tier prunes what is older than one hour
+  (one day for the daily caches), not everything it can reach.
+- **The liveness scan.** On Linux the routine reads the working directory
+  and the open files of *every* live process straight out of `/proc` (it
+  falls back to `lsof` elsewhere), and any path under a watched root counts
+  as in use regardless of age. `actions/runner` never changes its own
+  working directory, so the process that holds a checkout is the child it
+  spawned — `node`, `git`, `bash`. A process whose working directory is
+  `_work` itself holds every checkout below it and protects them all.
+
+**A path that is in use is never deleted, at any tier.** The in-use set is
+re-collected at the start of every pass, so a job that starts while an
+earlier pass is running is protected by the next one.
+
+A few directories are never swept at all, whatever their age:
+
+- `_work/_update` — where the runner stages a self-update before copying
+  the new binaries into `bin.<version>`. Removing it mid-update aborts the
+  copy and can leave a runner that cannot start.
+- `_work/_tool`, `_work/_actions`, `_work/_temp` — the runner's own
+  bookkeeping, swept by their own age windows.
+- `_diag/*.log` — the worker logs are the evidence for the "assigned, zero
+  steps" signature, so they keep a minimum age at every tier.
+- A freshly downloaded update archive in the runner home — deleting it
+  aborts the update it belongs to.
+
+Docker is pruned on the data disk, and only within limits: **dangling**
+images and build cache only, never a tagged image, and **never** a stopped
+container. The Docker daemon on the runner host also serves the user's own
+long-lived containers, and their state is not the routine's to destroy.
+
+### Repairing a bricked action
+
+The runner marks a downloaded action with a watermark file *next to* the
+action's version directory (`_work/_actions/<owner>/<repo>/v1.completed`
+beside `.../v1/`). If the version directory is swept away and the
+watermark is left behind, `actions/checkout` skips the download, the action
+manifest is missing, and the step fails — forever, because nothing else
+removes the watermark. The routine therefore deletes a watermark exactly
+when its version directory is gone, which makes the runner download the
+action again on the next job.
+
+### Repairing a broken interpreter
+
+`uv` inspects its managed CPython interpreters when it resolves one for a
+job. A tree whose interpreter lost its execute bit (mode `0444` instead of
+`0755`) makes every such inspection fail with `Permission denied (os error
+13)`, which breaks CI on the fleet even though the interpreter itself is
+intact and the host is otherwise healthy.
+
+That is not a disk-pressure problem, so the repair is **not** gated on the
+pressure tiers: it runs on every sweep, including the tier-0 tick, and
+restores the execute bit on any managed interpreter that is missing it. The
+mode it restores is `0755` — the mode `uv` itself installs — so the tree
+stays consistent with its siblings instead of ending up at `0455`. The
+repair is idempotent: a second run finds nothing to do.
+
+```bash
+runner-disk-cleanup.sh --status   # report only, changes nothing
+runner-disk-cleanup.sh --dry-run  # report what would change, change nothing
+```
+
+### Not running twice at once
+
+The routine takes an exclusive `flock` on `/run/runner-disk-cleanup.lock`.
+The weekly `runner-cleanup.service` on the same host prunes the work tree
+as well and has no in-use guard of its own, so **both units must take the
+same lock**: systemd serialises a unit against itself, never against a
+differently named one. The weekly unit lives outside this repository — the
+lock file is the contract between the two.
+
+### Installing it
+
+```bash
+github_runners_for_repo/scripts/install-disk-cleanup.sh    # Linux
+```
+
+The installer is idempotent: it installs the script to
+`/usr/local/bin/runner-disk-cleanup.sh`, writes the two systemd units, and
+enables the timer. It never stops the `actions.runner.*` services — a
+routine install must not take a runner offline. On macOS it installs
+nothing (systemd timers are Linux-only), but the routine itself is
+portable and runs there too.
+
+The host copy at `/usr/local/bin/runner-disk-cleanup.sh` is the one that
+has been proven under real disk pressure, so the installer refuses to
+overwrite a host script whose content differs from the repository copy
+unless you pass `--force`. With `--force` the previous host script is
+backed up to `runner-disk-cleanup.sh.bak` first:
+
+```bash
+github_runners_for_repo/scripts/install-disk-cleanup.sh --force
+```
+
+### Runner ownership
+
+The runner service runs as a non-root user, and it has to be able to write
+into its own work directory. When a root-run install creates that
+directory — when the work tree is bind-mounted onto the data disk, for
+instance — the directories end up root-owned and every job dies within
+about three seconds with `Access to the path ... is denied`. The runner
+still looks healthy, because it accepted the job and then failed to write
+its work directory: the job is assigned and no step ever runs, which is
+easy to mistake for a billing problem.
+
+The installer therefore derives the owning user from the runner home
+(never a hardcoded name), hands the whole runner home back to that user
+recursively, and then verifies that the user can actually write into the
+runner home, `_work`, `_work/_tool`, `_work/_temp`, `_work/_actions` and
+`_diag` — a root-owned `_actions` or `_diag` produces the same
+"assigned, zero steps" failure as a root-owned `_work`. If it cannot, the
+install fails instead of reporting success. The runner's credential files
+are tightened to `0600` while the installer is there, so no other user on
+the host can read or rewrite them. The cleanup routine itself only ever
+deletes, so it cannot leave a root-owned artefact behind.
+
+A **root-owned** runner home is the one case where the directory's owner
+cannot be the answer: chowning it to root is a no-op and the write check
+would trivially pass, so the install would report success while the
+non-root runner service still could not write. The installer therefore
+asks the runner's own systemd unit (`actions.runner.*.service`) which user
+it runs as, and uses that. If no unit names a user, the install refuses
+rather than guessing.
+
+Each runner's `.path` file is updated atomically — written to a temporary
+file and renamed — and as the runner user, so the runner never reads a
+half-written or root-owned path file. The install directory is added
+exactly once: the file is checked line by line, because that is the format
+the installer writes it in.
+
+### Job timeouts
+
+GitHub's default job timeout is 360 minutes. With only two Linux runners,
+one hung job can occupy a runner for six hours. Every job in
+`.github/workflows/` therefore sets `timeout-minutes` explicitly: 30
+minutes for test/build/lint work, 5 minutes for the health heartbeat and
+the verdict gate.
+
+### GitHub-hosted runners cannot start for private repos
+
+The org's Actions spending limit is exhausted, so GitHub-hosted runners
+refuse to start for **private** repositories:
+
+> The job was not started because recent account payments have failed or
+> your spending limit needs to be increased.
+
+Public repositories (including this one) are unaffected. For private repos
+the self-hosted fleet is the only working path — which is why the runners
+have to stay online, and why the disk routine and the job timeouts matter.
+
 ## Quick Start
 
 ```bash
@@ -215,8 +401,9 @@ See [`specs/PIPELINES.md`](specs/PIPELINES.md) for design rationale.
 
 ```
 github_runners_for_repo/   # Python package (CLI, config, GitHub API client, runner manager)
+  scripts/                 # provision-host.sh (toolchain) + disk cleanup routine and its installer
 tools/                     # check_pr_link.py + check_cov_threshold_drift.py
-tests/                     # Pytest suite (mocked, no live API calls)
+tests/                     # Pytest suite (mocked, no live API calls, sandbox tests for the shell scripts)
 specs/                     # Architecture and pipeline documentation
 .archgate/                 # ADRs + archgate rule type definitions
 .github/                   # CODEOWNERS + PR/issue templates + 8 GH Actions workflows
