@@ -57,9 +57,11 @@
 #
 # A path that is in use is NEVER deleted, at any tier. A live process that
 # holds a path's DIRECT PARENT also protects it: a process whose working
-# directory is the _work root holds every checkout below it. The check stops
-# at one level, because the runner's own process holds the runner home and
-# walking all the way up would disable the sweep entirely.
+# directory is the _work root holds every checkout below it. That rule is
+# limited to the _work root on purpose — the runner holds _work/_temp open at
+# all times, so a general "any parent protects" rule would disable the temp
+# sweep permanently, and walking up to the runner home would disable the whole
+# sweep, because the runner's own processes always hold that.
 #
 # ## Mutual exclusion
 #
@@ -98,6 +100,7 @@ BASE_ACTIONS_DAYS="${BASE_ACTIONS_DAYS:-14}"
 BASE_TOOL_DAYS="${BASE_TOOL_DAYS:-30}"
 BASE_DIAG_DAYS="${BASE_DIAG_DAYS:-7}"
 BASE_CACHE_DAYS="${BASE_CACHE_DAYS:-3}"
+BASE_ARCHIVE_DAYS="${BASE_ARCHIVE_DAYS:-1}"
 BASE_TMP_DAYS="${BASE_TMP_DAYS:-1}"
 
 JOURNAL_MAX="${JOURNAL_MAX:-50M}"
@@ -254,7 +257,7 @@ collect_inuse() {
 # home, so walking all the way to the root of the watched tree would mark
 # every candidate in use and disable the sweep entirely.
 is_in_use() {
-  local cand="$1" p physical parent physical_parent
+  local cand="$1" p physical
   # Compare on a slash-normalised candidate. The checkout glob ("$work"/*/)
   # yields a trailing slash, and "/work/repo/" does not prefix-match
   # "/work/repo/file" — without this the guard silently misses a live job's
@@ -266,21 +269,29 @@ is_in_use() {
   if [ -d "$cand" ]; then
     physical="$(cd "$cand" 2>/dev/null && pwd -P)" || physical=""
   fi
-  parent="$(dirname "$cand")"
-  physical_parent=""
-  [ -n "$physical" ] && physical_parent="$(dirname "$physical")"
   for p in "${INUSE_PATHS[@]:-}"; do
     [ -n "$p" ] || continue
     case "$p" in
       "$cand" | "$cand"/*) return 0 ;;
-      "$parent") return 0 ;;
     esac
     if [ -n "$physical" ]; then
       case "$p" in
         "$physical" | "$physical"/*) return 0 ;;
-        "$physical_parent") return 0 ;;
       esac
     fi
+    # A live path that is the candidate's DIRECT PARENT protects it too: a
+    # process whose working directory is the _work root holds every checkout
+    # below it, and without this rule that checkout was reported as prunable
+    # while a job was running in it.
+    #
+    # The rule is deliberately limited to the _work root. The runner itself
+    # holds _work/_temp open at all times, and treating that as protective
+    # would disable the temp sweep permanently; walking further up (to the
+    # runner home) would disable the whole sweep, because the runner's own
+    # processes always hold that.
+    case "$(dirname "$cand")" in
+      */_work) case "$p" in */_work) return 0 ;; esac ;;
+    esac
   done
   return 1
 }
@@ -424,18 +435,25 @@ prune_runner_work() {
   local home="$1" tier="$2" work="$1/_work" d name
   [ -d "$work" ] || return 0
 
-  local stale_h action_d tool_d diag_d
+  local stale_h action_d tool_d diag_d archive_d
   stale_h="$(scaled_age "$BASE_STALE_HOURS" "$tier")"
   action_d="$(scaled_age "$BASE_ACTIONS_DAYS" "$tier")"
   tool_d="$(scaled_age "$BASE_TOOL_DAYS" "$tier")"
   diag_d="$(scaled_age "$BASE_DIAG_DAYS" "$tier")"
+  archive_d="$(scaled_age "$BASE_ARCHIVE_DAYS" "$tier")"
 
   # Repo checkouts: _work/<repo>/. Never the runner's own bookkeeping.
   for d in "$work"/*/; do
     [ -d "$d" ] || continue
     name="$(basename "$d")"
     case "$name" in
-      _tool | _actions | _temp | _PipelineMapping) continue ;;
+      # _update is the runner's self-update staging area: SelfUpdaterV2
+      # downloads the new binaries there before copying them into
+      # bin.<version>/externals.<version>. Removing it mid-update aborts the
+      # copy and can leave a partial bin.<version> behind — a runner that
+      # cannot start, which is the exact failure this routine exists to
+      # prevent.
+      _tool | _actions | _temp | _PipelineMapping | _update) continue ;;
     esac
     try_remove "$d" "${stale_h} hours" "checkout"
   done
@@ -457,8 +475,11 @@ prune_runner_work() {
     done < <(find "$home/_diag" -maxdepth 1 -type f -name '*.log' -print0 2>/dev/null)
   fi
 
-  # Stale runner update archives left in the runner home.
+  # Stale runner update archives left in the runner home. The archive window
+  # applies here too: the runner downloads its own update tarball into the
+  # runner home, and deleting a fresh one aborts the update it belongs to.
   while IFS= read -r -d '' d; do
+    is_stale "$d" "${archive_d} days" || continue
     remove_file "$d" "archive"
   done < <(find "$home" -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 2>/dev/null)
 }
@@ -546,23 +567,34 @@ prune_system() {
 
   # Docker's storage lives on the data disk, so docker is pruned at the DATA
   # tier: a full root filesystem must not wipe every unused image.
+  #
+  # The scope is deliberately narrow, because this daemon also hosts the
+  # user's own long-lived containers and their state is not this routine's to
+  # destroy:
+  #
+  #   - only DANGLING images are removed ("image prune" WITHOUT -a): an image
+  #     that is tagged but not currently running belongs to the user, and
+  #     removing it breaks the next "docker run" that expects it;
+  #   - only DANGLING build cache is removed at the lower tiers; at the top
+  #     tier all UNUSED build cache goes, which is still only cache;
+  #   - stopped containers are never removed at all: a stopped container is
+  #     the user's state, not cache, and "container prune" deletes it
+  #     irreversibly.
   if command -v docker >/dev/null 2>&1; then
     if [ "$DRY_RUN" = "1" ]; then
+      log "would prune dangling docker images (older than $DOCKER_AGE)"
       if [ "$data_tier" -ge 2 ]; then
-        log "would prune unused docker images (older than $DOCKER_AGE)"
-        log "would prune unused docker build cache (older than $DOCKER_AGE)"
-        log "would prune stopped docker containers (older than $DOCKER_AGE)"
+        log "would prune all unused docker build cache (older than $DOCKER_AGE)"
       else
-        log "would prune dangling docker images"
-        log "would prune dangling docker build cache"
+        log "would prune dangling docker build cache (older than $DOCKER_AGE)"
       fi
-    elif [ "$data_tier" -ge 2 ]; then
-      docker image prune -af --filter "until=${DOCKER_AGE}" >/dev/null 2>&1 || true
-      docker builder prune -af --filter "until=${DOCKER_AGE}" >/dev/null 2>&1 || true
-      docker container prune -f --filter "until=${DOCKER_AGE}" >/dev/null 2>&1 || true
     else
       docker image prune -f --filter "until=${DOCKER_AGE}" >/dev/null 2>&1 || true
-      docker builder prune -f --filter "until=${DOCKER_AGE}" >/dev/null 2>&1 || true
+      if [ "$data_tier" -ge 2 ]; then
+        docker builder prune -af --filter "until=${DOCKER_AGE}" >/dev/null 2>&1 || true
+      else
+        docker builder prune -f --filter "until=${DOCKER_AGE}" >/dev/null 2>&1 || true
+      fi
     fi
   fi
 }
@@ -644,6 +676,56 @@ sweep_once() {
   prune_system "$root_tier" "$data_tier"
 }
 
+# ---------------------------------------------------------- interpreter repair
+#
+# uv keeps its managed CPython trees under
+#   <user home>/.local/share/uv/python/cpython-<version>-<platform>/bin/
+# and those interpreters are exactly the ones `uv` inspects when it resolves an
+# interpreter for a job. A tree whose interpreter lost its execute bit (mode
+# 0444 instead of 0755) makes every such resolution fail with
+#   Failed to query Python interpreter at .../bin/python3.14
+#     cause: Permission denied (os error 13)
+# which breaks CI on the fleet even though the interpreter itself is intact and
+# the host is otherwise healthy. It is not a disk-pressure problem, so it must
+# not be gated on the pressure tiers.
+#
+# The repair is cheap and idempotent: it walks the handful of managed trees and
+# restores the execute bit on any interpreter missing it. It runs on every
+# sweep, including tier 0, so a tree that loses the bit again is corrected
+# within one timer interval rather than at the next provisioning run.
+repair_uv_interpreters() {
+  local home tree interp fixed=0
+  for home in "${RUNNER_HOME_LIST[@]:-}"; do
+    [ -n "$home" ] || continue
+    # The managed trees live in the USER's home, one level above the runner
+    # directory.
+    home="$(dirname "$home")"
+    [ -d "$home/.local/share/uv/python" ] || continue
+    for tree in "$home"/.local/share/uv/python/*/bin; do
+      [ -d "$tree" ] || continue
+      for interp in "$tree"/python3.*; do
+        [ -f "$interp" ] || continue
+        [ -x "$interp" ] && continue
+        if [ "$DRY_RUN" = "1" ]; then
+          log "would restore the execute bit on $interp"
+        else
+          # 0755, not `u+x`: uv installs these interpreters 0755, and restoring
+          # the mode uv would have installed keeps the tree consistent with its
+          # siblings instead of leaving it at 0455.
+          if chmod 0755 "$interp" 2>/dev/null; then
+            log "restored the execute bit on $interp"
+            fixed=1
+          else
+            log "WARNING: could not restore the execute bit on $interp"
+          fi
+        fi
+      done
+    done
+  done
+  [ "$fixed" = "1" ] && log "repaired uv-managed interpreter execute bits"
+  return 0
+}
+
 main() {
   local root_pct data_pct pass
   local root_tier data_tier
@@ -661,6 +743,10 @@ main() {
   # Mutual exclusion: never run at the same time as another cleanup run on
   # this host.
   acquire_lock || return 0
+
+  # A broken interpreter is not a disk-pressure problem, so this repair runs
+  # before the tier loop and is not skipped at tier 0.
+  repair_uv_interpreters
 
   root_tier=0
   data_tier=0

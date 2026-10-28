@@ -98,13 +98,29 @@ every tier:
   falls back to `lsof` elsewhere), and any path under a watched root counts
   as in use regardless of age. `actions/runner` never changes its own
   working directory, so the process that holds a checkout is the child it
-  spawned — `node`, `git`, `bash`. A process whose working directory is a
-  checkout's direct parent holds every checkout below it and protects them
-  all.
+  spawned — `node`, `git`, `bash`. A process whose working directory is
+  `_work` itself holds every checkout below it and protects them all.
 
 **A path that is in use is never deleted, at any tier.** The in-use set is
 re-collected at the start of every pass, so a job that starts while an
 earlier pass is running is protected by the next one.
+
+A few directories are never swept at all, whatever their age:
+
+- `_work/_update` — where the runner stages a self-update before copying
+  the new binaries into `bin.<version>`. Removing it mid-update aborts the
+  copy and can leave a runner that cannot start.
+- `_work/_tool`, `_work/_actions`, `_work/_temp` — the runner's own
+  bookkeeping, swept by their own age windows.
+- `_diag/*.log` — the worker logs are the evidence for the "assigned, zero
+  steps" signature, so they keep a minimum age at every tier.
+- A freshly downloaded update archive in the runner home — deleting it
+  aborts the update it belongs to.
+
+Docker is pruned on the data disk, and only within limits: **dangling**
+images and build cache only, never a tagged image, and **never** a stopped
+container. The Docker daemon on the runner host also serves the user's own
+long-lived containers, and their state is not the routine's to destroy.
 
 ### Repairing a bricked action
 
@@ -116,6 +132,26 @@ manifest is missing, and the step fails — forever, because nothing else
 removes the watermark. The routine therefore deletes a watermark exactly
 when its version directory is gone, which makes the runner download the
 action again on the next job.
+
+### Repairing a broken interpreter
+
+`uv` inspects its managed CPython interpreters when it resolves one for a
+job. A tree whose interpreter lost its execute bit (mode `0444` instead of
+`0755`) makes every such inspection fail with `Permission denied (os error
+13)`, which breaks CI on the fleet even though the interpreter itself is
+intact and the host is otherwise healthy.
+
+That is not a disk-pressure problem, so the repair is **not** gated on the
+pressure tiers: it runs on every sweep, including the tier-0 tick, and
+restores the execute bit on any managed interpreter that is missing it. The
+mode it restores is `0755` — the mode `uv` itself installs — so the tree
+stays consistent with its siblings instead of ending up at `0455`. The
+repair is idempotent: a second run finds nothing to do.
+
+```bash
+runner-disk-cleanup.sh --status   # report only, changes nothing
+runner-disk-cleanup.sh --dry-run  # report what would change, change nothing
+```
 
 ### Not running twice at once
 
@@ -170,6 +206,14 @@ install fails instead of reporting success. The runner's credential files
 are tightened to `0600` while the installer is there, so no other user on
 the host can read or rewrite them. The cleanup routine itself only ever
 deletes, so it cannot leave a root-owned artefact behind.
+
+A **root-owned** runner home is the one case where the directory's owner
+cannot be the answer: chowning it to root is a no-op and the write check
+would trivially pass, so the install would report success while the
+non-root runner service still could not write. The installer therefore
+asks the runner's own systemd unit (`actions.runner.*.service`) which user
+it runs as, and uses that. If no unit names a user, the install refuses
+rather than guessing.
 
 Each runner's `.path` file is updated atomically — written to a temporary
 file and renamed — and as the runner user, so the runner never reads a

@@ -358,3 +358,266 @@ class TestTiers:
             check=True,
         )
         assert result.stdout.strip() == "3"
+
+
+def _uv_tree(tmp_path: Path) -> tuple[Path, Path]:
+    """Build a fake uv managed-Python tree.
+
+    uv keeps its managed interpreters under
+    ``<user home>/.local/share/uv/python/<tree>/bin/``, and the repair looks
+    for them one level ABOVE the runner home, so the runner home has to sit
+    in the same user home.
+
+    Returns the runner home and the tree's bin directory.
+    """
+    user_home = tmp_path / "home"
+    runner_home = user_home / "actions-runner-linux"
+    runner_home.mkdir(parents=True)
+    bin_dir = (
+        user_home
+        / ".local"
+        / "share"
+        / "uv"
+        / "python"
+        / "cpython-3.14.5-linux-aarch64-gnu"
+        / "bin"
+    )
+    bin_dir.mkdir(parents=True)
+    return runner_home, bin_dir
+
+
+def _repair(runner_home: Path, tmp_path: Path, dry_run: bool = False) -> str:
+    """Run repair_uv_interpreters against the fake tree."""
+    env = _env(runner_home, tmp_path)
+    env["CLEANUP_SCRIPT"] = str(SCRIPT)
+    source = f'source "$CLEANUP_SCRIPT"{" --dry-run" if dry_run else ""}'
+    result = subprocess.run(
+        ["bash", "-c", f"{source}; repair_uv_interpreters"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"repair failed: {result.returncode}\n{result.stderr}"
+    return result.stdout
+
+
+def _mode(path: Path) -> int:
+    return path.stat().st_mode & 0o777
+
+
+class TestUvInterpreterRepair:
+    """A managed interpreter that lost its execute bit breaks every uv call.
+
+    uv inspects its managed interpreters when it resolves one for a job. A
+    tree whose interpreter is mode 0444 makes that inspection fail with
+    "Permission denied (os error 13)", which breaks CI on the fleet even
+    though the interpreter itself is intact. It is not a disk-pressure
+    problem, so the repair is not gated on the pressure tiers.
+    """
+
+    def test_non_executable_interpreter_is_repaired(self, tmp_path: Path) -> None:
+        runner_home, bin_dir = _uv_tree(tmp_path)
+        interp = bin_dir / "python3.14"
+        interp.write_text("#!/bin/sh\n")
+        interp.chmod(0o444)
+
+        output = _repair(runner_home, tmp_path)
+
+        assert _mode(interp) == 0o755, (
+            f"the execute bit must be restored, mode is {oct(_mode(interp))}"
+        )
+        assert "restored the execute bit" in output
+
+    def test_dry_run_reports_but_does_not_mutate(self, tmp_path: Path) -> None:
+        runner_home, bin_dir = _uv_tree(tmp_path)
+        interp = bin_dir / "python3.14"
+        interp.write_text("#!/bin/sh\n")
+        interp.chmod(0o444)
+
+        output = _repair(runner_home, tmp_path, dry_run=True)
+
+        assert _mode(interp) == 0o444, "--dry-run must not change the mode"
+        assert "would restore the execute bit" in output
+
+    def test_non_interpreter_file_is_left_alone(self, tmp_path: Path) -> None:
+        runner_home, bin_dir = _uv_tree(tmp_path)
+        other = bin_dir / "README"
+        other.write_text("not an interpreter")
+        other.chmod(0o444)
+
+        _repair(runner_home, tmp_path)
+
+        assert _mode(other) == 0o444, "a file that is not an interpreter must not be touched"
+
+    def test_second_run_repairs_nothing(self, tmp_path: Path) -> None:
+        runner_home, bin_dir = _uv_tree(tmp_path)
+        interp = bin_dir / "python3.14"
+        interp.write_text("#!/bin/sh\n")
+        interp.chmod(0o444)
+
+        _repair(runner_home, tmp_path)
+        output = _repair(runner_home, tmp_path)
+
+        assert "restored the execute bit" not in output, (
+            "the repair must be idempotent: the second run has nothing to do"
+        )
+
+    def test_executable_interpreter_is_left_alone(self, tmp_path: Path) -> None:
+        runner_home, bin_dir = _uv_tree(tmp_path)
+        interp = bin_dir / "python3.14"
+        interp.write_text("#!/bin/sh\n")
+        interp.chmod(0o755)
+
+        output = _repair(runner_home, tmp_path)
+
+        assert _mode(interp) == 0o755
+        assert "restored the execute bit" not in output
+
+
+class TestNeverPruned:
+    """Directories the sweep must never touch, whatever their age."""
+
+    def test_self_update_staging_dir_is_never_pruned(
+        self, runner_home: Path, tmp_path: Path
+    ) -> None:
+        staging = runner_home / "_work" / "_update"
+        staging.mkdir(parents=True)
+        (staging / "bin.2.334.0").mkdir()
+        _age(staging, 30)
+
+        _sweep(runner_home, tmp_path, tier=3, collect=False)
+
+        assert staging.exists(), (
+            "_work/_update is where the runner stages a self-update: deleting "
+            "it mid-update aborts the copy and can leave a runner that cannot "
+            "start"
+        )
+
+    def test_recent_worker_log_is_kept(self, runner_home: Path, tmp_path: Path) -> None:
+        diag = runner_home / "_diag"
+        diag.mkdir()
+        worker_log = diag / "Worker_2026-10-28.log"
+        worker_log.write_text("runner worker log")
+
+        _sweep(runner_home, tmp_path, tier=3, collect=False)
+
+        assert worker_log.exists(), (
+            "the worker logs are the evidence for the 'assigned, zero steps' "
+            "signature; they must not be wiped regardless of disk pressure"
+        )
+
+    def test_fresh_update_archive_is_kept(self, runner_home: Path, tmp_path: Path) -> None:
+        archive = runner_home / "actions-runner-linux-x64-2.334.0.tar.gz"
+        archive.write_text("runner archive")
+
+        _sweep(runner_home, tmp_path, tier=1, collect=False)
+
+        assert archive.exists(), (
+            "the runner downloads its own update archive into the runner "
+            "home; deleting a fresh one aborts the update it belongs to"
+        )
+
+
+class TestRunnerOwnerDerivation:
+    """The owner of the runner home is only a proxy for the runner user.
+
+    A root-owned runner home is the failure state the installer repairs. The
+    owner of the directory cannot be the answer in that case: the recursive
+    chown becomes a no-op and the write check trivially passes, so the
+    install reports success while the non-root runner service still cannot
+    write. The runner service's own unit names the real user.
+    """
+
+    @staticmethod
+    def _resolve(
+        tmp_path: Path, home_owner: str, unit_user: str | None
+    ) -> subprocess.CompletedProcess[str]:
+        unit_dir = tmp_path / "units"
+        unit_dir.mkdir(exist_ok=True)
+        if unit_user is not None:
+            (unit_dir / "actions.runner.test.service").write_text(f"[Service]\nUser={unit_user}\n")
+        runner_home = tmp_path / "runner"
+        runner_home.mkdir(exist_ok=True)
+        env = os.environ.copy()
+        env.update(
+            {
+                "RUNNER_HOMES": str(runner_home),
+                "UNIT_DIR": str(unit_dir),
+                "INSTALLER": str(INSTALLER),
+            }
+        )
+        script = (
+            'source "$INSTALLER"; '
+            f"dir_owner() {{ echo {home_owner}; }}; "
+            "dir_group() { echo root; }; "
+            'runner_owner_and_group "${RUNNER_HOME_LIST[0]}"'
+        )
+        return subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_root_owned_home_uses_the_runner_service_user(self, tmp_path: Path) -> None:
+        current_user = subprocess.run(
+            ["id", "-un"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+        result = self._resolve(tmp_path, "root", current_user)
+
+        assert result.returncode == 0, result.stderr
+        resolved = result.stdout.strip().splitlines()[-1].split()
+        assert resolved[0] == current_user, (
+            f"a root-owned runner home must resolve to the runner service's user, got {resolved}"
+        )
+
+    def test_root_owned_home_without_a_unit_is_refused(self, tmp_path: Path) -> None:
+        result = self._resolve(tmp_path, "root", None)
+
+        assert result.returncode != 0, (
+            "without a runner service unit the real user cannot be known, so "
+            "the install must refuse rather than chown to root and report "
+            "success"
+        )
+        assert "root-owned" in result.stdout
+
+    def test_normal_owner_is_used_unchanged(self, tmp_path: Path) -> None:
+        current_user = subprocess.run(
+            ["id", "-un"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+        result = self._resolve(tmp_path, current_user, None)
+
+        assert result.returncode == 0, result.stderr
+        resolved = result.stdout.strip().splitlines()[-1].split()
+        assert resolved[0] == current_user
+
+    def test_service_unit_user_is_parsed_with_spaces(self, tmp_path: Path) -> None:
+        unit_dir = tmp_path / "units"
+        unit_dir.mkdir()
+        current_user = subprocess.run(
+            ["id", "-un"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        (unit_dir / "actions.runner.test.service").write_text(f"[Service]\nUser = {current_user}\n")
+        runner_home = tmp_path / "runner"
+        runner_home.mkdir(exist_ok=True)
+        env = os.environ.copy()
+        env.update(
+            {
+                "RUNNER_HOMES": str(runner_home),
+                "UNIT_DIR": str(unit_dir),
+                "INSTALLER": str(INSTALLER),
+            }
+        )
+        script = 'source "$INSTALLER"; runner_service_user'
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.stdout.strip() == current_user

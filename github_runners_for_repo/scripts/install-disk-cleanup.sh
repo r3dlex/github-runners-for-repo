@@ -146,6 +146,62 @@ as_user() {
   fi
 }
 
+# The user the runner service actually runs as, taken from its systemd unit.
+#
+# The unit is the only place the real user is written down. The owner of the
+# runner home is just a proxy for it, and that proxy is wrong exactly in the
+# case this install exists to repair: a root-owned runner home.
+runner_service_user() {
+  local unit user
+  for unit in "$UNIT_DIR"/actions.runner.*.service; do
+    [ -f "$unit" ] || continue
+    user="$(sed -n 's/^User[[:space:]]*=[[:space:]]*//p' "$unit" 2>/dev/null | head -n 1)"
+    [ -n "$user" ] || continue
+    # A unit can name a user that does not exist on this host; that is not a
+    # user to chown anything to.
+    id "$user" >/dev/null 2>&1 || continue
+    printf '%s' "$user"
+    return 0
+  done
+  return 1
+}
+
+# The user that must own the runner home, and the group to chown it with.
+# Prints "<owner> <group>"; returns 1 when it cannot be determined.
+#
+# Normally that user is the owner of the runner home. A ROOT-owned runner
+# home is the failure state this install repairs, and the owner of the
+# directory cannot be the answer in that case: the recursive chown becomes a
+# no-op and the write check trivially passes, so the install reports success
+# while the non-root runner service still cannot write its work directory.
+# The runner service's own unit names the real user, so it is asked instead.
+runner_owner_and_group() {
+  local runner_dir="$1" owner group svc_owner
+  owner="$(dir_owner "$runner_dir")"
+  if [ -z "$owner" ]; then
+    log "WARN: cannot determine the owner of $runner_dir"
+    return 1
+  fi
+  # Read the group before the chown — the chown changes it.
+  group="$(dir_group "$runner_dir")"
+  case "$owner" in
+    root | 0)
+      svc_owner="$(runner_service_user || true)"
+      if [ -z "$svc_owner" ]; then
+        log "WARN: $runner_dir is root-owned and no runner service unit names a user"
+        return 1
+      fi
+      log "$runner_dir is root-owned; the runner service runs as $svc_owner"
+      owner="$svc_owner"
+      group="$owner"
+      ;;
+  esac
+  if [ -z "$group" ]; then
+    group="$(id -gn "$owner" 2>/dev/null || printf '%s' "$owner")"
+  fi
+  printf '%s %s' "$owner" "$group"
+}
+
 install_script() {
   if [ ! -f "$SOURCE_SCRIPT" ]; then
     log "ERROR: $SOURCE_SCRIPT not found (run this from the repository checkout)"
@@ -226,7 +282,7 @@ UNIT
 # bind-mount of the data disk — is chowned recursively to the runner user,
 # and every file is made writable by its owner.
 fix_runner_ownership() {
-  local runner_dir owner group cred
+  local runner_dir owner group cred owner_group
   for runner_dir in "${RUNNER_HOME_LIST[@]:-}"; do
     [ -n "$runner_dir" ] || continue
     if [ ! -d "$runner_dir" ]; then
@@ -234,16 +290,12 @@ fix_runner_ownership() {
       continue
     fi
 
-    owner="$(dir_owner "$runner_dir")"
-    if [ -z "$owner" ]; then
-      log "WARN: cannot determine the owner of $runner_dir; leaving it untouched"
+    if ! owner_group="$(runner_owner_and_group "$runner_dir")"; then
+      log "WARN: the user that must own $runner_dir could not be determined; leaving it untouched"
       continue
     fi
-    # Read the group before the chown — the chown changes it.
-    group="$(dir_group "$runner_dir")"
-    if [ -z "$group" ]; then
-      group="$(id -gn "$owner" 2>/dev/null || printf '%s' "$owner")"
-    fi
+    owner="${owner_group%% *}"
+    group="${owner_group##* }"
 
     # The whole tree, recursively: a root-owned subdirectory is exactly what
     # breaks the job, and it hides behind a healthy-looking runner.
@@ -283,7 +335,7 @@ fix_runner_ownership() {
 # runner is assigned, the job dies in three seconds with zero steps, and
 # nothing in the runner's own health check reports a problem.
 verify_runner_writable() {
-  local runner_dir owner rc=0
+  local runner_dir owner rc=0 owner_group
   for runner_dir in "${RUNNER_HOME_LIST[@]:-}"; do
     [ -n "$runner_dir" ] || continue
     if [ ! -d "$runner_dir" ]; then
@@ -291,11 +343,11 @@ verify_runner_writable() {
       continue
     fi
 
-    owner="$(dir_owner "$runner_dir")"
-    if [ -z "$owner" ]; then
-      log "WARN: cannot determine the owner of $runner_dir; skipping the write check"
+    if ! owner_group="$(runner_owner_and_group "$runner_dir")"; then
+      log "WARN: skipping the write check for $runner_dir"
       continue
     fi
+    owner="${owner_group%% *}"
 
     # The check runs in a separate shell as the runner user; the single
     # quotes are deliberate, $1 is expanded by that shell at runtime.
