@@ -80,7 +80,13 @@ case "$url" in
     fi
     cat "$STUB_CHECKSUMS" > "$out"
     ;;
-  *) cat "$STUB_TARBALL" > "$out" ;;
+  *)
+    if [ -n "${STUB_DOWNLOAD_FAILS:-}" ]; then
+      printf 'download failed\n' >&2
+      exit 22
+    fi
+    cat "$STUB_TARBALL" > "$out"
+    ;;
 esac
 """
 
@@ -518,10 +524,30 @@ class TestArchitecture:
         assert self._arch(tmp_path, "x86_64") == "amd64"
 
     def test_unsupported_architecture_fails(self, tmp_path: Path) -> None:
+        """The diagnostic has to reach the operator, not the captured value.
+
+        The caller captures stdout in a command substitution, so a message
+        on stdout would be swallowed into the captured value and the
+        operator would see a bare exit code with no explanation.
+        """
         script = f'source "{SCRIPT}"; uname_m=sparc64; gh_linux_arch'
         result = _run(script, _sandbox(tmp_path))
         assert result.returncode != 0
-        assert "unsupported architecture" in result.stdout
+        assert "unsupported architecture" in result.stderr
+
+    def test_the_production_path_reports_the_unsupported_architecture(
+        self, tmp_path: Path
+    ) -> None:
+        """The install itself has to say WHY it gave up."""
+        env = _sandbox(tmp_path)
+        script = f'source "{SCRIPT}"; uname_m=sparc64; ensure_gh_linux'
+        result = _run(script, env)
+        assert result.returncode != 0, "an unsupported architecture must fail the install"
+        assert "unsupported architecture" in result.stderr, (
+            f"the reason has to reach stderr, got: {result.stderr}"
+        )
+        assert "no GitHub CLI asset for this architecture" in result.stdout
+        assert not Path(env["GH_INSTALL_PATH"]).exists(), "nothing must be installed"
 
 
 class TestVersion:
@@ -590,6 +616,31 @@ class TestPinnedDigest:
         result = _run(script, env)
         assert result.returncode == 0, result.stderr
         assert "missing" in result.stdout
+
+    def test_the_verification_without_the_requested_release_fails_closed(
+        self, tmp_path: Path
+    ) -> None:
+        """A call with five arguments must fail closed, not abort the script.
+
+        The sixth argument says which release was ASKED for; without it
+        the upstream checksum file may not stand in for a missing
+        recorded digest either. Reading it unconditionally made the
+        script die with "$6: unbound variable" instead of failing with
+        the message that says what is wrong.
+        """
+        env = _sandbox(tmp_path)
+        verify_dir = tmp_path / "verify"
+        verify_dir.mkdir()
+        script = (
+            f'source "{SCRIPT}"; '
+            f'verify_gh_asset "{verify_dir}" "$STUB_TARBALL" 9.9.9 arm64 "{ASSET}"'
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode == 1, result.stderr
+        assert "unbound variable" not in result.stderr, result.stderr
+        assert "no pinned sha256 for the GitHub CLI 9.9.9 arm64 asset" in result.stdout
 
     def test_the_upstream_checksum_file_is_fetched_as_corroboration(self, tmp_path: Path) -> None:
         env = _sandbox(tmp_path)
@@ -801,6 +852,62 @@ class TestInstall:
 
         assert result.returncode != 0, "the tampered asset has to fail the install"
         assert "caller-cleanup" in result.stdout, "the caller's EXIT trap was swallowed"
+
+    def test_a_failed_download_keeps_the_callers_cleanup(self, tmp_path: Path) -> None:
+        """A download that dies must still run the caller's cleanup.
+
+        The trap the install installs replaces the caller's own, and the
+        failure path leaves the script through `exit` — so the caller's
+        trap has to be put back before that exit, not from inside the
+        EXIT handler (a trap registered there is never run).
+
+        The download is the failure that matters: a network error, a 404
+        or a TLS error is the most likely one, and it used to abort the
+        script with `set -e` while the install's own trap was still
+        installed — the caller's cleanup was lost with it.
+        """
+        env = _sandbox(tmp_path)
+        env["STUB_DOWNLOAD_FAILS"] = "1"
+        script = (
+            'trap "echo caller-cleanup" EXIT; '
+            f'source "{SCRIPT}"; '
+            'gh_expected_sha256() { printf "%s" "$STUB_PINNED_SHA256"; }; '
+            "uname_m=aarch64; ensure_gh_linux"
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode != 0, "a failed download has to fail the install"
+        assert "caller-cleanup" in result.stdout, "the caller's EXIT trap was swallowed"
+        assert not Path(env["GH_INSTALL_PATH"]).exists(), "nothing must be installed"
+
+    def test_a_failed_unpack_keeps_the_callers_cleanup(self, tmp_path: Path) -> None:
+        """The same has to hold for a failure after the download.
+
+        The archive is broken, but its digest is the recorded one: the
+        install gets past the checksum check and dies on the unpack.
+        """
+        env = _sandbox(tmp_path)
+        broken = tmp_path / "not-a-tarball"
+        broken.write_bytes(b"this is not a gzip stream")
+        digest = _sha256(broken)
+        env["STUB_TARBALL"] = str(broken)
+        env["STUB_PINNED_SHA256"] = digest
+        checksums = tmp_path / "checksums-broken.txt"
+        checksums.write_text(f"{digest}  {ASSET}\n")
+        env["STUB_CHECKSUMS"] = str(checksums)
+        script = (
+            'trap "echo caller-cleanup" EXIT; '
+            f'source "{SCRIPT}"; '
+            'gh_expected_sha256() { printf "%s" "$STUB_PINNED_SHA256"; }; '
+            "uname_m=aarch64; ensure_gh_linux"
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode != 0, "a broken archive has to fail the install"
+        assert "caller-cleanup" in result.stdout, "the caller's EXIT trap was swallowed"
+        assert not Path(env["GH_INSTALL_PATH"]).exists(), "nothing must be installed"
 
 
 class TestInstalledVersion:

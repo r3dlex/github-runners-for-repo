@@ -279,12 +279,18 @@ installed_gh_version() {
 
 # The asset architecture for the host. The CLI publishes linux_arm64 and
 # linux_amd64; the runner fleet is aarch64.
+#
+# The diagnostic goes to STDERR: the caller captures stdout in a command
+# substitution, so a message on stdout would be swallowed into the
+# captured value and the operator would see a bare exit code with no
+# explanation at all.
 gh_linux_arch() {
   case "$uname_m" in
     aarch64 | arm64) printf 'arm64' ;;
     x86_64 | amd64) printf 'amd64' ;;
     *)
-      log "ERROR: unsupported architecture '$uname_m' for the GitHub CLI install"
+      printf '[provision] ERROR: unsupported architecture %s for the GitHub CLI install\n' \
+        "'$uname_m'" >&2
       exit 1
       ;;
   esac
@@ -371,8 +377,13 @@ upstream_sha256() {
 # what pinning it means — the next maintainer action, bumping GH_VERSION,
 # must not silently swap the trust anchor for one that arrives from the
 # same origin as the tarball.
+#
+# The sixth argument is optional. Without it the release is not known, so
+# the upstream checksum file may not stand in for a missing recorded
+# digest either: the check fails closed with the message below instead
+# of aborting the script with an unbound variable.
 verify_gh_asset() {
-  local tmpdir="$1" file="$2" version="$3" arch="$4" asset="$5" requested="$6"
+  local tmpdir="$1" file="$2" version="$3" arch="$4" asset="$5" requested="${6:-}"
   local actual expected upstream
   if ! actual="$(file_sha256 "$file")"; then
     log "ERROR: could not compute the sha256 of $asset"
@@ -424,6 +435,53 @@ verify_gh_asset() {
   log "verified: $asset matches sha256 $actual"
 }
 
+# Download, verify, unpack and install the GitHub CLI release.
+#
+# Every step is checked and reported: the caller runs this under `if !`,
+# which suspends `set -e` for the whole function, so a step that is not
+# checked would fail silently. It returns non-zero instead of exiting, so
+# the caller can put the caller's EXIT trap back before the script leaves.
+install_gh_release() {
+  local tmpdir="$1" version="$2" arch="$3" asset="$4" url="$5"
+  local binary
+
+  if ! curl -fsSL "$url" -o "$tmpdir/$asset"; then
+    log "ERROR: the download of $asset failed"
+    return 1
+  fi
+
+  if ! verify_gh_asset "$tmpdir" "$tmpdir/$asset" "$version" "$arch" "$asset" "$GH_VERSION"; then
+    log "ERROR: refusing to install an unverified GitHub CLI"
+    return 1
+  fi
+
+  if ! tar -xzf "$tmpdir/$asset" -C "$tmpdir"; then
+    log "ERROR: could not unpack $asset"
+    return 1
+  fi
+
+  # The upstream tarball holds one directory named after the asset, with
+  # the binary in bin/. The path is spelled out: `find` would match any
+  # archive member called "gh" and its traversal order is not guaranteed.
+  binary="$tmpdir/gh_${version}_linux_${arch}/bin/gh"
+  if [ ! -f "$binary" ]; then
+    log "ERROR: $asset does not contain a gh binary"
+    return 1
+  fi
+
+  # `install` creates the file as its invoking user and runs under sudo, so
+  # the result is root-owned with the mode the runner needs. The target
+  # directory is not guaranteed to exist on a bare host.
+  if ! run_privileged mkdir -p "$(dirname "$GH_INSTALL_PATH")"; then
+    log "ERROR: could not create $(dirname "$GH_INSTALL_PATH")"
+    return 1
+  fi
+  if ! run_privileged install -m 0755 "$binary" "$GH_INSTALL_PATH"; then
+    log "ERROR: could not install gh to $GH_INSTALL_PATH"
+    return 1
+  fi
+}
+
 # Install the GitHub CLI from the official release tarball.
 #
 # The GitHub-hosted images ship gh pre-installed; a bare self-hosted host
@@ -456,8 +514,11 @@ ensure_gh_linux() {
     exit 1
   fi
 
-  local arch asset url tmpdir binary
-  arch="$(gh_linux_arch)"
+  local arch asset url tmpdir
+  arch="$(gh_linux_arch)" || {
+    log "ERROR: no GitHub CLI asset for this architecture"
+    exit 1
+  }
   asset="gh_${version}_linux_${arch}.tar.gz"
   url="https://github.com/cli/cli/releases/download/v${version}/${asset}"
 
@@ -479,33 +540,22 @@ ensure_gh_linux() {
   previous_exit_trap="$(trap -p EXIT)"
   # shellcheck disable=SC2064
   trap "rm -rf '$tmpdir'" EXIT
-  curl -fsSL "$url" -o "$tmpdir/$asset"
-  if ! verify_gh_asset "$tmpdir" "$tmpdir/$asset" "$version" "$arch" "$asset" "$GH_VERSION"; then
-    log "ERROR: refusing to install an unverified GitHub CLI"
+  # The whole install runs in one place and every step of it is checked.
+  # A failure in the middle of it — a download that dies, an archive that
+  # does not unpack — used to abort the script with `set -e` while THIS
+  # trap was still installed, so the caller's trap was lost and the
+  # cleanup it registered never ran.
+  if ! install_gh_release "$tmpdir" "$version" "$arch" "$asset" "$url"; then
+    # The temp dir goes first: a failing `rm` must not leave it behind
+    # with no trap left to clean it.
+    rm -rf "$tmpdir" || log "WARN: could not remove $tmpdir"
     # The caller's trap has to be back in place before the script leaves,
     # or the cleanup it registered never runs.
     restore_exit_trap "$previous_exit_trap"
-    rm -rf "$tmpdir"
     exit 1
   fi
-  tar -xzf "$tmpdir/$asset" -C "$tmpdir"
-  # The upstream tarball holds one directory named after the asset, with
-  # the binary in bin/. The path is spelled out: `find` would match any
-  # archive member called "gh" and its traversal order is not guaranteed.
-  binary="$tmpdir/gh_${version}_linux_${arch}/bin/gh"
-  if [ ! -f "$binary" ]; then
-    log "ERROR: $asset does not contain a gh binary"
-    restore_exit_trap "$previous_exit_trap"
-    rm -rf "$tmpdir"
-    exit 1
-  fi
-  # `install` creates the file as its invoking user and runs under sudo, so
-  # the result is root-owned with the mode the runner needs. The target
-  # directory is not guaranteed to exist on a bare host.
-  run_privileged mkdir -p "$(dirname "$GH_INSTALL_PATH")"
-  run_privileged install -m 0755 "$binary" "$GH_INSTALL_PATH"
+  rm -rf "$tmpdir" || log "WARN: could not remove $tmpdir"
   restore_exit_trap "$previous_exit_trap"
-  rm -rf "$tmpdir"
   log "gh $("$GH_INSTALL_PATH" --version | head -1) installed to $GH_INSTALL_PATH"
 }
 
