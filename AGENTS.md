@@ -298,7 +298,13 @@ the VM prunes `_work` as well and has no in-use guard of its own, so
 **both units must take the same lock** — systemd serialises a unit
 against itself, never against a differently named one. The weekly unit
 lives outside this repository; the lock file is the contract between the
-two.
+two. The two units take the lock in different ways, **on purpose**: the
+routine takes the lock **itself**, so the 15-minute
+`runner-disk-cleanup.timer` unit deliberately carries **no outer
+`/usr/bin/flock`** (a unit that locks a lock it already holds deadlocks
+the timer against itself). The weekly `runner-cleanup.service` runs a
+script that takes no lock of its own, so **it must keep its
+`flock -w 300` wrapper**. Do not "fix" one unit to look like the other.
 
 **The action watermark has to go with its version directory.** The runner
 marks a downloaded action with a sibling file
@@ -329,6 +335,35 @@ a temporary file, then rename) and as the runner user, so the runner never
 reads a half-written or root-owned path file. The install directory is
 added exactly once: the membership test is a line-wise one, because that
 is the format the installer writes.
+
+**The installer's defaults point at the LIVE fleet, and it fails closed
+when a run would mix them.** The routine goes to `/usr/local/bin` and the
+runner homes are the two Colima runners. A verification that overrides
+`INSTALL_PATH` but not `RUNNER_HOMES` used to write the verification's
+install directory into the **live** runners' `.path` file — that happened
+on 2026-10-28 (`/tmp/verify/sandbox` became the first line of both
+runners' `.path`), and every job on them started with a dead PATH entry.
+The rules now are:
+
+- **`SANDBOX=1`** makes the run a verification: the runner homes, the
+  install path and the unit directory are confined to `SANDBOX_ROOT`
+  (default `$TMPDIR/install-disk-cleanup-sandbox`), anything that
+  resolves outside it is refused with a non-zero exit before a file is
+  touched, and the timer is neither enabled nor started.
+- **Without `SANDBOX`**, a run that changes the install *directory* but
+  not `RUNNER_HOMES` is refused as well — the default runner homes are
+  the live ones. Name `RUNNER_HOMES` explicitly, or use `SANDBOX=1`.
+- The install directory is only added to a `.path` file when it exists on
+  disk, and the ownership fix never chowns anything outside the sandbox
+  root.
+
+**The installer never prunes a `.path` file.** It only ever prepends its
+install directory. The live runners carry a colon-joined line
+(`/usr/games:/usr/local/games:/snap/bin`) whose fragments do not exist on
+the Colima VM; a cleanup that dropped "missing" fragments — or a whole
+line because one of its fragments was missing — would silently strip PATH
+entries the runners are supposed to have. If that ever has to change,
+prune per **FRAGMENT** and never per line.
 
 **Everything the install creates under a runner home belongs to the runner
 user.** The runner service runs as a non-root user, and a root-owned

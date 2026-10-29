@@ -162,6 +162,14 @@ same lock**: systemd serialises a unit against itself, never against a
 differently named one. The weekly unit lives outside this repository — the
 lock file is the contract between the two.
 
+The two units take the lock in different ways, on purpose. The routine
+takes the lock **itself**, so the 15-minute `runner-disk-cleanup.timer`
+unit deliberately carries **no outer `/usr/bin/flock`** — a unit that locks
+a lock it already holds deadlocks the timer against itself. The weekly
+`runner-cleanup.service` runs a script that takes no lock of its own, so
+**it must keep its `flock -w 300` wrapper**. Do not "fix" one unit to look
+like the other.
+
 ### Installing it
 
 ```bash
@@ -184,6 +192,42 @@ backed up to `runner-disk-cleanup.sh.bak` first:
 ```bash
 github_runners_for_repo/scripts/install-disk-cleanup.sh --force
 ```
+
+### Verifying the installer without touching the fleet
+
+The installer's defaults point at the **live** fleet: the routine goes to
+`/usr/local/bin` and the runner homes are the two Colima runners. A
+verification run that overrides `INSTALL_PATH` but not `RUNNER_HOMES`
+therefore writes the verification's install directory into the **live**
+runners' `.path` file, and every job on them then starts with a dead PATH
+entry. That happened on 2026-10-28: `/tmp/verify/sandbox` ended up as the
+first line of both runners' `.path`.
+
+The installer now fails closed instead of guessing:
+
+- **`SANDBOX=1`** turns the run into a verification. The runner homes, the
+  install path and the unit directory are confined to `SANDBOX_ROOT`
+  (default: `$TMPDIR/install-disk-cleanup-sandbox`); anything that
+  resolves outside it is refused with a non-zero exit before a single
+  file is touched. The timer is not enabled and the routine is not
+  started.
+- **Without `SANDBOX`**, a run that changes the install *directory* but
+  not `RUNNER_HOMES` is refused as well, because the default runner homes
+  are the live ones. Name `RUNNER_HOMES` explicitly, or use `SANDBOX=1`.
+- The install directory is only added to a `.path` file when it exists on
+  disk.
+
+```bash
+SANDBOX=1 SANDBOX_ROOT=/tmp/verify \
+  github_runners_for_repo/scripts/install-disk-cleanup.sh
+```
+
+The installer never *prunes* a `.path` file: it only ever prepends its
+install directory. The live runners carry a colon-joined line
+(`/usr/games:/usr/local/games:/snap/bin`) whose fragments do not exist on
+the Colima VM, and a cleanup that dropped "missing" fragments — or a whole
+line because one of its fragments was missing — would silently strip PATH
+entries the runners are supposed to have.
 
 ### Runner ownership
 

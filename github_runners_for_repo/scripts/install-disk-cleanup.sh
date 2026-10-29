@@ -43,6 +43,51 @@
 # does it — the install directory is prepended so the runner service can
 # resolve the routine by name.
 #
+# ## Sandbox mode
+#
+# The defaults point at the LIVE fleet: the routine goes to
+# /usr/local/bin and the runner homes are the two Colima runners. A
+# verification run that overrides INSTALL_PATH but NOT RUNNER_HOMES
+# therefore writes the verification's install directory into the LIVE
+# runners' .path file, and every job on them starts with a dead PATH
+# entry. The installer refuses to guess which of the two the operator
+# meant:
+#
+#   - SANDBOX=1 makes the run a verification. The runner homes, the
+#     install path and the unit directory are all confined to
+#     SANDBOX_ROOT (default: $TMPDIR/install-disk-cleanup-sandbox);
+#     anything that resolves outside it is refused with a non-zero exit
+#     before a single file is touched. The timer is not enabled and the
+#     routine is not started.
+#   - Without SANDBOX, a run that changes the install DIRECTORY but not
+#     RUNNER_HOMES is refused as well: the default runner homes are the
+#     live ones, so the run would mutate them. Name RUNNER_HOMES
+#     explicitly, or use SANDBOX=1.
+#   - The install directory is only added to a .path file when it exists
+#     on disk.
+#
+# ## The .path file is never pruned
+#
+# The installer only ever PREPENDS its install directory; it never
+# removes an entry. The live runners' .path carries a colon-joined line
+# (/usr/games:/usr/local/games:/snap/bin) whose fragments do not exist on
+# the Colima VM. A cleanup that dropped "missing" fragments — or a whole
+# line because one of its fragments was missing — would silently strip
+# PATH entries the runners are supposed to have. A stale entry costs a
+# failed lookup; a missing one costs a broken tool. If that ever has to
+# change, prune per FRAGMENT and never per line.
+#
+# ## Locking
+#
+# The routine takes the lock itself (an exclusive flock on
+# /run/runner-disk-cleanup.lock), so the 15-minute
+# runner-disk-cleanup.timer unit deliberately carries NO outer
+# /usr/bin/flock: a unit that locks a lock it already holds deadlocks
+# the timer against itself. The weekly runner-cleanup.service on the host
+# is a different unit and its script takes no lock of its own, so IT
+# must keep its own `flock -w 300` wrapper. Both units have to use the
+# same lock file.
+#
 set -euo pipefail
 
 # Umask 022 so the unit files this script writes are 0644 (systemd refuses
@@ -50,19 +95,87 @@ set -euo pipefail
 # runner-owned trees are additionally chmod'ed explicitly below.
 umask 022
 
+log() { printf '[install-disk-cleanup] %s\n' "$*"; }
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_SCRIPT="$SCRIPT_DIR/cleanup-host-disk.sh"
-INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/runner-disk-cleanup.sh}"
-UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
+
+# The defaults point at the LIVE fleet. Whether the operator changed a knob
+# is recorded BEFORE the defaults are applied, because "the install
+# directory was changed but the runner homes were not" is exactly the
+# mixed-mode run that mutates the live runners.
+DEFAULT_INSTALL_PATH="/usr/local/bin/runner-disk-cleanup.sh"
+DEFAULT_UNIT_DIR="/etc/systemd/system"
+DEFAULT_RUNNER_HOMES="/home/redlexgilgamesh.guest/actions-runner-linux /home/redlexgilgamesh.guest/actions-runner-linux-2"
+
+INSTALL_PATH_OVERRIDDEN=0
+if [ -n "${INSTALL_PATH+x}" ]; then INSTALL_PATH_OVERRIDDEN=1; fi
+UNIT_DIR_OVERRIDDEN=0
+if [ -n "${UNIT_DIR+x}" ]; then UNIT_DIR_OVERRIDDEN=1; fi
+RUNNER_HOMES_OVERRIDDEN=0
+if [ -n "${RUNNER_HOMES+x}" ]; then RUNNER_HOMES_OVERRIDDEN=1; fi
+
+INSTALL_PATH="${INSTALL_PATH:-$DEFAULT_INSTALL_PATH}"
+UNIT_DIR="${UNIT_DIR:-$DEFAULT_UNIT_DIR}"
 SERVICE_UNIT="$UNIT_DIR/runner-disk-cleanup.service"
 TIMER_UNIT="$UNIT_DIR/runner-disk-cleanup.timer"
 
 # The runner directories whose .path file is updated. Same knob as the
 # cleanup routine itself, so an operator points both at the same place.
-RUNNER_HOMES="${RUNNER_HOMES:-/home/redlexgilgamesh.guest/actions-runner-linux /home/redlexgilgamesh.guest/actions-runner-linux-2}"
+RUNNER_HOMES="${RUNNER_HOMES:-$DEFAULT_RUNNER_HOMES}"
 read -r -a RUNNER_HOME_LIST <<<"$RUNNER_HOMES"
 
-log() { printf '[install-disk-cleanup] %s\n' "$*"; }
+# The sandbox opt-in. SANDBOX=1 turns the run into a verification that is
+# confined to SANDBOX_ROOT; see the header for the contract.
+SANDBOX="${SANDBOX:-0}"
+case "$SANDBOX" in
+  1 | true | yes | on) SANDBOX=1 ;;
+  0 | false | no | off) SANDBOX=0 ;;
+  *)
+    log "ERROR: SANDBOX must be 0 or 1 (got '$SANDBOX')"
+    exit 1
+    ;;
+esac
+SANDBOX_ROOT="${SANDBOX_ROOT:-${TMPDIR:-/tmp}/install-disk-cleanup-sandbox}"
+
+# The absolute, symlink-resolved form of a path, whether or not it exists.
+#
+# `readlink -f` is GNU-only, so the longest existing prefix is resolved
+# with cd+pwd -P and the missing tail is appended unchanged. A containment
+# check needs this: on macOS /tmp is a symlink to /private/tmp, and a
+# relative path must not slip past one.
+resolve_path() {
+  local target="$1" tail="" head
+  case "$target" in
+    /*) ;;
+    *) target="$PWD/$target" ;;
+  esac
+  while [ ! -d "$target" ]; do
+    if [ "$target" = "/" ]; then break; fi
+    tail="/$(basename -- "$target")$tail"
+    target="$(dirname -- "$target")"
+  done
+  if [ -d "$target" ]; then
+    head="$(cd -- "$target" 2>/dev/null && pwd -P)" || head="$target"
+  else
+    head="/"
+  fi
+  case "$head" in
+    /) printf '%s' "/${tail#/}" ;;
+    *) printf '%s' "${head%/}$tail" ;;
+  esac
+}
+
+# True when $1 is $2 or lives under it. Both sides must already have been
+# resolved with resolve_path.
+path_under() {
+  local path="$1" root="$2"
+  case "$path" in
+    "$root") return 0 ;;
+    "$root"/*) return 0 ;;
+  esac
+  return 1
+}
 
 # --force is required to overwrite a host copy of the routine that differs
 # from the repo copy. The host copy is the one that has been proven under
@@ -88,6 +201,58 @@ done
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
   SUDO="sudo"
+fi
+
+# A sandbox run writes only into the sandbox, which the invoking user owns,
+# so it never needs sudo — and must never wait for a password prompt.
+if [ "$SANDBOX" = "1" ]; then
+  SUDO=""
+fi
+
+SANDBOX_ROOT_RESOLVED="$(resolve_path "$SANDBOX_ROOT")"
+
+if [ "$SANDBOX" = "1" ]; then
+  # Everything the run writes into is forced into the sandbox unless the
+  # operator names it explicitly.
+  if [ "$RUNNER_HOMES_OVERRIDDEN" -eq 0 ]; then
+    RUNNER_HOMES="$SANDBOX_ROOT/actions-runner-linux"
+  fi
+  if [ "$INSTALL_PATH_OVERRIDDEN" -eq 0 ]; then
+    INSTALL_PATH="$SANDBOX_ROOT/bin/runner-disk-cleanup.sh"
+  fi
+  if [ "$UNIT_DIR_OVERRIDDEN" -eq 0 ]; then
+    UNIT_DIR="$SANDBOX_ROOT/systemd"
+  fi
+  SERVICE_UNIT="$UNIT_DIR/runner-disk-cleanup.service"
+  TIMER_UNIT="$UNIT_DIR/runner-disk-cleanup.timer"
+  read -r -a RUNNER_HOME_LIST <<<"$RUNNER_HOMES"
+
+  # Fail closed: a sandbox run that reaches outside its root is refused
+  # before anything is touched.
+  for sandbox_target in "${RUNNER_HOME_LIST[@]:-}" "$INSTALL_PATH" "$UNIT_DIR"; do
+    [ -n "$sandbox_target" ] || continue
+    sandbox_target_resolved="$(resolve_path "$sandbox_target")"
+    if ! path_under "$sandbox_target_resolved" "$SANDBOX_ROOT_RESOLVED"; then
+      log "ERROR: SANDBOX=1, but $sandbox_target resolves to $sandbox_target_resolved,"
+      log "ERROR: which is outside the sandbox root $SANDBOX_ROOT_RESOLVED."
+      log "ERROR: refusing to touch anything outside the sandbox."
+      exit 1
+    fi
+  done
+  log "sandbox mode: everything stays under $SANDBOX_ROOT_RESOLVED"
+else
+  # A run that changes the install directory but not the runner homes
+  # would write that directory into the LIVE runners' .path file, which is
+  # the pollution that put a dead PATH entry into every job on the fleet.
+  install_bin_dir="$(resolve_path "$(dirname -- "$INSTALL_PATH")")"
+  default_bin_dir="$(resolve_path "$(dirname -- "$DEFAULT_INSTALL_PATH")")"
+  if [ "$RUNNER_HOMES_OVERRIDDEN" -eq 0 ] && [ "$install_bin_dir" != "$default_bin_dir" ]; then
+    log "ERROR: INSTALL_PATH was overridden to $INSTALL_PATH but RUNNER_HOMES was not."
+    log "ERROR: the default RUNNER_HOMES point at the LIVE runners, so this run"
+    log "ERROR: would write $install_bin_dir into their .path file."
+    log "ERROR: set RUNNER_HOMES explicitly, or run with SANDBOX=1."
+    exit 1
+  fi
 fi
 
 uname_s="$(uname -s)"
@@ -289,6 +454,13 @@ fix_runner_ownership() {
       log "WARN: runner home $runner_dir does not exist; skipping it"
       continue
     fi
+    # A sandbox run must not change the ownership of anything outside its
+    # root: the live runners' tree is not a verification target, and a
+    # recursive chown there is a fleet-wide mutation.
+    if [ "$SANDBOX" = "1" ] && ! path_under "$(resolve_path "$runner_dir")" "$SANDBOX_ROOT_RESOLVED"; then
+      log "WARN: $runner_dir is outside the sandbox root $SANDBOX_ROOT_RESOLVED; leaving its ownership untouched"
+      continue
+    fi
 
     if ! owner_group="$(runner_owner_and_group "$runner_dir")"; then
       log "WARN: the user that must own $runner_dir could not be determined; leaving it untouched"
@@ -424,6 +596,14 @@ path_file_has() {
 ensure_runner_path() {
   local runner_dir path_file current bin_dir owner tmp_file rc=0
   bin_dir="$(dirname "$INSTALL_PATH")"
+  # The install directory has to exist before it goes into a .path file: a
+  # dead entry costs every job on that runner a failed lookup, and the
+  # guarantee the entry exists for ("the routine resolves by name") is
+  # dead by default when the directory is missing.
+  if [ ! -d "$bin_dir" ]; then
+    log "WARN: the install directory $bin_dir does not exist; not adding it to any .path file"
+    return 0
+  fi
   for runner_dir in "${RUNNER_HOME_LIST[@]:-}"; do
     [ -n "$runner_dir" ] || continue
     if [ ! -d "$runner_dir" ]; then
@@ -467,33 +647,62 @@ ensure_runner_path() {
   return "$rc"
 }
 
+# Create the directories a sandbox install writes into, so a verification
+# run can complete end to end. Nothing outside the sandbox is touched.
+sandbox_prepare() {
+  local runner_dir
+  [ "$SANDBOX" = "1" ] || return 0
+  mkdir -p "$(dirname -- "$INSTALL_PATH")" "$UNIT_DIR"
+  for runner_dir in "${RUNNER_HOME_LIST[@]:-}"; do
+    [ -n "$runner_dir" ] || continue
+    mkdir -p "$runner_dir"
+  done
+}
+
+# The install itself. Enabling the timer and running the routine once are
+# the only steps that need a live systemd, so a sandbox run skips them.
+run_install() {
+  sandbox_prepare
+  install_script
+  install_units
+  fix_runner_ownership
+  # Fail closed: a runner that cannot write its work directory is worse
+  # than no install at all, so this must not report success.
+  if ! verify_runner_writable; then
+    log "ERROR: install aborted — the runner user cannot write its work directory"
+    exit 1
+  fi
+  if ! ensure_runner_path; then
+    log "WARN: at least one runner's .path file could not be updated"
+    log "WARN: the runner service may not find the routine by name"
+  fi
+  if [ "$SANDBOX" = "1" ]; then
+    log "sandbox mode: the timer was not enabled and the routine was not started"
+    log "sandbox install complete (nothing outside $SANDBOX_ROOT_RESOLVED was touched)"
+    return 0
+  fi
+  enable_timer
+  run_once
+  log "disk cleanup installed (timer enabled, routine verified)"
+}
+
 # Run the install when the script is executed. When it is sourced — the
 # sandbox tests do that to exercise the .path handling in isolation —
 # nothing is installed and the functions are simply available.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 case "$uname_s" in
   Linux)
-    install_script
-    install_units
-    fix_runner_ownership
-    # Fail closed: a runner that cannot write its work directory is worse
-    # than no install at all, so this must not report success.
-    if ! verify_runner_writable; then
-      log "ERROR: install aborted — the runner user cannot write its work directory"
-      exit 1
-    fi
-    if ! ensure_runner_path; then
-      log "WARN: at least one runner's .path file could not be updated"
-      log "WARN: the runner service may not find the routine by name"
-    fi
-    enable_timer
-    run_once
-    log "disk cleanup installed (timer enabled, routine verified)"
+    run_install
     log "the runner services were left running"
     ;;
   Darwin)
-    log "macOS: systemd timers are Linux-only, nothing installed"
-    log "macOS: the Linux runners live in the Colima VM — run this script there"
+    if [ "$SANDBOX" = "1" ]; then
+      log "sandbox mode: installing into $SANDBOX_ROOT_RESOLVED (macOS has no systemd)"
+      run_install
+    else
+      log "macOS: systemd timers are Linux-only, nothing installed"
+      log "macOS: the Linux runners live in the Colima VM — run this script there"
+    fi
     ;;
   *)
     log "ERROR: unsupported OS '$uname_s' (expected Linux or Darwin)"

@@ -323,6 +323,213 @@ class TestRunnerPathFile:
             f"an entry that is already there must not be added again, got {lines}"
         )
 
+    def test_the_colon_joined_line_of_the_live_runners_survives(self, tmp_path: Path) -> None:
+        """A line is never dropped because one of its fragments is missing.
+
+        The live runners carry a colon-joined line whose fragments
+        (/usr/games, /usr/local/games, /snap/bin) do not exist on the
+        Colima VM. A cleanup that pruned "missing" fragments — or a whole
+        line because a fragment was missing — would silently strip PATH
+        entries the runners are supposed to have.
+        """
+        home = tmp_path / "actions-runner-linux"
+        home.mkdir()
+        path_file = home / ".path"
+        joined = "/usr/games:/usr/local/games:/snap/bin"
+        path_file.write_text(f"{joined}\n")
+        install_path = tmp_path / "opt" / "bin" / "runner-disk-cleanup.sh"
+        install_path.parent.mkdir(parents=True)
+
+        self._update(home, install_path)
+
+        lines = path_file.read_text().splitlines()
+        assert joined in lines, (
+            f"the colon-joined line must survive the install untouched, got {lines}"
+        )
+
+    def test_a_missing_install_directory_is_not_added(self, tmp_path: Path) -> None:
+        """The guarantee has to be alive: a dead entry helps nobody.
+
+        The install directory is what the runner resolves the routine by,
+        so it has to exist before it goes into a .path file.
+        """
+        home = tmp_path / "actions-runner-linux"
+        home.mkdir()
+        path_file = home / ".path"
+        path_file.write_text("/usr/local/bin\n")
+        install_path = tmp_path / "verify" / "missing" / "runner-disk-cleanup.sh"
+
+        env = os.environ.copy()
+        env.update({"RUNNER_HOMES": str(home), "INSTALL_PATH": str(install_path)})
+        result = subprocess.run(
+            ["bash", "-c", 'source "$INSTALLER"; ensure_runner_path'],
+            env={**env, "INSTALLER": str(INSTALLER)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, f"ensure_runner_path failed: {result.stderr}"
+        assert path_file.read_text() == "/usr/local/bin\n", (
+            "a directory that does not exist must not go into a .path file"
+        )
+        assert "does not exist" in result.stdout, f"the skip has to be logged, got {result.stdout}"
+
+
+def _installer(overrides: dict[str, str], command: str) -> subprocess.CompletedProcess[str]:
+    """Source the installer with the given environment overrides.
+
+    Every knob the installer reads is removed from the inherited
+    environment first, so a test can assert what happens when the
+    operator did NOT set it.
+    """
+    env = os.environ.copy()
+    for knob in ("SANDBOX", "SANDBOX_ROOT", "RUNNER_HOMES", "INSTALL_PATH", "UNIT_DIR"):
+        env.pop(knob, None)
+    env.update(overrides)
+    env["INSTALLER"] = str(INSTALLER)
+    return subprocess.run(
+        ["bash", "-c", command],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+class TestInstallerSandbox:
+    """A sandbox run must never mutate the live fleet.
+
+    The live defect: a verification that overrode INSTALL_PATH but not
+    RUNNER_HOMES wrote the verification's install directory into the LIVE
+    Colima runners' .path file, so every job on them started with a dead
+    PATH entry. The installer now fails closed instead of guessing.
+    """
+
+    def test_sandbox_refuses_a_runner_home_outside_the_sandbox(self, tmp_path: Path) -> None:
+        sandbox = tmp_path / "sandbox"
+        live = tmp_path / "actions-runner-linux"
+        live.mkdir()
+        path_file = live / ".path"
+        path_file.write_text("/usr/local/bin\n")
+
+        result = _installer(
+            {
+                "SANDBOX": "1",
+                "SANDBOX_ROOT": str(sandbox),
+                "RUNNER_HOMES": str(live),
+                "INSTALL_PATH": str(sandbox / "bin" / "runner-disk-cleanup.sh"),
+            },
+            'source "$INSTALLER"',
+        )
+
+        assert result.returncode != 0, (
+            "a sandbox run that reaches outside the sandbox root must fail closed"
+        )
+        assert "sandbox" in result.stdout.lower(), (
+            f"the refusal has to say why, got {result.stdout}"
+        )
+        assert path_file.read_text() == "/usr/local/bin\n", (
+            "the runner home outside the sandbox must not be touched"
+        )
+
+    def test_sandbox_refuses_an_install_path_outside_the_sandbox(self, tmp_path: Path) -> None:
+        sandbox = tmp_path / "sandbox"
+
+        result = _installer(
+            {
+                "SANDBOX": "1",
+                "SANDBOX_ROOT": str(sandbox),
+                "INSTALL_PATH": "/usr/local/bin/runner-disk-cleanup.sh",
+            },
+            'source "$INSTALLER"',
+        )
+
+        assert result.returncode != 0, (
+            "a sandbox run must not install into the host's /usr/local/bin"
+        )
+        assert "sandbox" in result.stdout.lower(), (
+            f"the refusal has to say why, got {result.stdout}"
+        )
+
+    def test_sandbox_forces_the_runner_homes_into_the_sandbox(self, tmp_path: Path) -> None:
+        sandbox = tmp_path / "sandbox"
+
+        result = _installer(
+            {"SANDBOX": "1", "SANDBOX_ROOT": str(sandbox)},
+            'source "$INSTALLER"; printf "HOMES=%s\\n" "${RUNNER_HOME_LIST[*]}"',
+        )
+
+        assert result.returncode == 0, result.stderr
+        marked = [line for line in result.stdout.splitlines() if line.startswith("HOMES=")]
+        assert marked, f"the runner homes have to be reported, got {result.stdout}"
+        homes = marked[0][len("HOMES=") :].split()
+        assert homes, "the sandbox must still have a runner home"
+        for home in homes:
+            assert str(sandbox) in home, f"{home} must live inside the sandbox"
+
+    def test_overriding_only_the_install_path_does_not_touch_the_live_runners(
+        self, tmp_path: Path
+    ) -> None:
+        """The live incident, as a regression test.
+
+        RUNNER_HOMES is not set, so the defaults point at the LIVE
+        runners. The install directory is a verification directory, so
+        without a guard this run would put that directory into the live
+        runners' .path file.
+        """
+        result = _installer(
+            {"INSTALL_PATH": str(tmp_path / "verify" / "sandbox" / "runner-disk-cleanup.sh")},
+            'source "$INSTALLER"',
+        )
+
+        assert result.returncode != 0, (
+            "changing the install directory without naming the runner homes "
+            "would write it into the LIVE runners' .path file"
+        )
+        assert "RUNNER_HOMES" in result.stdout, (
+            f"the refusal has to name the knob the operator has to set, got {result.stdout}"
+        )
+
+    def test_naming_the_runner_homes_explicitly_is_allowed(self, tmp_path: Path) -> None:
+        """The guard must not block the legitimate mixed run."""
+        home = tmp_path / "actions-runner-linux"
+        home.mkdir()
+
+        result = _installer(
+            {
+                "RUNNER_HOMES": str(home),
+                "INSTALL_PATH": str(tmp_path / "verify" / "runner-disk-cleanup.sh"),
+            },
+            'source "$INSTALLER"',
+        )
+
+        assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+
+    def test_fix_runner_ownership_leaves_a_home_outside_the_sandbox_alone(
+        self, tmp_path: Path
+    ) -> None:
+        """The ownership fix is a recursive chown — it stays in the sandbox."""
+        sandbox = tmp_path / "sandbox"
+        inside = sandbox / "actions-runner-linux"
+        inside.mkdir(parents=True)
+        outside = tmp_path / "actions-runner-linux"
+        outside.mkdir()
+        marker = outside / "keep-me"
+        marker.write_text("untouched")
+
+        result = _installer(
+            {"SANDBOX": "1", "SANDBOX_ROOT": str(sandbox)},
+            # SUDO is emptied so the test can never block on a password
+            # prompt: the guard has to fire before any chown is attempted.
+            f'source "$INSTALLER"; SUDO=""; RUNNER_HOME_LIST=("{outside}"); fix_runner_ownership',
+        )
+
+        assert "outside the sandbox" in result.stdout, (
+            f"the ownership fix must refuse a home outside the sandbox, got {result.stdout}"
+        )
+        assert marker.exists(), "the home outside the sandbox must be left alone"
+
 
 class TestTiers:
     """The tier ladder itself."""
