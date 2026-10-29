@@ -30,10 +30,10 @@ Whatever the official binary supports, the CLI supports.
 
 GitHub-hosted runners ship with a full toolchain pre-installed; a bare
 self-hosted host (a fresh Colima VM, a clean macOS box) does not. When a
-job calls `npm`, `node`, or `pipx` on an unprovisioned host it fails with
-`command not found`, and the self-hosted-preferred wrapper silently falls
-back to the GitHub-hosted leg on every run — so self-hosted never actually
-does the work.
+job calls `npm`, `node`, `pipx` or `gh` on an unprovisioned host it fails
+with `command not found`, and the self-hosted-preferred wrapper silently
+falls back to the GitHub-hosted leg on every run — so self-hosted never
+actually does the work.
 
 `gh-runners provision` runs a bundled, idempotent script that closes that
 gap once per host:
@@ -46,6 +46,11 @@ gap once per host:
   with `NPM_PREFIX`) and chowns it to the runner user, which is already on
   `PATH`.
 - **pip + pipx** — for Python tooling installed globally on the host.
+- **The GitHub CLI (`gh`)** — on Linux the pinned official release
+  (`GH_VERSION`, default `v2.103.3`) is installed to `GH_INSTALL_PATH`
+  (default `/usr/local/bin/gh`) after the download is checked against a
+  recorded sha256; on macOS `gh` comes from Homebrew, because the pinned
+  release is Linux-only.
 
 ```bash
 gh-runners provision        # safe to re-run; checks before it installs
@@ -54,6 +59,42 @@ gh-runners provision        # safe to re-run; checks before it installs
 Run this once on each host before `configure` / `start`. It is the
 permanent home of the "self-hosted host needs the toolchain too" lesson —
 re-running after a host rebuild restores the toolchain.
+
+### How to run it
+
+`gh-runners provision` is normally run **as root**: the toolchain goes to
+`/usr/local`, the npm prefix has to be chowned, and the runner's `.path`
+file has to be written. Run it as the runner user instead and every
+privileged step escalates with `sudo` — **interactively**, so a watched
+invocation can answer the password prompt. `gh-runners provision
+--non-interactive` turns the escalation into `sudo -n`, where a missing
+password fails the provisioning instead of hanging on a prompt. (sudo only
+accepts `sudo -E` when the invoking user holds the `SETENV` tag; on a host
+where it does not, the NodeSource install has to be run by a user that
+does.)
+
+### The runner home has to exist
+
+The provisioning ends with a check that the **runner user** — the owner of
+the runner home, never hardcoded — can really run `gh --version` under the
+default job `PATH`, executed *as that user*. Root bypasses the mode bits,
+so a root-only check would pass for a binary the runner user cannot
+execute: every job on the host would then die with `gh: command not found`
+(exit 127) while the provisioning reported success.
+
+The runner home is named by the `RUNNER_HOMES` knob with **absolute
+paths** — the same knob `install-disk-cleanup.sh` uses — because
+provisioning runs as root and root's home holds no runner directory:
+
+```bash
+RUNNER_HOMES=/home/runner/actions-runner gh-runners provision
+```
+
+When no runner home is found the provisioning **fails loudly** (`no runner
+home found — cannot verify the runner user`) instead of quietly verifying
+the invoking user. Install the runner first (`gh-runners install
+--target-dir <runner home>`) or point `RUNNER_HOMES` at the runner home
+that is going to be used.
 
 ## Host disk management
 
@@ -251,7 +292,7 @@ uv sync
 cp .env.example .env
 # Edit .env — set GITHUB_ACCESS_TOKEN and exactly one of GITHUB_ORG or GITHUB_REPOSITORY
 
-# Provision the host toolchain (Node/npm, pipx) — one-time per host
+# Provision the host toolchain (Node/npm, pipx, gh) — one-time per host
 gh-runners provision
 
 # Create a runner directory and install the official binary
@@ -329,7 +370,7 @@ Copy `.env.example` to `.env` and fill in the values. `GITHUB_ORG` and
 
 | Command | Description |
 |---|---|
-| `gh-runners provision` | Install the host toolchain jobs expect (Node/npm, pipx) — idempotent |
+| `gh-runners provision [--non-interactive]` | Install the host toolchain jobs expect (Node/npm, pipx, gh) — idempotent |
 | `gh-runners install [--target-dir DIR] [--version VER]` | Download and extract the official `actions/runner` binary |
 | `gh-runners configure --name NAME [--target-dir DIR] [--labels L] [--runner-group G] [--work-dir W] [--no-replace]` | Fetch a JIT token, run `config.sh` with the resolved options |
 | `gh-runners start [--target-dir DIR] [--service]` | Start the runner (foreground by default; `--service` installs `launchd`/`systemd`) |

@@ -10,6 +10,23 @@
 # This script is idempotent: it checks before it installs, so re-running it
 # is safe and fast. It is invoked by `gh-runners provision`.
 #
+# ## How it is run
+#
+# It is normally run AS ROOT: the toolchain goes to /usr/local, the npm
+# prefix has to be chowned, and the runner's `.path` file has to be
+# written. Run as the runner user instead, every privileged step is
+# escalated with sudo — interactively by default, so a watched
+# invocation can answer the password prompt. `--non-interactive` turns
+# the escalation into `sudo -n`, where a missing password fails the
+# provisioning instead of hanging on a prompt.
+#
+# The runner user is NOT taken from $HOME: provisioning runs as root and
+# root's home holds no runner directory. It is the owner of the runner
+# home, and the runner home is named by the RUNNER_HOMES knob with
+# ABSOLUTE paths (the same knob install-disk-cleanup.sh uses). The
+# provisioning fails when no runner home is found: a check that verified
+# the invoking user would pass for a binary the runner user cannot run.
+#
 # What it ensures:
 #   - Node.js + npm (Linux: NodeSource; macOS: Homebrew)
 #   - An npm global prefix the runner user can write to (Linux only — the
@@ -25,6 +42,8 @@
 #     Actions job PATH. The release is pinned and the download is checked
 #     against a recorded sha256 before it is unpacked: the binary ends up
 #     root-owned and world executable, so every job on the host runs it.
+#     On macOS gh comes from Homebrew: the pinned release install is
+#     Linux-only, and the Homebrew prefix is not on the Linux job PATH.
 #   - uv (the Python package manager — installed by the official astral
 #     installer to ~/.local/bin/uv and added to the user's shell rc)
 #   - bun (the TypeScript runtime archgate is built with)
@@ -53,39 +72,88 @@ ARCHGATE_VERSION="${ARCHGATE_VERSION:-v0.60.0}"
 GH_INSTALL_PATH="${GH_INSTALL_PATH:-/usr/local/bin/gh}"
 GH_VERSION="${GH_VERSION:-v2.103.3}"
 
+# The runner homes on this host, as ABSOLUTE paths, separated by spaces.
+# Same knob as install-disk-cleanup.sh uses, so an operator points both
+# at the same place.
+#
+# The runner user is derived from the owner of one of these, and never
+# from $HOME: provisioning runs as root, and root's home holds no runner
+# directory, so a $HOME-based lookup falls back to root — and a check
+# that ran as root passes for a binary the runner user cannot execute.
+RUNNER_HOMES="${RUNNER_HOMES:-/home/redlexgilgamesh.guest/actions-runner-linux /home/redlexgilgamesh.guest/actions-runner-linux-2}"
+read -r -a RUNNER_HOME_LIST <<<"$RUNNER_HOMES"
+
 log() { printf '[provision] %s\n' "$*"; }
 
 # The command used to escalate to root for the writes that need it. It is
 # empty when the script already runs as root. It can be pinned from the
 # environment — the tests set it to "env" so an install can run into a
 # temporary directory without a password prompt.
-SUDO="${SUDO:-sudo}"
-if [ "$(id -u)" -eq 0 ] && [ "$SUDO" = "sudo" ]; then
-  SUDO=""
+#
+# The name is namespaced on purpose: SUDO is a common environment
+# variable, and an unrelated SUDO in the environment would silently
+# reroute every privileged call in this script.
+PROVISION_SUDO="${PROVISION_SUDO:-sudo}"
+if [ "$(id -u)" -eq 0 ] && [ "$PROVISION_SUDO" = "sudo" ]; then
+  PROVISION_SUDO=""
 fi
+
+# Whether the escalation may prompt for a password. The documented flow is
+# a watched invocation, so the default is interactive and a missing
+# password prompt can be answered. --non-interactive turns it into
+# `sudo -n`, where a missing password fails the provisioning instead of
+# hanging on a prompt.
+NON_INTERACTIVE=0
 
 # Whether the escalation command is a real sudo. The flags that belong to
 # sudo are only passed to it: a pinned escalation command — the tests pin
-# $SUDO to "env" — is not sudo and does not know them.
+# $PROVISION_SUDO to "env" — is not sudo and does not know them.
 is_sudo() {
   [ "${1##*/}" = "sudo" ]
+}
+
+usage() {
+  log "usage: $0 [--non-interactive]"
+  log "  --non-interactive  the privileged steps must not prompt for a password;"
+  log "                     a missing password fails the provisioning instead"
+  log "                     of hanging on a prompt"
+}
+
+parse_args() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --non-interactive) NON_INTERACTIVE=1 ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *)
+        log "ERROR: unknown argument '$arg' (see --help)"
+        usage
+        exit 1
+        ;;
+    esac
+  done
 }
 
 # Run a command as root when the script is not root already.
 #
 # The escalation is chosen HERE instead of being interpolated into the
-# command line: an empty $SUDO used to leave the sudo flags behind, so
-# `curl … | $SUDO -E bash -` became `-E bash -` and the shell reported
-# "-E: command not found" every time the script ran as root — which is
-# how `gh-runners provision` is normally run.
+# command line: an empty $PROVISION_SUDO used to leave the sudo flags
+# behind, so `curl … | $SUDO -E bash -` became `-E bash -` and the shell
+# reported "-E: command not found" every time the script ran as root —
+# which is how `gh-runners provision` is normally run.
 run_privileged() {
-  if [ -n "$SUDO" ]; then
-    if is_sudo "$SUDO"; then
-      # -n: a non-interactive provision must fail instead of hanging on a
-      # password prompt.
-      "$SUDO" -n "$@"
+  if [ -n "$PROVISION_SUDO" ]; then
+    if is_sudo "$PROVISION_SUDO"; then
+      if [ "$NON_INTERACTIVE" = "1" ]; then
+        "$PROVISION_SUDO" -n "$@"
+      else
+        "$PROVISION_SUDO" "$@"
+      fi
     else
-      "$SUDO" "$@"
+      "$PROVISION_SUDO" "$@"
     fi
   else
     "$@"
@@ -95,15 +163,21 @@ run_privileged() {
 # Pipe a remote install script into bash.
 #
 # `sudo -E` keeps the environment (the NodeSource script needs it), and
-# the flag only exists when there is a sudo to hand it to. `-n` makes the
-# escalation non-interactive: a provision that is not watched cannot
-# answer a password prompt.
+# the flag only exists when there is a sudo to hand it to. sudo only
+# accepts -E when the invoking user holds the SETENV tag; a host where
+# it does not refuses the escalation with "sorry, you are not allowed to
+# preserve the environment", and the NodeSource install then has to be
+# run by a user that does.
 run_remote_script() {
-  if [ -n "$SUDO" ]; then
-    if is_sudo "$SUDO"; then
-      "$SUDO" -n -E bash -
+  if [ -n "$PROVISION_SUDO" ]; then
+    if is_sudo "$PROVISION_SUDO"; then
+      if [ "$NON_INTERACTIVE" = "1" ]; then
+        "$PROVISION_SUDO" -n -E bash -
+      else
+        "$PROVISION_SUDO" -E bash -
+      fi
     else
-      "$SUDO" bash -
+      "$PROVISION_SUDO" bash -
     fi
   else
     bash -
@@ -476,8 +550,37 @@ install_gh_release() {
     log "ERROR: could not create $(dirname "$GH_INSTALL_PATH")"
     return 1
   fi
-  if ! run_privileged install -m 0755 "$binary" "$GH_INSTALL_PATH"; then
+  # The binary is staged next to the target and moved into place: `install`
+  # truncates the destination in place, so replacing a gh that a running
+  # job is executing fails with ETXTBSY. A rename(2) within one directory
+  # is atomic, so a job sees either the old binary or the new one.
+  local staged="${GH_INSTALL_PATH}.new.$$"
+  if ! run_privileged install -m 0755 "$binary" "$staged"; then
     log "ERROR: could not install gh to $GH_INSTALL_PATH"
+    run_privileged rm -f "$staged" || true
+    return 1
+  fi
+  if ! run_privileged mv -f "$staged" "$GH_INSTALL_PATH"; then
+    log "ERROR: could not install gh to $GH_INSTALL_PATH"
+    run_privileged rm -f "$staged" || true
+    return 1
+  fi
+}
+
+# Repair the mode and the owner of an installed gh.
+#
+# A fresh install gets them from `install -m 0755`. A gh that is already
+# there may have been left behind by another job on this shared host with
+# a mode that keeps the runner user out — and then every job on the host
+# dies with "gh: command not found" while the provisioning reports
+# success. The mode is repaired instead of assumed.
+repair_gh_install() {
+  if ! run_privileged chmod 0755 "$GH_INSTALL_PATH"; then
+    log "ERROR: could not make $GH_INSTALL_PATH world executable"
+    return 1
+  fi
+  if ! run_privileged chown "$(id -un):$(id -gn)" "$GH_INSTALL_PATH"; then
+    log "ERROR: could not set the owner of $GH_INSTALL_PATH"
     return 1
   fi
 }
@@ -508,6 +611,9 @@ ensure_gh_linux() {
       # The release API is unreachable but a working gh is installed: keep
       # it rather than failing the provisioning of an otherwise good host.
       log "WARN: could not read the latest GitHub CLI release; keeping gh $installed at $GH_INSTALL_PATH"
+      if ! repair_gh_install; then
+        exit 1
+      fi
       return
     fi
     log "ERROR: could not read the latest GitHub CLI release from the GitHub API"
@@ -525,6 +631,11 @@ ensure_gh_linux() {
   if [ -n "$installed" ]; then
     if [ "$(version_core "$installed")" = "$(version_core "$version")" ]; then
       log "gh $installed already present at $GH_INSTALL_PATH"
+      # The mode and the owner are repaired, not assumed: the version
+      # being right says nothing about who may run the binary.
+      if ! repair_gh_install; then
+        exit 1
+      fi
       return
     fi
     log "updating GitHub CLI ${installed} -> ${version} (${asset})"
@@ -557,6 +668,24 @@ ensure_gh_linux() {
   rm -rf "$tmpdir" || log "WARN: could not remove $tmpdir"
   restore_exit_trap "$previous_exit_trap"
   log "gh $("$GH_INSTALL_PATH" --version | head -1) installed to $GH_INSTALL_PATH"
+}
+
+# Install the GitHub CLI on a macOS host.
+#
+# The pinned release install is Linux-only: the release tarball is built
+# for linux, and the Homebrew prefix on macOS is not on the Linux job
+# PATH. Homebrew ships the same CLI, so a macOS host gets it from there.
+ensure_gh_macos() {
+  if command -v gh >/dev/null 2>&1; then
+    log "gh $(gh --version | head -1) already present"
+    return
+  fi
+  if ! command -v brew >/dev/null 2>&1; then
+    log "WARN: Homebrew not found; skipping the GitHub CLI install"
+    return
+  fi
+  log "installing the GitHub CLI via Homebrew"
+  brew install gh
 }
 
 ensure_uv() {
@@ -598,6 +727,12 @@ ensure_archgate() {
     fi
     local tmpdir
     tmpdir="$(mktemp -d)"
+    # The trap that was in place before is put back below, so a caller
+    # that registered a cleanup of its own does not lose it: `trap - EXIT`
+    # clears EVERY EXIT trap, and this function runs after the gh install
+    # that already saves and restores it.
+    local previous_exit_trap
+    previous_exit_trap="$(trap -p EXIT)"
     # shellcheck disable=SC2064
     trap "rm -rf '$tmpdir'" EXIT
     git clone --depth 1 --branch "$ARCHGATE_VERSION" \
@@ -607,7 +742,7 @@ ensure_archgate() {
     bun build "$tmpdir/archgate/src/cli.ts" --compile --bytecode \
       --outfile "$HOME/.archgate/bin/archgate"
     log "archgate $(~/.archgate/bin/archgate --version) installed to ~/.archgate/bin/archgate"
-    trap - EXIT
+    restore_exit_trap "$previous_exit_trap"
     rm -rf "$tmpdir"
   else
     log "installing archgate $ARCHGATE_VERSION via official install script (to ~/.archgate/bin)"
@@ -630,12 +765,16 @@ as_user() {
     "$@"
     return
   fi
-  local escalate="$SUDO"
+  local escalate="$PROVISION_SUDO"
   if [ -z "$escalate" ]; then
     escalate="sudo"
   fi
   if is_sudo "$escalate"; then
-    "$escalate" -n -u "$user" -- "$@"
+    if [ "$NON_INTERACTIVE" = "1" ]; then
+      "$escalate" -n -u "$user" -- "$@"
+    else
+      "$escalate" -u "$user" -- "$@"
+    fi
   else
     "$escalate" "$@"
   fi
@@ -648,53 +787,76 @@ as_user() {
 # back to root and the "the runner user can run gh" check verified root
 # instead of the user a job actually runs as.
 #
-# Falls back to the user the script runs as when there is no runner home
-# yet.
+# The runner home is named by the RUNNER_HOMES knob with absolute paths.
+# When none of them exists the user cannot be determined, and this fails
+# instead of falling back to the invoking user: a fallback would verify
+# root and pass vacuously.
 runner_user() {
   local runner_dir owner
-  for runner_dir in "$HOME"/actions-runner*; do
+  for runner_dir in "${RUNNER_HOME_LIST[@]:-}"; do
+    [ -n "$runner_dir" ] || continue
     [ -d "$runner_dir" ] || continue
     owner="$(stat -c '%U' "$runner_dir" 2>/dev/null || true)"
     if [ -z "$owner" ]; then
       owner="$(stat -f '%Su' "$runner_dir" 2>/dev/null || true)"
     fi
-    # An id with no passwd entry comes back as UNKNOWN; fall back to the
-    # user the script runs as.
+    # An id with no passwd entry comes back as UNKNOWN; that is not a user
+    # to run a job as.
     if [ -n "$owner" ] && [ "$owner" != "UNKNOWN" ]; then
       printf '%s' "$owner"
-      return
+      return 0
     fi
   done
-  id -un
+  return 1
 }
 
 # Assert that the runner user can really run gh. The binary is root-owned
 # and world executable by construction, but the job still dies with "gh:
 # command not found" when the PATH that carries it is not the one the job
-# gets — so the check runs gh under the default job PATH, as the runner
-# user.
+# gets — so the check runs the installed binary under the default job
+# PATH, as the runner user.
 #
 # The check runs as that user and not as root: root bypasses the mode
 # bits, so a root-only check would pass for a binary the runner user
 # cannot execute.
 verify_gh_runnable() {
   if [ "$uname_s" != "Linux" ]; then
-    # gh is installed by this script on Linux only; there is nothing to
-    # verify on a macOS host.
+    # The pinned release install is Linux-only; on macOS gh comes from
+    # Homebrew, whose prefix is not on the Linux job PATH.
     return
   fi
   local user
-  user="$(runner_user)"
-  if as_user "$user" env PATH="$DEFAULT_JOB_PATH" gh --version >/dev/null 2>&1; then
-    log "verified: $user can run gh"
+  if ! user="$(runner_user)"; then
+    log "ERROR: no runner home found — cannot verify the runner user"
+    log "ERROR: set RUNNER_HOMES to the runner home(s) on this host"
+    log "ERROR: a check that ran as the invoking user would pass for a gh the runner user cannot run"
+    exit 1
+  fi
+  # The binary that is verified is the one this script installed, not
+  # whatever `gh` the PATH happens to resolve to: an older gh somewhere
+  # else on the PATH says nothing about the install.
+  local gh_dir
+  gh_dir="$(dirname "$GH_INSTALL_PATH")"
+  case ":${DEFAULT_JOB_PATH}:" in
+    *":${gh_dir}:"*) ;;
+    *)
+      log "ERROR: $gh_dir is not on the default job PATH"
+      log "ERROR: jobs that call 'gh api' would fail with 'gh: command not found'"
+      exit 1
+      ;;
+  esac
+  if as_user "$user" env PATH="$DEFAULT_JOB_PATH" "$GH_INSTALL_PATH" --version >/dev/null 2>&1; then
+    log "verified: $user can run gh at $GH_INSTALL_PATH"
   else
-    log "ERROR: $user cannot run gh"
+    log "ERROR: $user cannot run gh at $GH_INSTALL_PATH"
     log "ERROR: jobs that call 'gh api' would fail with 'gh: command not found'"
     exit 1
   fi
 }
 
 main() {
+  parse_args "$@"
+
   case "$uname_s" in
     Linux)
       run_privileged apt-get update -y
@@ -705,6 +867,7 @@ main() {
     Darwin)
       ensure_node_macos
       ensure_pipx_macos
+      ensure_gh_macos
       ;;
     *)
       log "ERROR: unsupported OS '$uname_s' (expected Linux or Darwin)"
@@ -721,11 +884,7 @@ main() {
 
   verify_gh_runnable
 
-  local summary="uv, bun, archgate"
-  if [ "$uname_s" = "Linux" ]; then
-    summary="$summary, gh"
-  fi
-  log "host provisioning complete ($summary on PATH)"
+  log "host provisioning complete (uv, bun, archgate, gh on PATH)"
 }
 
 # Run the provisioning when the script is executed. When it is sourced — the

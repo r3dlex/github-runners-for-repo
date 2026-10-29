@@ -147,6 +147,7 @@ REQUIRED_BINARIES = (
     "install",
     "mkdir",
     "mktemp",
+    "mv",
     "rm",
     "sed",
     "sh",
@@ -267,7 +268,7 @@ def _sandbox(tmp_path: Path, arch: str = ARCH) -> dict[str, str]:
         {
             "PATH": f"{stub_dir}{os.pathsep}{sysbin}",
             "HOME": str(tmp_path / "home"),
-            "SUDO": "env",
+            "PROVISION_SUDO": "env",
             "GH_INSTALL_PATH": str(tmp_path / "usr-local-bin" / "gh"),
             "STUB_API_JSON": str(api_json),
             "STUB_TARBALL": str(tarball),
@@ -350,17 +351,17 @@ exec "$@"
 
 
 def _sudo_stub(env: dict[str, str]) -> None:
-    """Put a recording `sudo` into the sandbox and point $SUDO at it.
+    """Put a recording `sudo` into the sandbox and point $PROVISION_SUDO at it.
 
-    The sandbox pins $SUDO to "env" so the install runs as the test
-    user; that pin cannot switch to another user, so a check that has to
-    run AS the runner user needs a real escalation command here.
+    The sandbox pins $PROVISION_SUDO to "env" so the install runs as the
+    test user; that pin cannot switch to another user, so a check that
+    has to run AS the runner user needs a real escalation command here.
     """
     stub_dir = Path(env["STUB_DIR"])
     path = stub_dir / "sudo"
     path.write_text(SUDO_STUB)
     path.chmod(0o755)
-    env["SUDO"] = "sudo"
+    env["PROVISION_SUDO"] = "sudo"
     env["STUB_SUDO_LOG"] = str(stub_dir.parent / "sudo-calls.log")
 
 
@@ -376,6 +377,22 @@ if [ "${{1:-}}" = "-u" ]; then
   printf '0\\n'
   exit 0
 fi
+exec "{real_id}" "$@"
+"""
+
+
+# An `id` stub for a host where the provisioning runs AS root: both the
+# uid and the user NAME are root. The name matters — the check that
+# verifies the runner user compares the user it would switch to with the
+# user that runs the script, and a root invocation has to look like one.
+def _root_id_stub() -> str:
+    real_id = shutil.which("id", path=os.environ.get("PATH", ""))
+    assert real_id is not None, "the sandbox needs id and this host does not have it"
+    return f"""#!/usr/bin/env bash
+case "${{1:-}}" in
+  -u) printf '0\\n'; exit 0 ;;
+  -un) printf 'root\\n'; exit 0 ;;
+esac
 exec "{real_id}" "$@"
 """
 
@@ -408,6 +425,33 @@ printf 'echo remote-install-script-ran\\n'
 
 # `apt-get` and `npm` stubs: the provisioning only has to get past them.
 NOOP_STUB = """#!/usr/bin/env bash
+exit 0
+"""
+
+# A `git` stub for the archgate build: it "clones" the source into the
+# target directory instead of reaching the network.
+GIT_STUB = """#!/usr/bin/env bash
+target=""
+for arg in "$@"; do target="$arg"; done
+mkdir -p "$target/src"
+printf 'export const cli = 1;\\n' > "$target/src/cli.ts"
+exit 0
+"""
+
+# A `bun` stub for the archgate build: `bun install` does nothing and
+# `bun build --outfile <path>` writes a binary that reports a version.
+BUN_STUB = """#!/usr/bin/env bash
+outfile=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--outfile" ]; then outfile="$arg"; fi
+  prev="$arg"
+done
+if [ -n "$outfile" ]; then
+  mkdir -p "$(dirname "$outfile")"
+  printf '#!/bin/sh\\necho "archgate 0.60.0"\\n' > "$outfile"
+  chmod 0755 "$outfile"
+fi
 exit 0
 """
 
@@ -447,7 +491,7 @@ def _node_sandbox(tmp_path: Path, *, as_root: bool, with_sudo: bool) -> dict[str
             "STUB_DIR": str(stub_dir),
         }
     )
-    env.pop("SUDO", None)
+    env.pop("PROVISION_SUDO", None)
     (tmp_path / "home").mkdir(exist_ok=True)
     _assert_sandbox_shape(
         env,
@@ -464,27 +508,87 @@ def _fake_gh(path: Path, version: str) -> None:
     path.chmod(0o755)
 
 
+# A `gh` that emulates the mode bits of the binary it stands in for.
+#
+# The sandbox cannot change the user a command runs as, so the stub
+# emulates what the kernel does with the mode bits: root runs
+# everything, every other user needs an execute bit that applies to
+# them. $STUB_SUDO_USER is the user the escalated command runs as.
+#
+# The interpreter is spelled out: the check runs the binary under the
+# default job PATH, and that PATH does not carry the sandbox's bash.
+GH_STUB = """#!{bash}
+who="${{STUB_SUDO_USER:-$(id -un)}}"
+if [ -n "${{STUB_GH_IDENTITY_FILE:-}}" ]; then
+  printf '%s\\n' "$who" > "$STUB_GH_IDENTITY_FILE"
+fi
+if [ "$who" != "root" ]; then
+  mode="$(stat -c '%a' "$0" 2>/dev/null || stat -f '%Lp' "$0" 2>/dev/null || echo 755)"
+  owner="$(stat -c '%U' "$0" 2>/dev/null || stat -f '%Su' "$0" 2>/dev/null || echo "$who")"
+  bits="${{mode: -3}}"
+  odd() {{ case "$1" in 1|3|5|7) return 0 ;; *) return 1 ;; esac; }}
+  allowed=0
+  if [ "$owner" = "$who" ]; then
+    odd "${{bits:0:1}}" && allowed=1
+  else
+    odd "${{bits:1:1}}" && allowed=1
+    odd "${{bits:2:1}}" && allowed=1
+  fi
+  if [ "$allowed" -ne 1 ]; then
+    printf '%s: Permission denied\\n' "$0" >&2
+    exit 126
+  fi
+fi
+echo 'gh version 2.103.3 (2026-01-01)'
+"""
+
+
+def _gh_stub(env: dict[str, str], *, mode: int = 0o755) -> Path:
+    """Put a gh at the install path that honours the mode bits."""
+    bash = shutil.which("bash", path=os.environ.get("PATH", ""))
+    assert bash is not None, "the sandbox needs bash and this host does not have it"
+    path = Path(env["GH_INSTALL_PATH"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(GH_STUB.format(bash=bash))
+    path.chmod(mode)
+    return path
+
+
+def _job_path(env: dict[str, str]) -> str:
+    """The PATH a GitHub Actions job gets, with the install dir on it.
+
+    The default job PATH of the script, with the sandbox install
+    directory in front of it — the same shape a job sees on the host.
+    """
+    return (
+        f"{Path(env['GH_INSTALL_PATH']).parent}"
+        ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    )
+
+
 def _root_host_with_runner_home(tmp_path: Path, env: dict[str, str], owner: str) -> Path:
     """Make the sandbox look like a root host that has a runner home.
 
-    `id -u` reports 0 — provisioning runs as root — and `stat` reports the
-    runner user as the owner of the runner home. The runner home itself
-    is a plain directory: what matters is who owns it.
+    `id` reports root — provisioning runs as root — and `stat` reports
+    the runner user as the owner of the runner home. The runner home
+    itself is a plain directory: what matters is who owns it.
 
-    The runner home lives under $HOME, the way the provisioning script
-    finds it: the script looks for the runner dirs in the home of the
-    user that runs it, so a runner home anywhere else would not be found
-    at all.
+    The runner home is NOT under $HOME: root's home holds no runner
+    directory, so a $HOME-based lookup finds nothing and falls back to
+    root — which is exactly the case the check has to get right. The
+    runner home is named through the RUNNER_HOMES knob instead, with the
+    absolute path the fleet really uses.
     """
     stub_dir = Path(env["STUB_DIR"])
-    for name, body in (("id", _id_stub()), ("stat", _stat_stub())):
+    for name, body in (("id", _root_id_stub()), ("stat", _stat_stub())):
         path = stub_dir / name
         path.write_text(body)
         path.chmod(0o755)
     env["STUB_RUNNER_OWNER"] = owner
 
-    runner_home = Path(env["HOME"]) / "actions-runner-linux"
+    runner_home = tmp_path / "runner-homes" / "actions-runner-linux"
     runner_home.mkdir(parents=True)
+    env["RUNNER_HOMES"] = str(runner_home)
     return runner_home
 
 
@@ -908,6 +1012,37 @@ class TestInstall:
         assert not Path(env["GH_INSTALL_PATH"]).exists(), "nothing must be installed"
 
 
+class TestArchgateTrap:
+    """The archgate install must not swallow the caller's cleanup either.
+
+    `trap - EXIT` clears EVERY EXIT trap, and the archgate install runs
+    AFTER the gh install — so an unconditional `trap - EXIT` there takes
+    the cleanup the caller registered away again, exactly like the gh
+    install used to.
+    """
+
+    def _sandbox_with_bun_and_git(self, tmp_path: Path, env: dict[str, str]) -> None:
+        stub_dir = Path(env["STUB_DIR"])
+        for name, body in (("bun", BUN_STUB), ("git", GIT_STUB)):
+            path = stub_dir / name
+            path.write_text(body)
+            path.chmod(0o755)
+
+    def test_the_archgate_install_keeps_the_callers_cleanup(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        self._sandbox_with_bun_and_git(tmp_path, env)
+        script = (
+            'trap "echo caller-cleanup" EXIT; '
+            f'source "{SCRIPT}"; '
+            "uname_s=Linux; uname_m=aarch64; ensure_archgate"
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stderr
+        assert "caller-cleanup" in result.stdout, "the caller's EXIT trap was swallowed"
+
+
 class TestInstalledVersion:
     """The installed binary is compared against the requested release."""
 
@@ -978,49 +1113,77 @@ class TestRunnerUser:
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == "redlexgilgamesh.guest"
 
-    def test_without_a_runner_home_the_invoking_user_is_used(self, tmp_path: Path) -> None:
+    def test_without_a_runner_home_the_invoking_user_is_not_used(self, tmp_path: Path) -> None:
+        """No runner home means no runner user — and no vacuous pass.
+
+        The fallback to the invoking user is what made the check verify
+        root: root bypasses the mode bits, so a gh the runner user cannot
+        run passed the check. There is no fallback any more.
+        """
         env = _sandbox(tmp_path)
         _root_host_with_runner_home(tmp_path, env, "redlexgilgamesh.guest")
-        # A home with no runner dir in it: the script finds no runner
-        # home and falls back to the user it runs as.
-        empty_home = tmp_path / "empty-home"
-        empty_home.mkdir()
-        env["HOME"] = str(empty_home)
+        env["RUNNER_HOMES"] = str(tmp_path / "no-such-runner-home")
         script = f'source "{SCRIPT}"; runner_user'
         result = _run(script, env)
-        assert result.returncode == 0, result.stderr
-        assert result.stdout.strip() != "redlexgilgamesh.guest"
-        assert result.stdout.strip() != "root"
+        assert result.returncode != 0, "the runner user cannot be determined"
+        assert result.stdout.strip() == "", "no user may be invented"
+
+    def test_without_a_runner_home_the_check_fails_loudly(self, tmp_path: Path) -> None:
+        """The provisioning has to say that it could not verify anything."""
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, "redlexgilgamesh.guest")
+        env["RUNNER_HOMES"] = str(tmp_path / "no-such-runner-home")
+        script = f'source "{SCRIPT}"; uname_s=Linux; verify_gh_runnable'
+
+        result = _run(script, env)
+
+        assert result.returncode != 0, "the check must fail the install"
+        assert "no runner home found" in result.stdout
+        assert "cannot verify the runner user" in result.stdout
+
+    def test_a_root_invocation_verifies_the_runner_user_and_not_root(self, tmp_path: Path) -> None:
+        """The check must not pass vacuously because it ran as root.
+
+        The reviewer's scenario: the provisioning runs as root, the
+        runner home is NOT under $HOME (root's home holds no runner
+        directory), and the gh at the install path is mode 0700 — root
+        can run it, the runner user cannot. A check that verified root
+        reports success while every job on the host dies with
+        "gh: command not found".
+        """
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, "redlexgilgamesh.guest")
+        _sudo_stub(env)
+        _gh_stub(env, mode=0o700)
+        script = (
+            f'source "{SCRIPT}"; uname_s=Linux; DEFAULT_JOB_PATH="{_job_path(env)}"; '
+            "verify_gh_runnable"
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode != 0, "the check must fail for a gh the runner user cannot run"
+        assert "redlexgilgamesh.guest cannot run gh" in result.stdout
+        assert "gh: command not found" in result.stdout
 
     def test_the_check_runs_as_the_runner_user(self, tmp_path: Path) -> None:
         """The check has to run AS the runner user, not as root.
 
         Root bypasses the mode bits, so a check that ran as root would
         pass for a binary the runner user cannot execute. The escalation
-        is recorded, and the gh on the job path reports the user it was
-        started as — so a regression that stops using sudo is caught
-        here, not only in a review.
+        is recorded, and the gh reports the user it was started as — so a
+        regression that stops using sudo is caught here, not only in a
+        review.
         """
         env = _sandbox(tmp_path)
         _root_host_with_runner_home(tmp_path, env, "redlexgilgamesh.guest")
         _sudo_stub(env)
         identity = tmp_path / "gh-identity"
         env["STUB_GH_IDENTITY_FILE"] = str(identity)
-        real_id = shutil.which("id", path=os.environ.get("PATH", ""))
-        assert real_id is not None, "the sandbox needs id and this host does not have it"
-        bindir = tmp_path / "job-path"
-        bindir.mkdir()
-        gh = bindir / "gh"
-        gh.write_text(
-            "#!/bin/sh\n"
-            'who="${STUB_SUDO_USER:-'
-            f'"{real_id}" -un' + '}"\n'
-            'printf "%s\\n" "$who" > "$STUB_GH_IDENTITY_FILE"\n'
-            "echo 'gh version 2.103.3'\n"
-        )
-        gh.chmod(0o755)
+        _gh_stub(env)
+        job_path = _job_path(env)
         script = (
-            f'source "{SCRIPT}"; uname_s=Linux; DEFAULT_JOB_PATH="{bindir}"; verify_gh_runnable'
+            f'source "{SCRIPT}"; uname_s=Linux; DEFAULT_JOB_PATH="{job_path}"; verify_gh_runnable'
         )
 
         result = _run(script, env)
@@ -1030,9 +1193,10 @@ class TestRunnerUser:
         sudo_log = Path(env["STUB_SUDO_LOG"])
         assert sudo_log.exists(), "the check did not escalate to the runner user at all"
         sudo_calls = sudo_log.read_text().splitlines()
-        assert f"-n -u redlexgilgamesh.guest -- env PATH={bindir} gh --version" in sudo_calls, (
-            f"the check has to escalate to the runner user, recorded: {sudo_calls}"
-        )
+        assert (
+            f"-u redlexgilgamesh.guest -- env PATH={job_path} {env['GH_INSTALL_PATH']} --version"
+            in sudo_calls
+        ), f"the check has to escalate to the runner user, recorded: {sudo_calls}"
         assert identity.exists(), "gh did not run"
         assert identity.read_text().strip() == "redlexgilgamesh.guest", (
             "gh ran as the invoking user, not as the runner user"
@@ -1041,9 +1205,12 @@ class TestRunnerUser:
     def test_the_check_names_the_runner_user_when_it_fails(self, tmp_path: Path) -> None:
         env = _sandbox(tmp_path)
         _root_host_with_runner_home(tmp_path, env, "redlexgilgamesh.guest")
-        empty = tmp_path / "empty-path"
-        empty.mkdir()
-        script = f'source "{SCRIPT}"; uname_s=Linux; DEFAULT_JOB_PATH="{empty}"; verify_gh_runnable'
+        _sudo_stub(env)
+        _gh_stub(env, mode=0o700)
+        job_path = _job_path(env)
+        script = (
+            f'source "{SCRIPT}"; uname_s=Linux; DEFAULT_JOB_PATH="{job_path}"; verify_gh_runnable'
+        )
 
         result = _run(script, env)
 
@@ -1051,19 +1218,41 @@ class TestRunnerUser:
         assert "redlexgilgamesh.guest cannot run gh" in result.stdout
         assert "gh: command not found" in result.stdout
 
+    def test_the_check_verifies_the_installed_binary(self, tmp_path: Path) -> None:
+        """The binary that is verified is the one that was installed.
+
+        An older gh that happens to sit on the PATH says nothing about
+        the install this script just made.
+        """
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, "redlexgilgamesh.guest")
+        _sudo_stub(env)
+        _gh_stub(env)
+        job_path = _job_path(env)
+        script = (
+            f'source "{SCRIPT}"; uname_s=Linux; DEFAULT_JOB_PATH="{job_path}"; verify_gh_runnable'
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stderr
+        sudo_calls = Path(env["STUB_SUDO_LOG"]).read_text().splitlines()
+        assert any(env["GH_INSTALL_PATH"] in call for call in sudo_calls), (
+            f"the installed binary has to be the one that is verified, recorded: {sudo_calls}"
+        )
+
 
 class TestRunnerUserCheck:
     """The install has to end with a check the runner user can run gh."""
 
     def test_check_passes_when_gh_is_on_the_job_path(self, tmp_path: Path) -> None:
         env = _sandbox(tmp_path)
-        bindir = tmp_path / "job-path"
-        bindir.mkdir()
-        gh = bindir / "gh"
-        gh.write_text("#!/bin/sh\necho 'gh version 2.103.3'\n")
-        gh.chmod(0o755)
+        _root_host_with_runner_home(tmp_path, env, "redlexgilgamesh.guest")
+        _sudo_stub(env)
+        _gh_stub(env)
+        job_path = _job_path(env)
         script = (
-            f'source "{SCRIPT}"; uname_s=Linux; DEFAULT_JOB_PATH="{bindir}"; verify_gh_runnable'
+            f'source "{SCRIPT}"; uname_s=Linux; DEFAULT_JOB_PATH="{job_path}"; verify_gh_runnable'
         )
 
         result = _run(script, env)
@@ -1073,14 +1262,39 @@ class TestRunnerUserCheck:
 
     def test_check_fails_loudly_when_gh_is_not_runnable(self, tmp_path: Path) -> None:
         env = _sandbox(tmp_path)
-        empty = tmp_path / "empty-path"
-        empty.mkdir()
-        script = f'source "{SCRIPT}"; uname_s=Linux; DEFAULT_JOB_PATH="{empty}"; verify_gh_runnable'
+        _root_host_with_runner_home(tmp_path, env, "redlexgilgamesh.guest")
+        _sudo_stub(env)
+        _gh_stub(env, mode=0o700)
+        job_path = _job_path(env)
+        script = (
+            f'source "{SCRIPT}"; uname_s=Linux; DEFAULT_JOB_PATH="{job_path}"; verify_gh_runnable'
+        )
 
         result = _run(script, env)
 
         assert result.returncode != 0, "the check must fail the install"
         assert "cannot run gh" in result.stdout
+        assert "gh: command not found" in result.stdout
+
+    def test_check_fails_when_the_install_path_is_off_the_job_path(self, tmp_path: Path) -> None:
+        """A gh outside the job PATH is a gh the job cannot find.
+
+        The install honours $GH_INSTALL_PATH, so a path that is not on
+        the default job PATH produces a host that looks provisioned and
+        still dies with "gh: command not found" in every job.
+        """
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, "redlexgilgamesh.guest")
+        _sudo_stub(env)
+        _gh_stub(env)
+        script = (
+            f'source "{SCRIPT}"; uname_s=Linux; DEFAULT_JOB_PATH="/usr/bin"; verify_gh_runnable'
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode != 0, "the check must fail the install"
+        assert "is not on the default job PATH" in result.stdout
         assert "gh: command not found" in result.stdout
 
 
@@ -1105,7 +1319,7 @@ class TestSudoExpansion:
 
     def test_remote_install_escalates_with_sudo_when_set(self, tmp_path: Path) -> None:
         env = _node_sandbox(tmp_path, as_root=False, with_sudo=True)
-        env["SUDO"] = "sudo"
+        env["PROVISION_SUDO"] = "sudo"
         script = f'source "{SCRIPT}"; ensure_node_linux'
 
         result = _run(script, env)
@@ -1113,27 +1327,47 @@ class TestSudoExpansion:
         assert result.returncode == 0, result.stderr
         assert "remote-install-script-ran" in result.stdout
         sudo_calls = Path(env["STUB_SUDO_LOG"]).read_text().splitlines()
-        assert "-n -E bash -" in sudo_calls, (
-            f"the escalation must not prompt, recorded: {sudo_calls}"
+        assert "-E bash -" in sudo_calls, (
+            f"the escalation must keep the environment, recorded: {sudo_calls}"
         )
 
-    def test_the_escalation_is_never_interactive(self, tmp_path: Path) -> None:
-        """A non-interactive provision must not hang on a password prompt."""
+    def test_the_escalation_is_interactive_by_default(self, tmp_path: Path) -> None:
+        """The documented flow is a watched invocation.
+
+        `sudo -n` refuses to prompt, so a host whose sudo needs a
+        password failed the provisioning instead of asking for it. The
+        non-interactive escalation is opt-in.
+        """
         env = _node_sandbox(tmp_path, as_root=False, with_sudo=True)
-        env["SUDO"] = "sudo"
+        env["PROVISION_SUDO"] = "sudo"
         script = f'source "{SCRIPT}"; run_privileged id -u'
 
         result = _run(script, env)
 
         assert result.returncode == 0, result.stderr
         sudo_calls = Path(env["STUB_SUDO_LOG"]).read_text().splitlines()
-        assert "-n id -u" in sudo_calls
+        assert "id -u" in sudo_calls
+        assert "-n id -u" not in sudo_calls, (
+            f"the escalation must be able to prompt, recorded: {sudo_calls}"
+        )
 
-    def test_the_remote_install_never_escalates_interactively(self, tmp_path: Path) -> None:
+    def test_the_escalation_is_non_interactive_with_the_flag(self, tmp_path: Path) -> None:
+        """A provision that is NOT watched must not hang on a prompt."""
+        env = _node_sandbox(tmp_path, as_root=False, with_sudo=True)
+        env["PROVISION_SUDO"] = "sudo"
+        script = f'source "{SCRIPT}"; NON_INTERACTIVE=1; run_privileged id -u'
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stderr
+        sudo_calls = Path(env["STUB_SUDO_LOG"]).read_text().splitlines()
+        assert "-n id -u" in sudo_calls, f"the escalation must not prompt, recorded: {sudo_calls}"
+
+    def test_the_remote_install_is_non_interactive_with_the_flag(self, tmp_path: Path) -> None:
         """The remote install escalates too, and it must not prompt."""
         env = _node_sandbox(tmp_path, as_root=False, with_sudo=True)
-        env["SUDO"] = "sudo"
-        script = f'source "{SCRIPT}"; echo true | run_remote_script'
+        env["PROVISION_SUDO"] = "sudo"
+        script = f'source "{SCRIPT}"; NON_INTERACTIVE=1; echo true | run_remote_script'
 
         result = _run(script, env)
 
@@ -1143,11 +1377,31 @@ class TestSudoExpansion:
             f"the escalation must not prompt, recorded: {sudo_calls}"
         )
 
+    def test_the_non_interactive_flag_is_parsed(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        script = (
+            f'source "{SCRIPT}"; parse_args --non-interactive; printf "%s\\n" "$NON_INTERACTIVE"'
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "1"
+
+    def test_an_unknown_argument_is_rejected(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        script = f'source "{SCRIPT}"; parse_args --nope'
+
+        result = _run(script, env)
+
+        assert result.returncode != 0
+        assert "unknown argument" in result.stdout
+
     def test_no_unquoted_sudo_expansion_is_left_in_the_script(self) -> None:
         """A bare `$SUDO` in a command position is the bug this guards."""
         source = SCRIPT.read_text()
         code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
-        assert re.search(r'(?<!["{])\$SUDO', code) is None
+        assert re.search(r'(?<!["{])\$(PROVISION_)?SUDO', code) is None
 
 
 class TestSandboxHygiene:

@@ -105,6 +105,13 @@ class TestProvision:
         assert "complete" in captured.out
 
     @patch("github_runners_for_repo.runner_manager.subprocess.run")
+    def test_provision_non_interactive_passes_the_flag(self, mock_run, config):
+        mock_run.return_value = MagicMock(returncode=0)
+        provision(config, non_interactive=True)
+        cmd = mock_run.call_args[0][0]
+        assert "--non-interactive" in cmd
+
+    @patch("github_runners_for_repo.runner_manager.subprocess.run")
     def test_provision_missing_script_raises(self, mock_run, config):
         with patch("github_runners_for_repo.runner_manager.PROVISION_SCRIPT") as fake:
             fake.exists.return_value = False
