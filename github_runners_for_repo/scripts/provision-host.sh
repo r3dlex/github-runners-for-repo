@@ -141,9 +141,9 @@ parse_args() {
 #
 # The escalation is chosen HERE instead of being interpolated into the
 # command line: an empty $PROVISION_SUDO used to leave the sudo flags
-# behind, so `curl … | $SUDO -E bash -` became `-E bash -` and the shell
-# reported "-E: command not found" every time the script ran as root —
-# which is how `gh-runners provision` is normally run.
+# behind, so `curl … | $PROVISION_SUDO -E bash -` became `-E bash -` and
+# the shell reported "-E: command not found" every time the script ran as
+# root — which is how `gh-runners provision` is normally run.
 run_privileged() {
   if [ -n "$PROVISION_SUDO" ]; then
     if is_sudo "$PROVISION_SUDO"; then
@@ -752,12 +752,12 @@ ensure_archgate() {
 
 # Run a command as another user.
 #
-# The escalation command is the pinned $SUDO, so a sandbox that pins it
-# does not escalate at all. Only a real sudo can become another user; any
-# other escalation command runs the command as the invoking user. Root
-# still needs sudo for this — becoming another user is the one thing it
-# cannot do on its own — and it is non-interactive so a missing password
-# fails the install instead of hanging on a prompt.
+# The escalation command is the pinned $PROVISION_SUDO, so a sandbox that
+# pins it does not escalate at all. Only a real sudo can become another
+# user; any other escalation command runs the command as the invoking user.
+# Root still needs sudo for this — becoming another user is the one thing
+# it cannot do on its own. The escalation is interactive unless
+# --non-interactive was passed, so a missing password can be answered.
 as_user() {
   local user="$1"
   shift

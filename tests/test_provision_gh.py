@@ -1397,6 +1397,30 @@ class TestSudoExpansion:
         assert result.returncode != 0
         assert "unknown argument" in result.stdout
 
+    def test_main_reaches_the_argument_parser(self, tmp_path: Path) -> None:
+        """The flag has to be read on the way the script is really run.
+
+        `main` is what the CLI invokes, and it is what calls the argument
+        parser — a flag that only `parse_args` understands would be
+        silently ignored on the real invocation.
+        """
+        env = _sandbox(tmp_path)
+        script = f'source "{SCRIPT}"; main --help'
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stderr
+        assert "--non-interactive" in result.stdout
+
+    def test_main_rejects_an_unknown_argument(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        script = f'source "{SCRIPT}"; main --nope'
+
+        result = _run(script, env)
+
+        assert result.returncode != 0
+        assert "unknown argument" in result.stdout
+
     def test_no_unquoted_sudo_expansion_is_left_in_the_script(self) -> None:
         """A bare `$SUDO` in a command position is the bug this guards."""
         source = SCRIPT.read_text()
