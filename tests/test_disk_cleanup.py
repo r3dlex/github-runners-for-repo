@@ -126,6 +126,27 @@ def _sweep(
     return result.stdout
 
 
+def _sweep_caches(home: Path, tmp_path: Path, tier: int = 3, dry_run: bool = False) -> str:
+    """Run the cache sweep of the routine over the sandbox home.
+
+    The cache sweep is the one that reclaims the shared home: the download
+    caches and the installed toolchain trees.
+    """
+    source = f'source "$CLEANUP_SCRIPT"{" --dry-run" if dry_run else ""}'
+    script = f'{source}; prune_caches "$TIER"'
+    env = _env(home, tmp_path)
+    env.update({"CLEANUP_SCRIPT": str(SCRIPT), "TIER": str(tier)})
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"cache sweep failed: {result.returncode}\n{result.stderr}"
+    return result.stdout
+
+
 @pytest.fixture
 def runner_home(tmp_path: Path) -> Path:
     home = tmp_path / "actions-runner-linux"
@@ -1001,3 +1022,329 @@ class TestSweepExclusions:
                 f"{name} must be excluded before the destructive step, not "
                 f"offered to it and skipped afterwards: {output}"
             )
+
+
+def _managed_interpreter(home: Path, version: str = "3.11") -> Path:
+    """A uv managed CPython tree under the sandbox home."""
+    tree = home / ".local" / "share" / "uv" / "python" / f"cpython-{version}-linux-aarch64-gnu"
+    (tree / "bin").mkdir(parents=True)
+    (tree / "bin" / "python3").write_text("#!/bin/sh\n")
+    return tree
+
+
+def _mise_install(home: Path, version: str = "3.12") -> Path:
+    """A mise-installed interpreter under the sandbox home."""
+    install = home / ".local" / "share" / "mise" / "installs" / "python" / version
+    (install / "bin").mkdir(parents=True)
+    (install / "bin" / "python").write_text("#!/bin/sh\n")
+    return install
+
+
+def _rust_toolchain(home: Path, name: str = "stable-aarch64") -> Path:
+    """A rustup toolchain under the sandbox home."""
+    toolchain = home / ".rustup" / "toolchains" / name
+    (toolchain / "bin").mkdir(parents=True)
+    (toolchain / "bin" / "cargo").write_text("#!/bin/sh\n")
+    return toolchain
+
+
+class TestToolchainCaches:
+    """The installed toolchain trees are what grows the root filesystem.
+
+    The two Colima runners share ONE home, so every interpreter a job
+    resolves is installed once and kept for every job that follows: ten
+    managed CPythons, the mise installs and the rust toolchains were all
+    still there while the routine swept only the download caches. The root
+    filesystem filled up in spite of it.
+    """
+
+    def test_a_stale_managed_interpreter_is_pruned(self, runner_home: Path, tmp_path: Path) -> None:
+        tree = _managed_interpreter(tmp_path)
+        _age(tree, 60)
+
+        _sweep_caches(runner_home, tmp_path, tier=3)
+
+        assert not tree.exists(), (
+            "a managed interpreter nobody has touched for months has to be "
+            "reclaimed: it is what fills the root filesystem"
+        )
+
+    def test_a_stale_mise_install_is_pruned(self, runner_home: Path, tmp_path: Path) -> None:
+        install = _mise_install(tmp_path)
+        _age(install, 60)
+
+        _sweep_caches(runner_home, tmp_path, tier=3)
+
+        assert not install.exists(), "a stale mise install has to be reclaimed"
+
+    def test_a_stale_rust_toolchain_is_pruned(self, runner_home: Path, tmp_path: Path) -> None:
+        toolchain = _rust_toolchain(tmp_path)
+        _age(toolchain, 60)
+
+        _sweep_caches(runner_home, tmp_path, tier=3)
+
+        assert not toolchain.exists(), "a stale rust toolchain has to be reclaimed"
+
+    def test_a_fresh_managed_interpreter_survives(self, runner_home: Path, tmp_path: Path) -> None:
+        """The age floor still protects a tree that was just installed."""
+        tree = _managed_interpreter(tmp_path)
+
+        _sweep_caches(runner_home, tmp_path, tier=3)
+
+        assert tree.exists(), (
+            "a managed interpreter that was just installed must survive: the "
+            "next job that resolves it would have to download it again"
+        )
+
+    def test_a_managed_interpreter_held_by_a_live_process_survives(
+        self, runner_home: Path, tmp_path: Path
+    ) -> None:
+        """The liveness guard applies to the toolchains as well.
+
+        The interpreter of a running job is an open file of that job. A
+        sweep that removed it would pull the interpreter out from under the
+        process that is executing it.
+        """
+        tree = _managed_interpreter(tmp_path)
+        _age(tree, 60)
+        target = tree / "bin" / "python3"
+
+        holder = subprocess.Popen(
+            ["bash", "-c", 'exec 9<"$1"; sleep 30', "_", str(target)],
+            cwd=tmp_path,
+        )
+        try:
+            time.sleep(0.5)
+            _sweep_caches(runner_home, tmp_path, tier=3)
+        finally:
+            holder.terminate()
+            holder.wait()
+
+        assert tree.exists(), "a toolchain a live process holds open must never be pruned"
+
+    def test_the_toolchain_sweep_waits_for_real_pressure(
+        self, runner_home: Path, tmp_path: Path
+    ) -> None:
+        """Nothing is reclaimed while the disk is merely under watch.
+
+        A miss costs a re-download of the whole toolchain, and the routine
+        is meant to cost almost nothing while the disk is still fine. The
+        toolchain trees are therefore only reclaimed from the elevated tier
+        up.
+        """
+        tree = _managed_interpreter(tmp_path)
+        _age(tree, 60)
+
+        _sweep_caches(runner_home, tmp_path, tier=1)
+
+        assert tree.exists(), (
+            "the watch tier must not touch the installed toolchains: only a "
+            "disk under real pressure justifies a re-download"
+        )
+
+    def test_the_user_site_packages_is_never_pruned(
+        self, runner_home: Path, tmp_path: Path
+    ) -> None:
+        """The shims in ~/.local/bin depend on the site-packages.
+
+        ruff, black and the archgate wrapper are installed into the user's
+        site-packages and resolved by name. Removing it breaks every tool
+        the runners resolve that way.
+        """
+        site_packages = tmp_path / ".local" / "lib" / "python3.11" / "site-packages"
+        (site_packages / "pkg").mkdir(parents=True)
+        (site_packages / "pkg" / "__init__.py").write_text("")
+        _age(site_packages, 60)
+
+        _sweep_caches(runner_home, tmp_path, tier=3)
+
+        assert site_packages.exists(), (
+            "the user's site-packages must never be swept: the ~/.local/bin "
+            "shims are installed into it"
+        )
+
+
+class TestCacheExclusions:
+    """The caches that are not caches."""
+
+    def test_the_playwright_browsers_are_never_pruned(
+        self, runner_home: Path, tmp_path: Path
+    ) -> None:
+        """The E2E leg needs the exact browsers that were downloaded.
+
+        ~/.cache/ms-playwright holds ~929 MB of chromium, headless shell
+        and ffmpeg. The generic ~/.cache sweep only kept it while
+        something inside it was fresh, so a few days without a browser
+        install was enough for the tree to disappear — and the next E2E
+        job then failed with "Executable doesn't exist at
+        ~/.cache/ms-playwright/chromium-1208/...".
+        """
+        browsers = tmp_path / ".cache" / "ms-playwright" / "chromium-1208"
+        browsers.mkdir(parents=True)
+        (browsers / "chrome").write_text("binary")
+        _age(browsers, 60)
+
+        _sweep_caches(runner_home, tmp_path, tier=3)
+
+        assert browsers.exists(), (
+            "the Playwright browsers must never be swept: the E2E leg needs "
+            "the binaries that were downloaded"
+        )
+
+    def test_the_proto_download_cache_is_pruned(self, runner_home: Path, tmp_path: Path) -> None:
+        """The protobuf download cache is a pure download cache."""
+        cache = tmp_path / ".proto" / "cache"
+        cache.mkdir(parents=True)
+        (cache / "descriptor.bin").write_text("cache entry")
+        _age(cache, 60)
+
+        _sweep_caches(runner_home, tmp_path, tier=3)
+
+        assert not cache.exists(), "the protobuf download cache has to be reclaimed"
+
+    def test_a_cold_cache_is_still_pruned(self, runner_home: Path, tmp_path: Path) -> None:
+        """The generic sweep still reclaims everything else under ~/.cache."""
+        cache = tmp_path / ".cache" / "something-cold"
+        cache.mkdir(parents=True)
+        (cache / "entry").write_text("cache entry")
+        _age(cache, 60)
+
+        _sweep_caches(runner_home, tmp_path, tier=3)
+
+        assert not cache.exists(), "a cold cache entry has to be reclaimed"
+
+
+def _has_all_flag(calls: list[str]) -> bool:
+    """True when any of the recorded calls carries docker's "all" flag.
+
+    docker spells it "-a", "-af" or "--all" depending on the subcommand,
+    so the flag is looked for as a whole word.
+    """
+    return any(flag in {"-a", "-af", "--all"} for call in calls for flag in call.split())
+
+
+class TestDockerPruneScope:
+    """The docker prune stays inside the promise the documentation makes.
+
+    The routine runs on a daemon that hosts the user's own long-lived
+    containers. Only DANGLING images and DANGLING build cache are removed:
+    "docker builder prune -a" drops the whole unused build cache, which is
+    ~12 GB on the fleet host and rebuilds every image from scratch.
+    """
+
+    @staticmethod
+    def _prune_system(tmp_path: Path) -> list[str]:
+        """Run prune_system with recording stand-ins for the host tools.
+
+        The stand-ins for `rm`, `journalctl`, `apt-get` and `docker` record
+        their arguments instead of doing anything, so the test never
+        touches the machine it runs on.
+        """
+        fake_bin = tmp_path / "fake-bin"
+        fake_bin.mkdir()
+        record = tmp_path / "calls.log"
+        for name in ("docker", "rm", "journalctl", "apt-get"):
+            stand_in = fake_bin / name
+            stand_in.write_text(
+                f'#!/bin/sh\nprintf "%s %s\\n" "{name}" "$*" >> "$CALL_RECORD"\nexit 0\n'
+            )
+            stand_in.chmod(0o755)
+
+        env = _env(tmp_path / "runner", tmp_path)
+        env.update(
+            {
+                "CLEANUP_SCRIPT": str(SCRIPT),
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "CALL_RECORD": str(record),
+            }
+        )
+        result = subprocess.run(
+            ["bash", "-c", 'source "$CLEANUP_SCRIPT"; prune_system 0 2'],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"prune_system failed: {result.stderr}"
+        if not record.exists():
+            return []
+        return record.read_text().splitlines()
+
+    def test_only_dangling_images_are_pruned(self, tmp_path: Path) -> None:
+        calls = self._prune_system(tmp_path)
+        image_calls = [c for c in calls if c.startswith("docker image prune")]
+        assert image_calls, f"the images have to be pruned: {calls}"
+        assert not _has_all_flag(image_calls), (
+            f"a tagged image belongs to the user and must not be removed: {calls}"
+        )
+
+    def test_the_whole_unused_build_cache_is_not_pruned(self, tmp_path: Path) -> None:
+        calls = self._prune_system(tmp_path)
+        builder_calls = [c for c in calls if c.startswith("docker builder prune")]
+        assert builder_calls, f"the build cache has to be pruned: {calls}"
+        assert not _has_all_flag(builder_calls), (
+            f"only the DANGLING build cache may be removed: {calls}"
+        )
+
+    def test_no_container_is_ever_pruned(self, tmp_path: Path) -> None:
+        calls = self._prune_system(tmp_path)
+        assert not [c for c in calls if c.startswith("docker container prune")], (
+            f"a stopped container is the user's state, not cache: {calls}"
+        )
+
+
+class TestProcCollector:
+    """The two /proc collectors have to return the same set.
+
+    The scan runs before every destructive step, so it has to be cheap:
+    a readlink fork per open descriptor costs ~490 ms on the fleet host,
+    which is minutes of lock time per pass. The fast collector reads the
+    whole host with a handful of processes instead — but it may only
+    return the same paths, or a live checkout could be deleted.
+    """
+
+    @staticmethod
+    def _collect(home: Path, tmp_path: Path, function: str) -> list[str]:
+        env = _env(home, tmp_path)
+        env.update({"CLEANUP_SCRIPT": str(SCRIPT), "COLLECTOR": function})
+        script = (
+            'source "$CLEANUP_SCRIPT"; '
+            "INUSE_PATHS=(); "
+            '"$COLLECTOR"; '
+            'printf "%s\\n" "${INUSE_PATHS[@]}"'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"collector failed: {result.stderr}"
+        return sorted(line for line in result.stdout.splitlines() if line)
+
+    def test_both_collectors_return_the_same_paths(self, runner_home: Path, tmp_path: Path) -> None:
+        if not Path("/proc/self").exists():
+            pytest.skip("the /proc collector only runs on Linux")
+
+        checkout = runner_home / "_work" / "live-repo"
+        checkout.mkdir(parents=True)
+        target = checkout / "artifact.bin"
+        target.write_text("build output")
+
+        holder = subprocess.Popen(
+            ["bash", "-c", 'exec 9<"$1"; sleep 30', "_", str(target)],
+            cwd=tmp_path,
+        )
+        try:
+            time.sleep(0.5)
+            fast = self._collect(runner_home, tmp_path, "collect_inuse_proc_ls")
+            slow = self._collect(runner_home, tmp_path, "collect_inuse_proc_readlink")
+        finally:
+            holder.terminate()
+            holder.wait()
+
+        assert fast == slow, f"the two collectors must return the same paths: {fast} != {slow}"
+        assert any(str(target) in path for path in fast), (
+            f"the open descriptor must be found: {fast}"
+        )

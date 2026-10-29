@@ -151,7 +151,14 @@ ensure_user_path_in_runner() {
     [ -d "$runner_dir" ] || continue
     path_file="$runner_dir/.path"
     [ -f "$path_file" ] || continue
+    # The owner home is resolved PHYSICALLY. On the Linux fleet
+    # /home/<user>.linux is a symlink to /home/<user>.guest, so the scan
+    # above finds the SAME runner twice — once through each name. With
+    # the symlinked name the bin dirs are spelled differently, the
+    # membership test does not find what the first pass wrote, and all
+    # three fragments are prepended AGAIN.
     owner_home="$(dirname "$runner_dir")"
+    owner_home="$(cd "$owner_home" 2>/dev/null && pwd -P)" || owner_home="$(dirname "$runner_dir")"
     bin_dirs=(
       "$owner_home/.local/bin"
       "$owner_home/.bun/bin"

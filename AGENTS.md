@@ -264,23 +264,48 @@ tier.**
    runner's own process holds the runner home and walking further up would
    disable the sweep entirely.
 
-The in-use set is re-collected at the top of every pass, so a job that
-starts while an earlier pass is running is protected by the next one.
+The in-use set is re-collected at the top of every pass **and immediately
+before every destructive step**, so a job that starts while an earlier pass
+is running is protected by the next one. The scan therefore runs once per
+candidate, and it has to stay cheap: it reads the whole host with one
+`ls -l` per directory of descriptors instead of a `readlink` fork per
+descriptor (~490 ms per scan on the fleet host, which is minutes of lock
+time per pass). The two collectors have to return the same set of paths;
+the sandbox test compares them on every Linux run.
 
 **A few paths are never swept, whatever their age:** `_work/_update` (the
 runner's self-update staging area — deleting it mid-update aborts the copy
 and can leave a runner that cannot start), `_work/_tool`, `_work/_actions`
 and `_work/_temp` (the runner's own bookkeeping, swept by their own age
-windows), and `_diag/*.log` (the worker logs are the evidence for the
+windows), `_diag/*.log` (the worker logs are the evidence for the
 "assigned, zero steps" signature, so they keep a minimum age at every
-tier). A freshly downloaded update archive in the runner home is kept too:
-deleting it aborts the update it belongs to.
+tier), and `~/.cache/ms-playwright` (the Playwright browsers — the E2E
+leg needs the exact binaries that were downloaded, and re-downloading them
+costs ~929 MB and a network round trip). A freshly downloaded update
+archive in the runner home is kept too: deleting it aborts the update it
+belongs to.
+
+**The shared home is swept in two classes, and they are not the same.**
+The *download caches* (pip, uv, npm, bun, pre-commit, the cargo registry,
+the rustup downloads, the protobuf download cache, and everything else
+cold under `~/.cache`) are pure downloads: a miss costs one fetch, so
+they get the short window (`BASE_CACHE_DAYS`, default 3 days). The
+*installed toolchain trees* (`~/.local/share/uv/python/cpython-*`, the
+mise installs, `~/.rustup/toolchains/*`) are installed state: a miss costs
+a re-download of the whole toolchain, so they get their own, much longer
+window (`BASE_TOOLCHAIN_DAYS`, default 30 days) and are only reclaimed
+from the **elevated tier up**. The tier logic scales that window like every
+other one — 15 days at the elevated tier, the one-unit floor at the critical
+tier, where the disk has to reclaim something. The user's `site-packages` is
+deliberately never swept — the `~/.local/bin` shims are installed into it.
 
 **Docker is pruned on the data disk, and only within limits:** dangling
 images and dangling build cache only, never a tagged image, and never a
 stopped container. The Docker daemon on the runner host also serves the
 user's own long-lived containers, and their state is not the routine's to
-destroy.
+destroy. `docker builder prune -a` (the whole unused build cache, ~12 GB
+on the fleet host) is **not** used — the build cache is pruned dangling
+only, at every tier.
 
 **A broken interpreter is repaired on every sweep, at every tier.**
 `uv` inspects its managed CPython interpreters when it resolves one for a

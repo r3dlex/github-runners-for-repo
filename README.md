@@ -102,8 +102,9 @@ every tier:
   `_work` itself holds every checkout below it and protects them all.
 
 **A path that is in use is never deleted, at any tier.** The in-use set is
-re-collected at the start of every pass, so a job that starts while an
-earlier pass is running is protected by the next one.
+re-collected at the start of every pass **and again immediately before
+every destructive step**, so a job that picks up a checkout *during* a
+pass keeps it.
 
 A few directories are never swept at all, whatever their age:
 
@@ -114,13 +115,49 @@ A few directories are never swept at all, whatever their age:
   bookkeeping, swept by their own age windows.
 - `_diag/*.log` — the worker logs are the evidence for the "assigned, zero
   steps" signature, so they keep a minimum age at every tier.
+- `~/.cache/ms-playwright` — the Playwright browsers. The E2E leg needs the
+  exact binaries that were downloaded, and re-downloading them costs
+  ~929 MB and a network round trip.
 - A freshly downloaded update archive in the runner home — deleting it
   aborts the update it belongs to.
 
 Docker is pruned on the data disk, and only within limits: **dangling**
-images and build cache only, never a tagged image, and **never** a stopped
-container. The Docker daemon on the runner host also serves the user's own
-long-lived containers, and their state is not the routine's to destroy.
+images and **dangling** build cache only, never a tagged image, and
+**never** a stopped container. The Docker daemon on the runner host also
+serves the user's own long-lived containers, and their state is not the
+routine's to destroy. The whole unused build cache (`docker builder prune
+-a`, ~12 GB on the fleet host) is never dropped — every image would have
+to be rebuilt from scratch.
+
+### What the routine reclaims from the shared home
+
+The two runners on the Colima VM share **one** `$HOME`, so everything a
+job installs is installed once and kept for every job that follows. The
+routine sweeps that home in two classes, and they are not the same:
+
+- **Download caches** — pip, uv, npm, bun, pre-commit, the cargo registry,
+  the rustup downloads, the protobuf download cache, and everything else
+  cold under `~/.cache`. A miss costs one fetch, so they get the short
+  window (`BASE_CACHE_DAYS`, three days by default).
+- **Installed toolchain trees** — the uv-managed interpreters
+  (`~/.local/share/uv/python/cpython-*`), the mise installs and the rust
+  toolchains. These are installed state, not a download cache: a miss
+  costs a re-download of the whole toolchain. They get their own, much
+  longer window (`BASE_TOOLCHAIN_DAYS`, 30 days by default) and are only
+  reclaimed from the **elevated tier up** — a disk that is merely under
+  watch is not worth a re-download. The tier logic scales that window like
+  every other one: 15 days at the elevated tier, and the one-unit floor at
+  the critical tier, where the disk has to reclaim something.
+
+The user's `site-packages` is deliberately never swept: the `~/.local/bin`
+shims (`ruff`, `black`, the archgate wrapper) are installed into it.
+
+The liveness scan is re-run immediately before every destructive step, so
+a job that picks up a checkout *during* a pass keeps it. That makes the
+scan run once per candidate, and it has to stay cheap: it reads the whole
+host with one `ls -l` per directory of descriptors, not a `readlink` fork
+per open descriptor (~490 ms per scan on the fleet host — minutes of lock
+time per pass).
 
 ### Repairing a bricked action
 

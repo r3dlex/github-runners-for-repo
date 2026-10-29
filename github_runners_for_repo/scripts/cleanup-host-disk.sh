@@ -20,11 +20,13 @@
 #
 #   tier 0  nominal    (< WATCH_PCT)        skip the sweep entirely
 #   tier 1  watch      (WATCH..ELEVATED)    standard age thresholds
-#   tier 2  elevated   (ELEVATED..CRITICAL) half the thresholds, caches purged
-#                                            regardless of age
+#   tier 2  elevated   (ELEVATED..CRITICAL) half the thresholds
 #   tier 3  critical   (>= CRITICAL)        the one-unit floor: anything older
 #                                            than an hour (a day for the
 #                                            daily caches) that is not in use
+#
+# The unit of the floor is the unit of the window it belongs to: the
+# checkout windows are in hours, the cache and toolchain windows in days.
 #
 # Tier 3 does NOT mean "prune regardless of age". The age floor is what
 # protects a live job's checkout: the runner writes into it continuously, so
@@ -100,6 +102,19 @@ BASE_ACTIONS_DAYS="${BASE_ACTIONS_DAYS:-14}"
 BASE_TOOL_DAYS="${BASE_TOOL_DAYS:-30}"
 BASE_DIAG_DAYS="${BASE_DIAG_DAYS:-7}"
 BASE_CACHE_DAYS="${BASE_CACHE_DAYS:-3}"
+# The installed toolchain trees — the managed interpreters, the mise
+# installs, the rust toolchains — get their OWN window, and it is much
+# longer than the one the download caches get.
+#
+# A download cache is a pure download: a miss costs one fetch. An installed
+# toolchain is NOT: removing the managed CPython a job resolves means the
+# next job that needs it downloads it again, so the window is long enough
+# that only a tree nobody has touched for a month is ever considered.
+#
+# The tier logic scales this window like every other one: the elevated tier
+# halves it, and the critical tier keeps the one-unit floor, because a
+# critical disk has to reclaim something.
+BASE_TOOLCHAIN_DAYS="${BASE_TOOLCHAIN_DAYS:-30}"
 BASE_ARCHIVE_DAYS="${BASE_ARCHIVE_DAYS:-1}"
 BASE_TMP_DAYS="${BASE_TMP_DAYS:-1}"
 
@@ -127,6 +142,8 @@ log() {
 
 # Runner directories to sweep, space separated. The Colima VM has two Linux
 # runner directories; the macOS runners live under the runner user's home.
+# The value is split on whitespace, so a path that contains a space cannot
+# be expressed in this list.
 RUNNER_HOMES="${RUNNER_HOMES:-/home/redlexgilgamesh.guest/actions-runner-linux /home/redlexgilgamesh.guest/actions-runner-linux-2}"
 read -r -a RUNNER_HOME_LIST <<<"$RUNNER_HOMES"
 
@@ -205,7 +222,37 @@ INUSE_PATHS=()
 #
 # Every path under a watched root is kept; everything else is dropped, so the
 # in-use set stays small no matter how many processes the host runs.
-collect_inuse_proc() {
+#
+# The scan reads every link target of the host in ONE `ls -l` per directory
+# of descriptors. The obvious implementation — a `readlink` per descriptor —
+# forks once per open file of every process: on the fleet host that is
+# thousands of forks, ~490 ms per scan. The routine re-scans immediately
+# before every destructive step, so that cost is paid once per candidate
+# and turned a single pass into minutes of lock time. `ls -l` prints the
+# target of every symlink it lists, so the same set of paths is read in
+# three processes instead of thousands.
+#
+# The fallback is the per-descriptor readlink loop. It is slower but it
+# needs nothing but readlink, and the two are proven to return the same
+# set (the sandbox test compares them on every Linux run).
+collect_inuse_proc_ls() {
+  local target
+  while IFS= read -r target; do
+    [ -n "$target" ] || continue
+    # The target of a socket, a pipe or an unreadable link is not a path
+    # ("socket:[1234]", "?"), and neither is anything outside a watched
+    # root: the in-use set stays small no matter how many processes run.
+    under_watched_root "$target" || continue
+    INUSE_PATHS+=("$target")
+  done < <(
+    {
+      ls -l /proc/[0-9]*/cwd 2>/dev/null
+      ls -l /proc/[0-9]*/fd 2>/dev/null
+    } | awk 'index($0, " -> ") { print substr($0, index($0, " -> ") + 4) }'
+  )
+}
+
+collect_inuse_proc_readlink() {
   local d target fd
   for d in /proc/[0-9]*; do
     target="$(readlink "$d/cwd" 2>/dev/null)" || target=""
@@ -222,6 +269,14 @@ collect_inuse_proc() {
       INUSE_PATHS+=("$target")
     done
   done
+}
+
+collect_inuse_proc() {
+  if command -v ls >/dev/null 2>&1; then
+    collect_inuse_proc_ls
+  else
+    collect_inuse_proc_readlink
+  fi
 }
 
 # Fallback for hosts without /proc (macOS): lsof lists the open files of
@@ -377,6 +432,10 @@ remove_file() {
   # the top of the pass is a snapshot, and a job that started since it was
   # taken holds this path RIGHT NOW. The decision is made on a set that is
   # current at the moment of the deletion.
+  #
+  # The cost is one /proc scan per candidate that reaches this point, so
+  # the scan has to stay cheap: it runs once per candidate, not once per
+  # deletion.
   collect_inuse
   is_in_use "$target" && { log "skipped (in use) $target"; return 1; }
   if [ "$DRY_RUN" = "1" ]; then
@@ -399,9 +458,14 @@ try_remove() {
   # the top of the pass is a snapshot taken BEFORE the sweep started, so a
   # job that picked up a checkout while the sweep was running is not in it:
   # without this refresh the sweep would delete the checkout of a job that
-  # is running RIGHT NOW. The refresh costs one /proc scan per path that is
-  # actually about to be deleted, so the cost tracks the deletions and not
-  # the number of candidates that were examined.
+  # is running RIGHT NOW.
+  #
+  # The refresh costs one /proc scan per candidate that passes the age
+  # filter — including the candidates that turn out to be in use — so the
+  # cost tracks the candidates examined, not the deletions. The scan
+  # therefore reads the whole host in a handful of processes; a scan that
+  # forks per open descriptor costs ~490 ms on the fleet host, which is
+  # minutes of lock time per pass.
   collect_inuse
   is_in_use "$target" && { log "skipped (in use) $target"; return 1; }
   if [ "$DRY_RUN" = "1" ]; then
@@ -500,13 +564,15 @@ prune_runner_work() {
 }
 
 prune_caches() {
-  local tier="$1" c cache_d
+  local tier="$1" c cache_d tool_d
   cache_d="$(scaled_age "$BASE_CACHE_DAYS" "$tier")"
+  tool_d="$(scaled_age "$BASE_TOOLCHAIN_DAYS" "$tier")"
 
+  # Download caches. A miss costs one fetch, so the short window applies.
   for c in "$HOME_DIR/.cache/pip" "$HOME_DIR/.cache/uv" "$HOME_DIR/.npm/_cacache" \
            "$HOME_DIR/.bun/install/cache" "$HOME_DIR/.cache/pre-commit" \
            "$HOME_DIR/.cargo/registry/cache" "$HOME_DIR/.cargo/registry/src" \
-           "$HOME_DIR/.rustup/downloads"; do
+           "$HOME_DIR/.rustup/downloads" "$HOME_DIR/.proto/cache"; do
     [ -d "$c" ] || continue
     try_remove "$c" "${cache_d} days" "cache"
   done
@@ -517,8 +583,47 @@ prune_caches() {
       [ -d "$c" ] || continue
       case "$c" in
         */pip/ | */uv/ | */pre-commit/) continue ;;
+        # The Playwright browsers are NOT a cache: the E2E leg needs the
+        # exact binaries that were downloaded, and re-downloading them
+        # costs ~929 MB and a network round trip on the runner. Freshness
+        # alone would keep them for a few days and then delete them, and
+        # the next E2E job would fail with "Executable doesn't exist at
+        # ~/.cache/ms-playwright/chromium-1208/...".
+        */ms-playwright/) continue ;;
       esac
       try_remove "$c" "${cache_d} days" "cache"
+    done
+  fi
+
+  # The installed toolchain trees are the directories that actually grow
+  # the root filesystem: the managed interpreters, the mise installs and
+  # the rust toolchains. The two runners on the Colima VM share ONE home,
+  # so every interpreter one of them resolves is installed once and kept
+  # for every job that follows.
+  #
+  # They are installed state, not a download cache, so they get their own,
+  # much longer window (BASE_TOOLCHAIN_DAYS) and are only reclaimed once
+  # the disk is under real pressure — from the elevated tier up. A miss
+  # costs a re-download of the whole toolchain, and the routine is meant
+  # to cost almost nothing while the disk is still fine.
+  #
+  # The window is scaled by the tier like every other one: half at the
+  # elevated tier, and the one-unit floor at the critical tier, where the
+  # disk has to reclaim something.
+  #
+  # The same discipline as everything else applies: never while a live
+  # process holds them, and never while they are being written to.
+  #
+  # The user's site-packages is deliberately NOT in this list: the
+  # ~/.local/bin shims (ruff, black, the archgate wrapper) are installed
+  # into it, and removing it would break every tool the runners resolve by
+  # name.
+  if [ "$tier" -ge 2 ]; then
+    for c in "$HOME_DIR"/.local/share/uv/python/cpython-* \
+             "$HOME_DIR"/.local/share/mise/installs/*/* \
+             "$HOME_DIR"/.rustup/toolchains/*; do
+      [ -d "$c" ] || continue
+      try_remove "$c" "${tool_d} days" "toolchain"
     done
   fi
 }
@@ -590,26 +695,20 @@ prune_system() {
   #   - only DANGLING images are removed ("image prune" WITHOUT -a): an image
   #     that is tagged but not currently running belongs to the user, and
   #     removing it breaks the next "docker run" that expects it;
-  #   - only DANGLING build cache is removed at the lower tiers; at the top
-  #     tier all UNUSED build cache goes, which is still only cache;
+  #   - only DANGLING build cache is removed ("builder prune" WITHOUT -a):
+  #     the whole unused build cache is ~12 GB on the fleet host, and
+  #     dropping all of it rebuilds every image from scratch the next time
+  #     it is needed;
   #   - stopped containers are never removed at all: a stopped container is
   #     the user's state, not cache, and "container prune" deletes it
   #     irreversibly.
   if command -v docker >/dev/null 2>&1; then
     if [ "$DRY_RUN" = "1" ]; then
       log "would prune dangling docker images (older than $DOCKER_AGE)"
-      if [ "$data_tier" -ge 2 ]; then
-        log "would prune all unused docker build cache (older than $DOCKER_AGE)"
-      else
-        log "would prune dangling docker build cache (older than $DOCKER_AGE)"
-      fi
+      log "would prune dangling docker build cache (older than $DOCKER_AGE)"
     else
       docker image prune -f --filter "until=${DOCKER_AGE}" >/dev/null 2>&1 || true
-      if [ "$data_tier" -ge 2 ]; then
-        docker builder prune -af --filter "until=${DOCKER_AGE}" >/dev/null 2>&1 || true
-      else
-        docker builder prune -f --filter "until=${DOCKER_AGE}" >/dev/null 2>&1 || true
-      fi
+      docker builder prune -f --filter "until=${DOCKER_AGE}" >/dev/null 2>&1 || true
     fi
   fi
 }

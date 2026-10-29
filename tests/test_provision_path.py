@@ -232,6 +232,31 @@ class TestRunnerHomeEnumeration:
             f"the .path file must not grow when every dir is already there: {content!r}"
         )
 
+    def test_a_symlinked_home_does_not_duplicate_the_entries(self, tmp_path: Path) -> None:
+        """The same runner found twice must not double the fragments.
+
+        On the Linux fleet /home/<user>.linux is a symlink to
+        /home/<user>.guest, so the scan finds the SAME runner twice —
+        once through each name. With the symlinked name the bin dirs are
+        spelled differently, the membership test does not find what the
+        first pass wrote, and every fragment is prepended a second time.
+        """
+        homes = tmp_path / "homes"
+        guest = homes / "guest"
+        runner = guest / "actions-runner-linux"
+        runner.mkdir(parents=True)
+        path_file = runner / ".path"
+        path_file.write_text("/usr/local/bin:/usr/bin\n")
+        (homes / "guest.linux").symlink_to(guest)
+
+        _update_path_file(tmp_path, parents=homes)
+
+        content = path_file.read_text()
+        for fragment in (".local/bin", ".bun/bin", ".archgate/bin"):
+            assert content.count(fragment) == 1, (
+                f"{fragment} must be written exactly once: {content!r}"
+            )
+
 
 class TestHomeParentSelection:
     """Only the home parent of THIS platform may be scanned.

@@ -122,6 +122,9 @@ TIMER_UNIT="$UNIT_DIR/runner-disk-cleanup.timer"
 
 # The runner directories whose .path file is updated. Same knob as the
 # cleanup routine itself, so an operator points both at the same place.
+#
+# The list is SPACE separated: the value is split on whitespace, so a path
+# that contains a space cannot be expressed here.
 RUNNER_HOMES="${RUNNER_HOMES:-$DEFAULT_RUNNER_HOMES}"
 read -r -a RUNNER_HOME_LIST <<<"$RUNNER_HOMES"
 
