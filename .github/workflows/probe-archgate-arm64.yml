@@ -48,8 +48,14 @@ jobs:
           ref: f65d99f56d02757cca94d53f6d717333770e0170
           fetch-depth: 1
           persist-credentials: false
+          # Checked out into a subdirectory: archgate's own GEN-005 rule
+          # requires the repository root to contain only allowlisted files,
+          # so the job's scratch files (the bun cache, the test logs, the
+          # build output) must live OUTSIDE the checked out repo.
+          path: archgate-src
 
       - name: Record the checked out commit
+        working-directory: archgate-src
         run: |
           set -euo pipefail
           echo "archgate HEAD = $(git rev-parse HEAD)"
@@ -177,11 +183,13 @@ jobs:
           printf 'bun resolved at %s\n' "$bun_bin"
 
       - name: bun install --frozen-lockfile
+        working-directory: archgate-src
         env:
           BUN_INSTALL: ${{ github.workspace }}/.bun-install
         run: bun install --frozen-lockfile
 
       - name: CPU benchmark
+        working-directory: archgate-src
         # A comparable integer throughput number, so the arm64 and x64
         # measurements of the same wall-clock budgets can be read against
         # each other.
@@ -192,6 +200,7 @@ jobs:
           bun -e 'const t=Date.now(); let s=0; for(let i=0;i<5e7;i++){s=(s+i)%1000000007;} console.log("bench_iterations=5e7 bench_ms="+(Date.now()-t)+" checksum="+s);'
 
       - name: archgate latency-budget tests on arm64, measured without the 190-file parallel load
+        working-directory: archgate-src
         # These two files assert WALL-CLOCK budgets (startup latency, per
         # rule time budget). Upstream's own source documents that the
         # budgets are load sensitive: "under `bun run test`'s parallel load
@@ -223,6 +232,7 @@ jobs:
           exit 0
 
       - name: archgate's own test suite on arm64 (upstream's package.json script)
+        working-directory: archgate-src
         # package.json: "test": "bun test --timeout 60000 --parallel"
         # This is the canonical invocation and its result is reported
         # verbatim. `--parallel` runs 190 test files at once, which starves
@@ -244,6 +254,7 @@ jobs:
           exit 0
 
       - name: Build the linux/arm64 binary
+        working-directory: archgate-src
         # The compile flags mirror the `ensure_archgate` recipe in
         # github_runners_for_repo/scripts/provision-host.sh — the recipe the
         # org's own arm64 CI already runs `archgate check` with. The
@@ -256,24 +267,25 @@ jobs:
           BUN_INSTALL: ${{ github.workspace }}/.bun-install
         run: |
           set -euo pipefail
-          mkdir -p out
+          mkdir -p "$GITHUB_WORKSPACE/out"
           bun build src/cli.ts --compile --bytecode \
             --compile-exec-argv=--use-system-ca \
-            --outfile out/archgate
+            --outfile "$GITHUB_WORKSPACE/out/archgate"
           chmod +x out/archgate
-          ls -l out/archgate
-          file out/archgate || true
+          ls -l "$GITHUB_WORKSPACE/out/archgate"
+          file "$GITHUB_WORKSPACE/out/archgate" || true
 
       - name: Prove the binary runs on arm64
+        working-directory: archgate-src
         env:
           BUN_INSTALL: ${{ github.workspace }}/.bun-install
         run: |
           set -euo pipefail
           echo "----- archgate --version -----"
-          out/archgate --version
+          "$GITHUB_WORKSPACE"/out/archgate --version
           echo "----- archgate --help (head) -----"
-          out/archgate --help 2>&1 | head -30
-          version="$(out/archgate --version 2>&1 | tr -d '[:space:]')"
+          "$GITHUB_WORKSPACE"/out/archgate --help 2>&1 | head -30
+          version="$("$GITHUB_WORKSPACE"/out/archgate --version 2>&1 | tr -d '[:space:]')"
           printf 'parsed version = %s\n' "$version"
           case "$version" in
             *0.61.0*) echo "version 0.61.0 confirmed" ;;
@@ -281,6 +293,7 @@ jobs:
           esac
 
       - name: Measure the COMPILED binary's startup latency
+        working-directory: archgate-src
         # The upstream budget tests measure `bun run src/cli.ts`, i.e. the
         # CLI running FROM SOURCE with a transpile on every spawn. The
         # asset that superman's CI actually consumes is the COMPILED
@@ -292,7 +305,7 @@ jobs:
           for label in "--version" "--help"; do
             for i in 1 2 3; do
               start=$(date +%s%N)
-              out/archgate $label >/dev/null 2>&1
+              "$GITHUB_WORKSPACE"/out/archgate $label >/dev/null 2>&1
               end=$(date +%s%N)
               printf 'compiled %s run %s: %sms\n' "$label" "$i" "$(( (end - start) / 1000000 ))"
             done
@@ -300,14 +313,16 @@ jobs:
           exit 0
 
       - name: Functional smoke test (archgate check on its own repo)
+        working-directory: archgate-src
         # A vacuous pass is possible (archgate skips ADRs whose scope misses
         # the changed file set), so this is reported, not enforced. It still
         # proves the compiled engine loads and runs on arm64.
         env:
           BUN_INSTALL: ${{ github.workspace }}/.bun-install
         run: |
+          set +e
           set -uo pipefail
-          out/archgate check 2>&1 | tee "$GITHUB_WORKSPACE/check-output.txt" | tail -40
+          "$GITHUB_WORKSPACE"/out/archgate check 2>&1 | tee "$GITHUB_WORKSPACE/check-output.txt" | tail -40
           printf 'archgate check exit code = %s\n' "${PIPESTATUS[0]:-$?}"
           exit 0
 
@@ -316,7 +331,7 @@ jobs:
         # archive root, plus a <asset>.sha256 file in `sha256sum` format.
         run: |
           set -euo pipefail
-          cd out
+          cd "$GITHUB_WORKSPACE/out"
           tar -czf "$ASSET_NAME.tar.gz" archgate
           sha256sum "$ASSET_NAME.tar.gz" > "$ASSET_NAME.tar.gz.sha256"
           sha256sum archgate > archgate.binary.sha256
@@ -363,7 +378,7 @@ jobs:
             echo "### archgate --version"
             echo ""
             echo '```'
-            out/archgate --version
+            "$GITHUB_WORKSPACE"/out/archgate --version
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -380,6 +395,7 @@ jobs:
           retention-days: 30
 
       - name: archgate's own test suite on arm64, full run without the parallel load
+        working-directory: archgate-src
         # The same test files and the same assertions as `bun run test`,
         # scheduled without `--parallel` so the wall-clock budget assertions
         # are not starved by 189 other test files. Runs last, after the
@@ -417,8 +433,14 @@ jobs:
           ref: f65d99f56d02757cca94d53f6d717333770e0170
           fetch-depth: 1
           persist-credentials: false
+          # Checked out into a subdirectory: archgate's own GEN-005 rule
+          # requires the repository root to contain only allowlisted files,
+          # so the job's scratch files (the bun cache, the test logs, the
+          # build output) must live OUTSIDE the checked out repo.
+          path: archgate-src
 
       - name: Record the runner capacity
+        working-directory: archgate-src
         run: |
           set -uo pipefail
           echo "uname=$(uname -s) $(uname -m)"
@@ -495,11 +517,13 @@ jobs:
           "$bun_bin" --version
 
       - name: bun install --frozen-lockfile
+        working-directory: archgate-src
         env:
           BUN_INSTALL: ${{ github.workspace }}/.bun-install
         run: bun install --frozen-lockfile
 
       - name: CPU benchmark
+        working-directory: archgate-src
         env:
           BUN_INSTALL: ${{ github.workspace }}/.bun-install
         run: |
@@ -507,6 +531,7 @@ jobs:
           bun -e 'const t=Date.now(); let s=0; for(let i=0;i<5e7;i++){s=(s+i)%1000000007;} console.log("bench_iterations=5e7 bench_ms="+(Date.now()-t)+" checksum="+s);'
 
       - name: archgate latency-budget tests on linux/x64 (the control)
+        working-directory: archgate-src
         env:
           BUN_INSTALL: ${{ github.workspace }}/.bun-install
         run: |
