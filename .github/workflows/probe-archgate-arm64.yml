@@ -188,6 +188,29 @@ jobs:
           BUN_INSTALL: ${{ github.workspace }}/.bun-install
         run: bun install --frozen-lockfile
 
+      - name: upstream's own static gates on the unmodified source tree
+        working-directory: archgate-src
+        # Upstream's release job runs `bun run validate` before it builds.
+        # `validate` is: lint && typecheck && format:check && test && check
+        # && knip && build:check. The test and check halves are covered by
+        # their own steps below. These three are the ones that prove the
+        # checkout really is upstream's reviewed tree, UNMODIFIED: `lint`
+        # and `typecheck` both run scripts/ensure-rules-dts.ts, which fails
+        # if the tracked rules.d.ts is missing, and `format:check` fails if
+        # a single byte of the tree was reformatted on the way in.
+        #
+        # Non-fatal: this step REPORTS, it does not gate the artifact.
+        env:
+          BUN_INSTALL: ${{ github.workspace }}/.bun-install
+        run: |
+          set +e
+          for gate in lint typecheck format:check; do
+            echo "===== upstream gate: bun run $gate ====="
+            bun run "$gate" 2>&1 | tail -25
+            echo "----- gate '$gate' exit code = ${PIPESTATUS[0]} -----"
+          done
+          exit 0
+
       - name: CPU benchmark
         working-directory: archgate-src
         # A comparable integer throughput number, so the arm64 and x64
@@ -255,22 +278,41 @@ jobs:
 
       - name: Build the linux/arm64 binary
         working-directory: archgate-src
-        # The compile flags mirror the `ensure_archgate` recipe in
-        # github_runners_for_repo/scripts/provision-host.sh — the recipe the
-        # org's own arm64 CI already runs `archgate check` with. The
-        # --compile-exec-argv flag matches upstream's release-binaries.yml
-        # so this asset trusts the same CA store as the darwin-arm64 and
-        # linux-x64 assets superman's CI already consumes. --target is
-        # omitted because the host IS bun-linux-arm64, so the default target
-        # is already correct.
+        # The compile flags are upstream's OWN release command, copied from
+        # archgate/cli @ f65d99f .github/workflows/release-binaries.yml:
+        #
+        #   bun build src/cli.ts --compile --bytecode \
+        #     --compile-exec-argv=--use-system-ca --minify \
+        #     --target ${{ matrix.target }} --outfile dist/${{ matrix.artifact }}
+        #
+        # The ONLY delta is the target: upstream ships darwin-arm64,
+        # darwin-x64, linux-x64 and win32-x64, so the linux-arm64 leg uses
+        # bun's own bun-linux-arm64 target. Every other flag is identical,
+        # so a reviewer can diff this against the reviewed tag's release
+        # workflow line by line. --compile-exec-argv=--use-system-ca keeps
+        # the asset on the system CA store, like the darwin-arm64 and
+        # linux-x64 assets superman's CI already consumes.
+        #
+        # If this bun build does not recognise the target name, the build
+        # retries without it: the host IS aarch64, so bun's default target
+        # is already linux-arm64 and the produced binary is the same
+        # platform. The step records which path it took.
         env:
           BUN_INSTALL: ${{ github.workspace }}/.bun-install
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/out"
-          bun build src/cli.ts --compile --bytecode \
-            --compile-exec-argv=--use-system-ca \
-            --outfile "$GITHUB_WORKSPACE/out/archgate"
+          BUILD_FLAGS=(--compile --bytecode --compile-exec-argv=--use-system-ca --minify)
+          if bun build src/cli.ts "${BUILD_FLAGS[@]}" \
+               --target bun-linux-arm64 \
+               --outfile "$GITHUB_WORKSPACE/out/archgate"; then
+            echo "build_target=bun-linux-arm64"
+          else
+            echo "::warning::bun build rejected --target bun-linux-arm64; retrying with bun's default target (native aarch64)"
+            bun build src/cli.ts "${BUILD_FLAGS[@]}" \
+              --outfile "$GITHUB_WORKSPACE/out/archgate"
+            echo "build_target=default-native-aarch64"
+          fi
           chmod +x "$GITHUB_WORKSPACE/out/archgate"
           ls -l "$GITHUB_WORKSPACE/out/archgate"
           file "$GITHUB_WORKSPACE/out/archgate" || true
