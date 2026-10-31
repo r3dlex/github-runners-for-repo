@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pwd
 import re
 import shutil
 import stat
@@ -263,9 +264,13 @@ def _sandbox(tmp_path: Path, arch: str = ARCH) -> dict[str, str]:
     `curl` is stubbed, `PROVISION_SUDO` is pinned to "env" so the install
     runs as the test user instead of asking for a password, and `HOME`
     points at an empty directory so the invoking user's home cannot
-    decide what the script does. The PATH holds only the binaries the
-    script shells out to, so what the host happens to have installed
-    cannot change what the script does.
+    decide what the script does. `RUNNER_HOMES` is pinned to a path that
+    does not exist: the script's default names the live fleet
+    (`/home/<runner-user>/actions-runner-linux*`), and a test that leaves
+    the knob unset passes on a laptop — where those directories are
+    absent — and fails on the runners, where they are not. The PATH holds
+    only the binaries the script shells out to, so what the host happens
+    to have installed cannot change what the script does.
     """
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir(exist_ok=True)
@@ -301,6 +306,7 @@ def _sandbox(tmp_path: Path, arch: str = ARCH) -> dict[str, str]:
             "HOME": str(tmp_path / "home"),
             "PROVISION_SUDO": "env",
             "GH_INSTALL_PATH": str(tmp_path / "usr-local-bin" / "gh"),
+            "RUNNER_HOMES": str(tmp_path / "no-such-runner-home"),
             "STUB_API_JSON": str(api_json),
             "STUB_TARBALL": str(tarball),
             "STUB_CHECKSUMS": str(checksums),
@@ -665,6 +671,10 @@ def _node_sandbox(tmp_path: Path, *, as_root: bool, with_sudo: bool) -> dict[str
     `as_root` fakes `id -u` so the script derives an empty escalation
     command — the way `gh-runners provision` is normally run. `with_sudo`
     installs a `sudo` stub that records what it was asked to run.
+    `RUNNER_HOMES` is pinned to a path that does not exist, for the same
+    reason `_sandbox` pins it: the script default names the live fleet,
+    and a test that leaves it unset answers differently on the runners
+    than it does on a laptop.
     """
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir(exist_ok=True)
@@ -691,6 +701,7 @@ def _node_sandbox(tmp_path: Path, *, as_root: bool, with_sudo: bool) -> dict[str
             "PATH": f"{stub_dir}{os.pathsep}{sysbin}",
             "HOME": str(tmp_path / "home"),
             "NPM_PREFIX": str(tmp_path / "npm-prefix"),
+            "RUNNER_HOMES": str(tmp_path / "no-such-runner-home"),
             "STUB_SUDO_LOG": str(tmp_path / "sudo-calls.log"),
             "STUB_CHOWN_LOG": str(tmp_path / "chown-calls.log"),
             "STUB_DIR": str(stub_dir),
@@ -1793,10 +1804,13 @@ class TestGhInstallDirProtection:
     def test_the_npm_prefix_is_in_the_tool_home_and_on_the_runner_path(
         self, tmp_path: Path
     ) -> None:
-        """The prefix is a dir of the tool user's own home.
+        """With no runner home, the prefix is a dir of the invoking home.
 
-        The prefix's bin dir has to be writable by the runner user, so
-        it must not be a dir that is shared with the host-wide binaries.
+        The prefix's bin dir has to be writable by the user the tools
+        belong to, so it must not be a dir that is shared with the
+        host-wide binaries. The sandbox pins RUNNER_HOMES to a path that
+        does not exist: leaving the script's live-fleet default in place
+        makes this assertion pass on a laptop and fail on the runners.
         """
         env = _node_sandbox(tmp_path, as_root=True, with_sudo=False)
         env.pop("NPM_PREFIX", None)
@@ -1814,6 +1828,46 @@ class TestGhInstallDirProtection:
         )
         assert f"{prefix}/bin" in tool_path, (
             f"the prefix's bin dir has to be on the runner PATH, got {tool_path}"
+        )
+
+    def test_the_npm_prefix_follows_the_runner_user_not_the_invoking_home(
+        self, tmp_path: Path
+    ) -> None:
+        """A runner home decides the prefix, not whoever ran the provision.
+
+        Provisioning runs as root, so $HOME is /root. The prefix has to
+        land in the runner user's own home — the account the jobs run as —
+        or `npm install -g` writes somewhere the job cannot read. The
+        runner home is named explicitly: the script's default points at
+        the live fleet, and a test that left it unset would answer
+        differently on the runners than on a laptop.
+        """
+        env = _node_sandbox(tmp_path, as_root=True, with_sudo=False)
+        env.pop("NPM_PREFIX", None)
+        runner_home = tmp_path / "runner-homes" / "actions-runner-linux"
+        runner_home.mkdir(parents=True)
+        env["RUNNER_HOMES"] = str(runner_home)
+        owner = pwd.getpwuid(runner_home.stat().st_uid)
+        script = (
+            f'source "{SCRIPT}"; resolve_tool_dirs; '
+            'printf "%s\\n%s\\n%s\\n" "$TOOL_USER" "$TOOL_HOME" "$NPM_PREFIX"'
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stderr
+        tool_user, tool_home, prefix = result.stdout.split("\n")[:3]
+        assert tool_user == owner.pw_name, (
+            f"the tool user is the owner of the runner home, got {tool_user}"
+        )
+        assert tool_home == owner.pw_dir, (
+            f"the tool home is the runner user's home, got {tool_home}"
+        )
+        assert prefix == str(Path(owner.pw_dir) / ".npm"), (
+            f"the npm prefix belongs to the runner user, got {prefix}"
+        )
+        assert prefix != str(Path(env["HOME"]) / ".npm"), (
+            "the invoking home must not decide the prefix when a runner home exists"
         )
 
 
