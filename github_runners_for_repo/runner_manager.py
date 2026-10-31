@@ -105,20 +105,28 @@ def install(
     return target_dir
 
 
-def provision(config: RunnerConfig) -> None:
+def provision(config: RunnerConfig, non_interactive: bool = False) -> None:
     """Provision the runner host with the toolchain jobs expect.
 
     A bare self-hosted host lacks the toolchain a GitHub-hosted runner ships
-    with (Node/npm, pipx). Without it, jobs that call ``npm`` or ``node``
+    with (Node/npm, pipx, gh). Without it, jobs that call ``npm`` or ``node``
     fail with "command not found" and silently fall back to the
     GitHub-hosted leg. This runs the bundled idempotent provisioning script
     so re-running is safe.
+
+    The privileged steps escalate with sudo. They are interactive by
+    default, so a watched invocation can answer the password prompt;
+    ``non_interactive`` turns them into ``sudo -n``, where a missing
+    password fails the provisioning instead of hanging on a prompt.
     """
     del config  # provisioning is host-scoped, not runner-scoped
     if not PROVISION_SCRIPT.exists():
         raise RunnerError(f"Provisioning script not found at {PROVISION_SCRIPT}")
     print(f"Provisioning host via {PROVISION_SCRIPT}...")
-    subprocess.run(["bash", str(PROVISION_SCRIPT)], check=True)  # noqa: S603, S607
+    cmd = ["bash", str(PROVISION_SCRIPT)]
+    if non_interactive:
+        cmd.append("--non-interactive")
+    subprocess.run(cmd, check=True)  # noqa: S603, S607
     print("Host provisioning complete.")
 
 

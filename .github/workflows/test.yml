@@ -13,8 +13,15 @@ jobs:
     timeout-minutes: 30
     # Self-hosted is the preferred leg; the canonical job falls back to a
     # GitHub-hosted runner when it fails, so a failure here must not fail
-    # the overall run.
+    # the overall run. The job level continue-on-error does exactly that,
+    # but it also hides a FAILING TEST SUITE: the job reported success,
+    # the gate said "passed" and the hosted legs skipped the work, so a
+    # green run proved nothing. The outcome of the Test step is published
+    # below and the gate requires it, so a failing suite always runs on
+    # the hosted leg as well.
     continue-on-error: true
+    outputs:
+      passed: ${{ steps.mark.outputs.passed }}
     strategy:
       fail-fast: false
       matrix:
@@ -33,7 +40,17 @@ jobs:
         run: uv sync --frozen
 
       - name: Test
+        id: test
         run: uv run pytest
+
+      - id: mark
+        if: always()
+        # The OUTCOME, not the conclusion: the job level continue-on-error
+        # turns a failed step into a successful job, and the needs context
+        # does not expose step outcomes at all. steps.test.outcome is
+        # "failure" when pytest failed and "skipped" when an earlier step
+        # kept the suite from running — neither may pass the gate.
+        run: echo "passed=${{ steps.test.outcome == 'success' }}" >> "$GITHUB_OUTPUT"
 
   _test-gate:
     name: "Test gate"
@@ -45,7 +62,12 @@ jobs:
       passed: ${{ steps.check.outputs.passed }}
     steps:
       - id: check
-        if: needs._test-self-hosted.result == 'success'
+        # The job result is only half of the truth: the job level
+        # continue-on-error reports success even when pytest failed. The
+        # published outcome of the Test step is the other half, and the
+        # gate needs both before it may tell the canonical job to skip
+        # the work.
+        if: needs._test-self-hosted.result == 'success' && needs._test-self-hosted.outputs.passed == 'true'
         run: echo "passed=true" >> "$GITHUB_OUTPUT"
 
   test:

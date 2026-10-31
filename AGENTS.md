@@ -96,7 +96,7 @@ uv run gh-runners remove --name <NAME>
 │   ├── github_api.py            # GitHub API interactions
 │   ├── runner_manager.py        # Native actions/runner binary lifecycle
 │   └── scripts/
-│       ├── provision-host.sh    # Idempotent host toolchain provisioning (Node/npm, pipx)
+│       ├── provision-host.sh    # Idempotent host toolchain provisioning (Node/npm, pipx, gh)
 │       ├── cleanup-host-disk.sh # Pressure-adaptive disk reclaim routine (timer-driven)
 │       └── install-disk-cleanup.sh  # Installs the routine + its two systemd units
 ├── tools/
@@ -147,19 +147,58 @@ the CLI in each. There is no Docker, no custom runner agent, and no
 `actions/runner-images` indirection.
 
 A self-hosted host needs the same toolchain a GitHub-hosted runner ships
-with (Node/npm, pipx); a bare host (fresh Colima VM, clean macOS box) does
-not have it, and jobs that call `npm`/`node` fail with `command not found`,
-silently falling back to the GitHub-hosted leg. `gh-runners provision`
+with (Node/npm, pipx, gh); a bare host (fresh Colima VM, clean macOS box)
+does not have it, and jobs that call `npm`/`node`/`gh` fail with
+`command not found`, silently falling back to the GitHub-hosted leg.
+`gh-runners provision`
 runs the bundled idempotent `scripts/provision-host.sh` to close that gap
 once per host. This is the permanent home of that lesson — do not delete
 it; if a host rebuild loses the toolchain, re-running `provision` restores
 it.
 
+`provision` is normally run **as root** (the toolchain goes to `/usr/local`
+and the npm prefix in the runner user's home has to be chowned). Run as
+the runner user instead and
+every privileged step escalates with `sudo`, interactively by default so a
+watched invocation can answer the password prompt;
+`gh-runners provision --non-interactive` uses `sudo -n` instead, where a
+missing password fails the provisioning rather than hanging on a prompt.
+On Linux the provisioning ends with a check that the **runner user** can
+really run `gh` under the default job `PATH`; on macOS the equivalent
+check is that Homebrew's `gh` is on the runner's `.path` file. The runner
+user is the owner of the runner home, named by the `RUNNER_HOMES` knob
+with **absolute paths** (same knob as `install-disk-cleanup.sh`) — never
+a hardcoded name, and never taken from the invoking user's `$HOME` alone:
+provisioning runs as root and root's home holds no runner directory. A
+runner home under the invoking account's own home is found as well,
+because that is where it lives on a host that is provisioned by the
+account that owns the runner. Every runner home on the host is checked,
+and a runner home owned by root is skipped: root is not a runner user,
+and a check that ran as root would prove nothing. Without a runner home
+other than a root-owned one the provisioning says so loudly and checks
+the install the other way round — the binary has to be executable by
+every user on the host — rather than verifying the invoking user, which
+would pass for a `gh` the runner user cannot execute.
+
+The GitHub CLI is a **host-wide** binary: `/usr/local/bin/gh` belongs to
+root, and so does the directory that holds it. `unlink(2)` and
+`rename(2)` are governed by the write permission on the **containing
+directory**, not by the ownership or the mode of the file, so a
+root-owned `gh` inside a runner-writable `/usr/local/bin` can still be
+deleted and replaced by the runner user — and the runner user runs
+arbitrary pull-request code. The provisioning therefore keeps the npm
+prefix in the runner user's own home (`$HOME/.npm`), never in a prefix
+shared with the host binaries, and it verifies that the directory of
+`GH_INSTALL_PATH` is root-owned and neither group nor other writable.
+Do not weaken that check: it is the difference between a host-wide `gh`
+and a `gh` any job on the host can replace.
+
 The flow for one runner:
 
 0. `gh-runners provision` — one-time per host; installs the toolchain
    (Node/npm via NodeSource on Linux or Homebrew on macOS, npm global
-   prefix repointed to a user-writable dir on Linux, pip + pipx).
+   prefix repointed to a user-writable dir on Linux, pip + pipx, the
+   GitHub CLI — the pinned release on Linux, Homebrew on macOS).
 1. `gh-runners install` — downloads and extracts the official
    `actions-runner-<os>-<arch>-<ver>.tar.gz` from the GitHub release into
    a target directory.

@@ -30,10 +30,10 @@ Whatever the official binary supports, the CLI supports.
 
 GitHub-hosted runners ship with a full toolchain pre-installed; a bare
 self-hosted host (a fresh Colima VM, a clean macOS box) does not. When a
-job calls `npm`, `node`, or `pipx` on an unprovisioned host it fails with
-`command not found`, and the self-hosted-preferred wrapper silently falls
-back to the GitHub-hosted leg on every run — so self-hosted never actually
-does the work.
+job calls `npm`, `node`, `pipx` or `gh` on an unprovisioned host it fails
+with `command not found`, and the self-hosted-preferred wrapper silently
+falls back to the GitHub-hosted leg on every run — so self-hosted never
+actually does the work.
 
 `gh-runners provision` runs a bundled, idempotent script that closes that
 gap once per host:
@@ -42,10 +42,20 @@ gap once per host:
   macOS via Homebrew.
 - **npm global prefix** (Linux only) — the default `/usr` prefix is
   root-owned, so `npm install -g` fails with `EACCES` for the non-root
-  runner user. The script repoints the prefix at `/usr/local` (overridable
-  with `NPM_PREFIX`) and chowns it to the runner user, which is already on
-  `PATH`.
+  runner user. The script repoints the prefix at the runner user's own
+  `$HOME/.npm` (overridable with `NPM_PREFIX`), chowns it to the runner
+  user and puts its `bin` directory on the runner's `PATH`. It is
+  deliberately **not** `/usr/local`: the `bin` directory of `/usr/local`
+  holds the host-wide `gh`, and `unlink(2)`/`rename(2)` are governed by
+  the write permission on the *containing directory* — a runner-writable
+  `/usr/local/bin` would let any job replace the `gh` on the host.
 - **pip + pipx** — for Python tooling installed globally on the host.
+- **The GitHub CLI (`gh`)** — on Linux the pinned official release
+  (`GH_VERSION`, default `v2.103.3`) is installed to `GH_INSTALL_PATH`
+  (default `/usr/local/bin/gh`) after the download is checked against a
+  recorded sha256; on macOS `gh` comes from Homebrew, because the pinned
+  release is Linux-only. The Homebrew prefix is added to the runner's
+  `.path` file, so the jobs find `gh` there too.
 
 ```bash
 gh-runners provision        # safe to re-run; checks before it installs
@@ -54,6 +64,74 @@ gh-runners provision        # safe to re-run; checks before it installs
 Run this once on each host before `configure` / `start`. It is the
 permanent home of the "self-hosted host needs the toolchain too" lesson —
 re-running after a host rebuild restores the toolchain.
+
+### How to run it
+
+`gh-runners provision` is normally run **as root**: the toolchain goes to
+`/usr/local`, the npm prefix in the runner user's home has to be chowned,
+and the runner's `.path` file has to be written. Run it as the runner user
+instead and every
+privileged step escalates with `sudo` — **interactively**, so a watched
+invocation can answer the password prompt. `gh-runners provision
+--non-interactive` turns the escalation into `sudo -n`, where a missing
+password fails the provisioning instead of hanging on a prompt. (sudo only
+accepts `sudo -E` when the invoking user holds the `SETENV` tag; on a host
+where it does not, the NodeSource install has to be run by a user that
+does.)
+
+The runner-user check has to *switch* users — a check that runs as root
+proves nothing, because root bypasses the mode bits. When the
+provisioning cannot escalate (no `sudo` and the invoking user is not
+root) the check **fails loudly** instead of pretending it verified
+something: run the provisioning as root, or as a user that can `sudo`.
+
+### The runner-user check
+
+The provisioning ends with a check that the **runner user** — the owner of
+the runner home, never hardcoded — can really run `gh --version` under the
+default job `PATH`, executed *as that user*. Root bypasses the mode bits,
+so a root-only check would pass for a binary the runner user cannot
+execute: every job on the host would then die with `gh: command not found`
+(exit 127) while the provisioning reported success.
+
+The runner home is named by the `RUNNER_HOMES` knob with **absolute
+paths** — the same knob `install-disk-cleanup.sh` uses — because
+provisioning runs as root and root's home holds no runner directory:
+
+```bash
+RUNNER_HOMES=/home/runner/actions-runner gh-runners provision
+```
+
+A runner home under the provisioning account's own home is found as well
+— that is where it lives on a host that is provisioned by the account
+that owns the runner. Every runner home on the host is checked, not just
+the first one: two runner homes on one host can belong to different
+users. A runner home **owned by root** is skipped — root is not a runner
+user, and a check that ran as root would verify nothing — and the next
+runner home on the host is used instead.
+
+When no runner home is found — or when every runner home on the host is
+owned by root — the provisioning **says so loudly** (`no runner home
+found — the runner user check did not run`) and checks the install the
+other way round: the binary has to be executable by *every*
+user on the host, because every job on the host runs it. A host that is
+provisioned before the runner is installed is a normal thing to be, so
+this does not fail the provisioning — point `RUNNER_HOMES` at the runner
+home that is going to be used to have the runner-user check run as well.
+
+`/usr/local/bin/gh` itself belongs to **root**, never to the user that
+runs the provisioning: it is a host-wide binary, and a `gh` the runner
+user owns is a `gh` that every job on the host — and every pull request
+that runs on it — can replace.
+
+Owning the file is not enough on its own, though: `unlink(2)` and
+`rename(2)` are governed by the write permission on the **containing
+directory**, not by the ownership or the mode of the file. A root-owned
+`gh` inside a runner-writable `/usr/local/bin` can still be deleted and
+replaced by the runner user. The provisioning therefore checks the
+directory that holds the `gh` as well: it has to belong to root, it must
+not be group or other writable, and it must not be writable by the runner
+user. The provisioning fails when it is.
 
 ## Host disk management
 
@@ -251,7 +329,7 @@ uv sync
 cp .env.example .env
 # Edit .env — set GITHUB_ACCESS_TOKEN and exactly one of GITHUB_ORG or GITHUB_REPOSITORY
 
-# Provision the host toolchain (Node/npm, pipx) — one-time per host
+# Provision the host toolchain (Node/npm, pipx, gh) — one-time per host
 gh-runners provision
 
 # Create a runner directory and install the official binary
@@ -264,6 +342,15 @@ gh-runners configure --name r3dlex-runner-1
 
 # Start it as a launchd service (persistent across reboots)
 gh-runners start --service
+```
+
+Provisioning before the runner is installed is fine — the runner-user
+check simply reports that it did not run and checks the `gh` install
+instead. To have that check really run as the runner user, point
+`RUNNER_HOMES` at the runner home and provision once more:
+
+```bash
+RUNNER_HOMES="$PWD/runners/mac-1" gh-runners provision
 ```
 
 Run the same sequence in another directory for each additional runner.
@@ -329,7 +416,7 @@ Copy `.env.example` to `.env` and fill in the values. `GITHUB_ORG` and
 
 | Command | Description |
 |---|---|
-| `gh-runners provision` | Install the host toolchain jobs expect (Node/npm, pipx) — idempotent |
+| `gh-runners provision [--non-interactive]` | Install the host toolchain jobs expect (Node/npm, pipx, gh) — idempotent |
 | `gh-runners install [--target-dir DIR] [--version VER]` | Download and extract the official `actions/runner` binary |
 | `gh-runners configure --name NAME [--target-dir DIR] [--labels L] [--runner-group G] [--work-dir W] [--no-replace]` | Fetch a JIT token, run `config.sh` with the resolved options |
 | `gh-runners start [--target-dir DIR] [--service]` | Start the runner (foreground by default; `--service` installs `launchd`/`systemd`) |
