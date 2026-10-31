@@ -451,10 +451,18 @@ filled up. The rules now are:
     `runner-disk-cleanup.service` to execute the new path;
   - `UNIT_DIR` is not a systemd directory while the install path is
     still the live one — enabling the timer would enable the LIVE
-    `runner-disk-cleanup.timer`.
+    `runner-disk-cleanup.timer`;
+  - the runner homes changed but `INSTALL_PATH` and `UNIT_DIR` did not —
+    the run would overwrite the LIVE routine, rewrite the LIVE unit and
+    start the LIVE timer.
+- **`SYSTEMD_UNIT_DIRS` cannot retarget the live check.** The directories
+  systemd reads are hard-coded. A non-sandbox run that sets the variable
+  is refused: it used to be the whole answer to "is this a live unit
+  directory", and setting it to a sandbox path made `/etc/systemd/system`
+  look non-live.
 - **The old "name `RUNNER_HOMES` explicitly and you are fine" advice was
   wrong and must not come back**: naming the runner homes alone leaves
-  the unit directory live.
+  the unit directory and the install path live.
 - The install directory is only added to a `.path` file when it exists on
   disk, and the ownership fix never chowns anything outside the sandbox
   root.

@@ -595,19 +595,12 @@ class TestInstallerSandbox:
         """
         home = tmp_path / "actions-runner-linux"
         home.mkdir()
-        # The "live" systemd directory, pointed at a sandbox so the test
-        # can look at it. SYSTEMD_UNIT_DIRS is the installer's own knob
-        # for it; on the host it is the real set of directories systemd
-        # reads.
-        live_units = tmp_path / "live-systemd"
-        live_units.mkdir()
 
         result = _installer(
             {
                 "RUNNER_HOMES": str(home),
                 "INSTALL_PATH": str(tmp_path / "verify" / "runner-disk-cleanup.sh"),
-                "UNIT_DIR": str(live_units),
-                "SYSTEMD_UNIT_DIRS": str(live_units),
+                "UNIT_DIR": "/etc/systemd/system",
             },
             'source "$INSTALLER"',
         )
@@ -618,12 +611,6 @@ class TestInstallerSandbox:
         )
         assert "UNIT_DIR" in result.stdout, (
             f"the refusal has to name the knob the operator has to set, got {result.stdout}"
-        )
-        assert not (live_units / "runner-disk-cleanup.service").exists(), (
-            "the live unit file must not be rewritten by a refused run"
-        )
-        assert not (live_units / "runner-disk-cleanup.timer").exists(), (
-            "the live timer file must not be rewritten by a refused run"
         )
 
     def test_a_fully_isolated_run_is_allowed(self, tmp_path: Path) -> None:
@@ -652,6 +639,57 @@ class TestInstallerSandbox:
         result = _installer({}, 'source "$INSTALLER"')
 
         assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+
+    def test_overriding_only_the_runner_homes_is_refused(self, tmp_path: Path) -> None:
+        """Naming RUNNER_HOMES alone still mutates the live fleet.
+
+        The install path and the unit directory stay at their live
+        defaults, so the run overwrites the live routine, rewrites the
+        live unit and starts the live timer. The operator named a scratch
+        home and believes the run is scoped to it.
+        """
+        home = tmp_path / "actions-runner-linux"
+        home.mkdir()
+
+        result = _installer(
+            {"RUNNER_HOMES": str(home)},
+            'source "$INSTALLER"',
+        )
+
+        assert result.returncode != 0, (
+            "changing only the runner homes would overwrite the LIVE routine "
+            "and start the LIVE timer"
+        )
+        assert "RUNNER_HOMES" in result.stdout, (
+            f"the refusal has to name the knob that was set, got {result.stdout}"
+        )
+
+    def test_systemd_unit_dirs_cannot_hide_the_live_unit_directory(self, tmp_path: Path) -> None:
+        """An environment variable must not make /etc/systemd/system look non-live.
+
+        SYSTEMD_UNIT_DIRS used to be the whole answer to "is this a live
+        unit directory". Setting it to a sandbox path made the guard say
+        no, and the run then rewrote the live unit.
+        """
+        home = tmp_path / "actions-runner-linux"
+        home.mkdir()
+
+        result = _installer(
+            {
+                "RUNNER_HOMES": str(home),
+                "INSTALL_PATH": str(tmp_path / "verify" / "runner-disk-cleanup.sh"),
+                "UNIT_DIR": "/etc/systemd/system",
+                "SYSTEMD_UNIT_DIRS": str(tmp_path / "fake-systemd"),
+            },
+            'source "$INSTALLER"',
+        )
+
+        assert result.returncode != 0, (
+            "SYSTEMD_UNIT_DIRS must not be able to hide the live unit directory"
+        )
+        assert "SYSTEMD_UNIT_DIRS" in result.stdout, (
+            f"the refusal has to name the knob that hid the live directory, got {result.stdout}"
+        )
 
     def test_units_outside_systemd_with_the_live_install_path_are_refused(
         self, tmp_path: Path
@@ -1799,7 +1837,12 @@ class TestSystemPruneGuards:
     """
 
     @staticmethod
-    def _prune_system(tmp_path: Path, comm: str | None) -> list[str]:
+    def _prune_system(
+        tmp_path: Path,
+        comm: str | None,
+        *,
+        coredump_dir: Path | None = None,
+    ) -> list[str]:
         """Run prune_system with recording stand-ins for the host tools.
 
         `rm`, `journalctl`, `apt-get` and `docker` record their arguments
@@ -1829,6 +1872,9 @@ class TestSystemPruneGuards:
                 "PROC_ROOT": str(proc),
             }
         )
+        if coredump_dir is not None:
+            coredump_dir.mkdir(parents=True, exist_ok=True)
+            env["COREDUMP_DIR"] = str(coredump_dir)
         result = subprocess.run(
             ["bash", "-c", 'source "$CLEANUP_SCRIPT"; prune_system 2 0'],
             env=env,
@@ -1855,6 +1901,41 @@ class TestSystemPruneGuards:
 
         assert [c for c in calls if "/var/lib/apt/lists" in c], (
             f"the apt index has to be reclaimed when nothing is installing: {calls}"
+        )
+
+    def test_a_coredump_being_written_is_kept(self, tmp_path: Path) -> None:
+        """The kernel reports systemd-coredump as systemd-coredum.
+
+        /proc/<pid>/comm holds 15 characters. The helper's name is 16, so
+        a literal comparison against systemd-coredump never matches and
+        the sweep deletes the dump it is writing.
+        """
+        dump_dir = tmp_path / "coredump"
+        calls = self._prune_system(tmp_path, "systemd-coredum", coredump_dir=dump_dir)
+
+        assert not [c for c in calls if str(dump_dir) in c], (
+            f"a coredump being written must not be deleted: {calls}"
+        )
+
+    def test_crash_dumps_are_pruned_when_nothing_is_writing_one(self, tmp_path: Path) -> None:
+        """The guard is an activity check, not a permanent exemption."""
+        dump_dir = tmp_path / "coredump"
+        calls = self._prune_system(tmp_path, "bash", coredump_dir=dump_dir)
+
+        assert [c for c in calls if str(dump_dir) in c], (
+            f"crash dumps have to be reclaimed when nothing is writing one: {calls}"
+        )
+
+    def test_a_fifteen_character_package_manager_name_still_guards(self, tmp_path: Path) -> None:
+        """Truncating the comparison must not miss a name that already fits.
+
+        unattended-upgrades is reported as unattended-upgr — exactly 15
+        characters. The apt index still has to be kept while it runs.
+        """
+        calls = self._prune_system(tmp_path, "unattended-upgr")
+
+        assert not [c for c in calls if "/var/lib/apt/lists" in c], (
+            f"the apt index must not be dropped while unattended-upgrades runs: {calls}"
         )
 
 

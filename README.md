@@ -298,6 +298,12 @@ is refused before a single file is written:
 - **The unit directory is not a systemd directory but the install path is
   still the live one** is refused: enabling the timer would enable the
   **live** `runner-disk-cleanup.timer`.
+- **Only `RUNNER_HOMES` was named** is refused: the install path and the
+  unit directory stay at their live defaults, so the run overwrites the
+  live routine, rewrites the live unit and starts the live timer.
+- **`SYSTEMD_UNIT_DIRS` cannot hide a live unit directory.** The
+  directories systemd reads are hard-coded. A non-sandbox run that sets
+  the variable is refused.
 - The install directory is only added to a `.path` file when it exists on
   disk.
 

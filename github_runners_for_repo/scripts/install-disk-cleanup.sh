@@ -72,10 +72,18 @@
 #         live timer would then fail on every tick;
 #       - the unit directory is not a systemd directory but the install
 #         path is still the live one: enabling the timer would enable
-#         the LIVE runner-disk-cleanup.timer.
+#         the LIVE runner-disk-cleanup.timer;
+#       - the runner homes changed but the install path and the unit
+#         directory did not: the run would overwrite the LIVE routine,
+#         rewrite the LIVE unit and start the LIVE timer.
 #     The "name RUNNER_HOMES explicitly and you are fine" advice that
 #     used to be in this file was wrong: naming the runner homes alone
-#     leaves the unit directory live, and the run rewrites the live unit.
+#     leaves the unit directory and the install path live.
+#   - SYSTEMD_UNIT_DIRS cannot retarget the live check. The directories
+#     systemd reads are hard-coded. A non-sandbox run that sets the
+#     variable is refused: it used to be the whole answer to "is this a
+#     live unit directory", and setting it to a sandbox path made
+#     /etc/systemd/system look non-live.
 #   - The install directory is only added to a .path file when it exists
 #     on disk.
 #
@@ -196,18 +204,32 @@ path_under() {
 # The systemd unit directories. A unit file written into one of them is a
 # LIVE unit: systemd reads it on the next daemon-reload and runs it.
 #
-# The list is a knob ONLY so the sandbox tests can point the live directory
-# at a sandbox directory and prove that a refused run leaves the live unit
-# file untouched. On the host it is never set: the installer is run as root
-# from a shell that carries no such variable, and the default is the real
-# set of directories systemd reads.
-SYSTEMD_UNIT_DIRS="${SYSTEMD_UNIT_DIRS:-/etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system}"
+# The list is HARD-CODED. It used to be an environment variable, and a
+# non-sandbox run that set SYSTEMD_UNIT_DIRS to a sandbox path made
+# is_systemd_unit_dir answer false for /etc/systemd/system. The guard
+# then let the run rewrite the live unit. An environment variable must
+# not be able to hide a directory systemd actually reads.
+LIVE_SYSTEMD_UNIT_DIRS="/etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system"
+# Sandbox tests add a directory to the live set so they can prove a
+# refused run did not write a unit file. The addition never replaces
+# the hard-coded list, and a non-sandbox run that sets it is refused
+# below — the knob cannot retarget the live check.
+SYSTEMD_UNIT_DIRS_OVERRIDDEN=0
+if [ -n "${SYSTEMD_UNIT_DIRS+x}" ]; then SYSTEMD_UNIT_DIRS_OVERRIDDEN=1; fi
+SYSTEMD_UNIT_DIRS="${SYSTEMD_UNIT_DIRS:-}"
 
 # True when the directory is one systemd reads units from.
 is_systemd_unit_dir() {
-  local dir="$1" candidate
+  local dir="$1" candidate extras=""
   dir="$(resolve_path "$dir")"
-  for candidate in $SYSTEMD_UNIT_DIRS; do
+  # The extra directories are consulted only in a sandbox run. Outside
+  # one they are refused before this function is asked, but a caller
+  # that reaches here anyway must still not be able to hide a live dir.
+  if [ "$SANDBOX" = "1" ]; then
+    extras="$SYSTEMD_UNIT_DIRS"
+  fi
+  for candidate in $LIVE_SYSTEMD_UNIT_DIRS $extras; do
+    [ -n "$candidate" ] || continue
     candidate="$(resolve_path "$candidate")"
     if [ "$dir" = "$candidate" ]; then
       return 0
@@ -314,6 +336,19 @@ if [ "$SANDBOX" = "1" ]; then
   done
   log "sandbox mode: everything stays under $SANDBOX_ROOT_RESOLVED"
 else
+  # SYSTEMD_UNIT_DIRS used to BE the live-directory list. A non-sandbox
+  # run that set it to a sandbox path made /etc/systemd/system look
+  # non-live, and the run rewrote the live unit. The hard-coded list
+  # above is what the guard trusts; setting the variable is refused
+  # rather than silently ignored, so the operator sees why.
+  if [ "$SYSTEMD_UNIT_DIRS_OVERRIDDEN" = "1" ]; then
+    log "ERROR: SYSTEMD_UNIT_DIRS cannot retarget the live unit directories."
+    log "ERROR: a non-sandbox run that sets it would hide /etc/systemd/system"
+    log "ERROR: and rewrite the LIVE runner-disk-cleanup.service."
+    log "ERROR: unset SYSTEMD_UNIT_DIRS, or run with SANDBOX=1."
+    exit 1
+  fi
+
   # The runner homes are compared RESOLVED: a home that is spelled through
   # a symlink (/home/<user>.linux -> <user>.guest) IS the live home, and a
   # run that names it has to be treated as one.
@@ -367,6 +402,29 @@ else
     log "ERROR: UNIT_DIR is not a systemd unit directory ($UNIT_DIR) but INSTALL_PATH is the live default ($INSTALL_PATH)."
     log "ERROR: enabling the timer would enable the LIVE runner-disk-cleanup.timer."
     log "ERROR: set INSTALL_PATH to a non-default path, or use the live defaults for both."
+    exit 1
+  fi
+
+  # Backstop for a mix the guards above do not name. Naming only
+  # RUNNER_HOMES leaves the install path and the unit directory at their
+  # live defaults: the run overwrites the live routine, rewrites the live
+  # unit and starts the live timer, while the operator believes the run
+  # is scoped to the scratch home.
+  live_count=0
+  if [ "$install_path_resolved" = "$default_install_path_resolved" ]; then
+    live_count=$((live_count + 1))
+  fi
+  if is_systemd_unit_dir "$UNIT_DIR"; then
+    live_count=$((live_count + 1))
+  fi
+  if [ "$runner_homes_resolved" = "$default_runner_homes_resolved" ]; then
+    live_count=$((live_count + 1))
+  fi
+  if [ "$live_count" -ne 0 ] && [ "$live_count" -ne 3 ]; then
+    log "ERROR: a non-sandbox run must be entirely LIVE or entirely ISOLATED."
+    log "ERROR: INSTALL_PATH, UNIT_DIR and RUNNER_HOMES are mixed"
+    log "ERROR: ($live_count of 3 still at the live default)."
+    log "ERROR: set all three, or none of them, or run with SANDBOX=1."
     exit 1
   fi
 

@@ -81,7 +81,9 @@
 # covered by the in-use scan — those paths are not under a watched root and
 # are not held by a job. They are guarded by their own activity check
 # instead: the apt index is only dropped while no package manager is running,
-# and the crash dumps only while no coredump is being written.
+# and the crash dumps only while no coredump is being written. The check
+# reads /proc/<pid>/comm, which the kernel truncates to 15 characters, so
+# systemd-coredump is matched as systemd-coredum.
 #
 # ## Mutual exclusion
 #
@@ -138,6 +140,11 @@ BASE_TMP_DAYS="${BASE_TMP_DAYS:-1}"
 
 JOURNAL_MAX="${JOURNAL_MAX:-50M}"
 DOCKER_AGE="${DOCKER_AGE:-24h}"
+# Crash dumps live outside every watched root, so the in-use scan never
+# covers them. The path is a knob so a test can point it at a sandbox
+# directory: the guard has to be provable on a host that has no
+# /var/lib/systemd/coredump.
+COREDUMP_DIR="${COREDUMP_DIR:-/var/lib/systemd/coredump}"
 
 DRY_RUN=0
 STATUS_ONLY=0
@@ -490,10 +497,16 @@ collect_inuse() {
 # watched root, so they are guarded by their own activity check.
 process_running() {
   local want comm
+  # /proc/<pid>/comm is a 16-byte kernel buffer (TASK_COMM_LEN), so it
+  # holds at most 15 characters. systemd-coredump is 16 characters and
+  # the kernel reports systemd-coredum; a literal comparison against the
+  # full name never matches, and the crash-dump guard then never fires.
+  # Both sides are compared on the 15 characters the kernel stores.
   while IFS= read -r comm; do
     [ -n "$comm" ] || continue
+    comm="${comm:0:15}"
     for want in "$@"; do
-      [ "$comm" = "$want" ] && return 0
+      [ "$comm" = "${want:0:15}" ] && return 0
     done
   done < <(cat "$PROC_ROOT"/[0-9]*/comm 2>/dev/null)
   return 1
@@ -509,7 +522,7 @@ process_running() {
 # home, so walking all the way to the root of the watched tree would mark
 # every candidate in use and disable the sweep entirely.
 is_in_use() {
-  local cand="$1" p physical
+  local cand="$1" p physical parent
   # Compare on a slash-normalised candidate. The checkout glob ("$work"/*/)
   # yields a trailing slash, and "/work/repo/" does not prefix-match
   # "/work/repo/file" — without this the guard silently misses a live job's
@@ -521,6 +534,11 @@ is_in_use() {
   if [ -d "$cand" ]; then
     physical="$(cd "$cand" 2>/dev/null && pwd -P)" || physical=""
   fi
+  # dirname once per call, not once per in-use path. The case sits in
+  # the loop, and a fork per (candidate x in-use path) makes a tier-3
+  # pass outrun the unit's timeout. The parent does not change inside
+  # the loop.
+  parent="$(dirname "$cand")"
   for p in "${INUSE_PATHS[@]:-}"; do
     [ -n "$p" ] || continue
     case "$p" in
@@ -541,7 +559,7 @@ is_in_use() {
     # would disable the temp sweep permanently; walking further up (to the
     # runner home) would disable the whole sweep, because the runner's own
     # processes always hold that.
-    case "$(dirname "$cand")" in
+    case "$parent" in
       */_work) case "$p" in */_work) return 0 ;; esac ;;
     esac
   done
@@ -1021,13 +1039,13 @@ prune_system() {
   fi
 
   # Crash dumps. A coredump that is still being written is left alone.
-  if [ -d /var/lib/systemd/coredump ]; then
+  if [ -d "$COREDUMP_DIR" ]; then
     if process_running systemd-coredump; then
       log "skipped (a coredump is being written) the crash dumps"
     elif [ "$DRY_RUN" = "1" ]; then
       log "would prune coredumps"
     else
-      rm -rf /var/lib/systemd/coredump/* >/dev/null 2>&1 || true
+      rm -rf "$COREDUMP_DIR"/* >/dev/null 2>&1 || true
     fi
   fi
 
