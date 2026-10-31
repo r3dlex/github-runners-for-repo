@@ -60,71 +60,101 @@ jobs:
             exit 1
           fi
 
+      - name: Probe the runner tooling
+        # This runner image is minimal: no unzip, no python3, no bsdtar and
+        # no bun. The bun.sh installer needs unzip, so it cannot be used.
+        # Print the inventory so the install step below can pick a route
+        # that actually exists here.
+        run: |
+          set -uo pipefail
+          echo "HOME=$HOME"
+          echo "uname=$(uname -s) $(uname -m)"
+          for tool in tar gzip xz zstd unzip python python3 node npm perl busybox curl wget sha512sum sha256sum; do
+            printf '%-10s %s\n' "$tool" "$(command -v "$tool" 2>/dev/null || echo MISSING)"
+          done
+          echo "--- /usr/bin ---"
+          # shellcheck disable=SC2012
+          ls /usr/bin 2>/dev/null | tr '\n' ' ' | head -c 2000
+          echo
+          echo "--- /usr/local/bin ---"
+          # shellcheck disable=SC2012
+          ls /usr/local/bin 2>/dev/null | tr '\n' ' ' | head -c 1000
+          echo
+
       - name: Install bun (job scoped)
         # The fleet shares one $HOME between runner instances, so bun is
         # installed into a job scoped directory inside the workspace
         # instead of the shared $HOME/.bun. Nothing outside this job's
         # workspace is touched.
         #
-        # The bun.sh installer needs `unzip`, which this runner image does
-        # not have, so the release archive is fetched and unpacked here
-        # with whatever unpacker is available. A bun that the fleet's
-        # provision-host.sh already installed is the last resort.
+        # Route: the npm platform package @oven/bun-linux-aarch64 ships the
+        # RAW bun binary in a plain .tgz, so `tar -xzf` unpacks it without
+        # unzip. The tarball is checksum-locked against the sha512 the npm
+        # registry publishes for that exact version.
         env:
           BUN_INSTALL: ${{ github.workspace }}/.bun-install
+          BUN_VERSION: 1.4.4
+          BUN_TGZ_URL: https://registry.npmjs.org/@oven/bun-linux-aarch64/-/bun-linux-aarch64-1.4.4.tgz
+          BUN_TGZ_SHA512: 65356da5ff7398748154f5f5b01c1ee5a8066ffacddf8c8f1a0fc76f2f1ed80c76b82500d944592a5647eea2e7b4aeea68524231787dbf4196358376cc8373d7
         run: |
           set -uo pipefail
-          echo "HOME=$HOME"
-          echo "uname=$(uname -s) $(uname -m)"
-          for tool in unzip python3 bsdtar curl; do
-            printf '%s=%s\n' "$tool" "$(command -v "$tool" || echo MISSING)"
-          done
-          ls -la "$HOME/.bun/bin" 2>&1 || echo "(no $HOME/.bun/bin on this runner)"
-
           mkdir -p "$BUN_INSTALL/bin"
           bun_bin=""
-          archive="$BUN_INSTALL/bun-linux-aarch64.zip"
 
-          if curl -fsSL --retry 3 --max-time 300 \
-            https://github.com/oven-sh/bun/releases/latest/download/bun-linux-aarch64.zip \
-            -o "$archive"; then
-            echo "downloaded bun release archive ($(wc -c < "$archive") bytes)"
-            extracted="$BUN_INSTALL/dl"
-            mkdir -p "$extracted"
-            if command -v unzip >/dev/null 2>&1; then
-              unzip -o "$archive" -d "$extracted"
-            elif command -v python3 >/dev/null 2>&1; then
-              python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$archive" "$extracted"
-            elif command -v bsdtar >/dev/null 2>&1; then
-              bsdtar -xf "$archive" -C "$extracted"
+          # (a) a bun that is already on this runner
+          for candidate in "$(command -v bun 2>/dev/null || true)" "$HOME/.bun/bin/bun"; do
+            if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+              bun_bin="$candidate"
+              echo "using the bun already present at $candidate"
+              break
+            fi
+          done
+
+          # (b) the checksum-locked npm platform package
+          if [ -z "$bun_bin" ]; then
+            tgz="$BUN_INSTALL/bun.tgz"
+            if curl -fsSL --retry 3 --max-time 300 "$BUN_TGZ_URL" -o "$tgz"; then
+              echo "downloaded $(wc -c < "$tgz") bytes of bun $BUN_VERSION"
+              actual=""
+              if command -v sha512sum >/dev/null 2>&1; then
+                actual="$(sha512sum "$tgz" | awk '{print $1}')"
+              elif command -v shasum >/dev/null 2>&1; then
+                actual="$(shasum -a 512 "$tgz" | awk '{print $1}')"
+              fi
+              if [ -n "$actual" ] && [ "$actual" != "$BUN_TGZ_SHA512" ]; then
+                echo "::error::bun tarball checksum mismatch: $actual"
+                rm -f "$tgz"
+                exit 1
+              fi
+              if [ -z "$actual" ]; then
+                echo "::warning::no sha512 tool on this runner, checksum not verified"
+              else
+                echo "bun tarball sha512 verified: $actual"
+              fi
+              mkdir -p "$BUN_INSTALL/dl"
+              if tar -xzf "$tgz" -C "$BUN_INSTALL/dl" && [ -f "$BUN_INSTALL/dl/package/bin/bun" ]; then
+                cp -f "$BUN_INSTALL/dl/package/bin/bun" "$BUN_INSTALL/bin/bun"
+                chmod +x "$BUN_INSTALL/bin/bun"
+                bun_bin="$BUN_INSTALL/bin/bun"
+              else
+                echo "::warning::could not unpack $tgz with tar"
+              fi
+              rm -f "$tgz"
             else
-              echo "::warning::no unpacker (unzip/python3/bsdtar) on this runner"
+              echo "::warning::bun npm tarball download failed"
             fi
-            found="$(find "$extracted" -type f -name bun -perm -u+x 2>/dev/null | head -1)"
-            if [ -n "$found" ]; then
-              cp -f "$found" "$BUN_INSTALL/bin/bun"
-              chmod +x "$BUN_INSTALL/bin/bun"
-              bun_bin="$BUN_INSTALL/bin/bun"
-            fi
-          else
-            echo "::warning::bun release archive download failed"
           fi
 
-          if [ -z "$bun_bin" ] && [ -x "$HOME/.bun/bin/bun" ]; then
-            echo "::warning::falling back to the bun the fleet's provision-host.sh installed"
-            cp -f "$HOME/.bun/bin/bun" "$BUN_INSTALL/bin/bun"
-            chmod +x "$BUN_INSTALL/bin/bun"
-            bun_bin="$BUN_INSTALL/bin/bun"
-          fi
-
-          rm -f "$archive"
           if [ -z "$bun_bin" ]; then
             echo "::error::no bun available on this runner"
             exit 1
           fi
-          echo "$BUN_INSTALL/bin" >> "$GITHUB_PATH"
+          case ":$PATH:" in
+            *":$(dirname "$bun_bin"):"*) ;;
+            *) echo "$(dirname "$bun_bin")" >> "$GITHUB_PATH" ;;
+          esac
           "$bun_bin" --version
-          echo "bun resolved at $bun_bin"
+          printf 'bun resolved at %s\n' "$bun_bin"
 
       - name: bun install --frozen-lockfile
         env:
