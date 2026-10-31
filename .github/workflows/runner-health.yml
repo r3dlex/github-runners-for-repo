@@ -7,16 +7,29 @@ on:
 
 permissions:
   contents: read
-
-# Bounds the whole run, including time spent queued for a runner. A tier with
-# no available runner leaves its job queued; this turns that into a bounded
-# failure instead of an indefinite hang. cancel-in-progress stays false so a
-# starved tier reports the timeout rather than a confusing "cancelled".
-timeout-minutes: 30
+  actions: read
 
 concurrency:
-  group: runner-health
-  cancel-in-progress: false
+  # `cancel-in-progress: true` is deliberate, not incidental.
+  #
+  # A tier whose label pool has no available runner leaves its job `queued`
+  # INDEFINITELY: GitHub has no workflow-level timeout, and a job-level
+  # `timeout-minutes` clock starts when the job starts RUNNING, not when it is
+  # queued. Measured 2026-10-31 on this fleet: a probe job with
+  # `timeout-minutes: 2` was still `queued` four minutes after it was
+  # created, and a starved heartbeat job was still `queued` twenty minutes
+  # later.
+  #
+  # With `cancel-in-progress: false` such a stuck run holds this concurrency
+  # group forever, so every later run sits in `pending` and never starts. The
+  # probe would go silent exactly when the fleet is broken - the opposite of
+  # what it is for. Cancelling the previous run keeps the probe alive; the
+  # cancelled job is still recorded, and the watchdog below reads that record.
+  #
+  # The group is scoped by ref so a branch run can never cancel the scheduled
+  # run on the default branch.
+  group: runner-health-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   heartbeat:
@@ -99,3 +112,135 @@ jobs:
             echo "::error::less than 1GiB free on the runner work volume"
             exit 1
           fi
+
+      - name: Runner inventory (informational)
+        # Best effort only. Whether these endpoints are readable with the
+        # workflow's own token depends on the installation's permissions, so
+        # this step reports what it can and never fails the build.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ORG: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          const token = process.env.GITHUB_TOKEN;
+          const repo = process.env.GITHUB_REPOSITORY;
+          const org = process.env.ORG;
+          async function tryList(label, url) {
+            try {
+              const response = await fetch(`https://api.github.com${url}`, {
+                headers: {
+                  authorization: `Bearer ${token}`,
+                  accept: "application/vnd.github+json",
+                  "x-github-api-version": "2022-11-28",
+                },
+              });
+              if (!response.ok) {
+                console.log(`${label}: HTTP ${response.status} (not readable with this token)`);
+                return;
+              }
+              const body = await response.json();
+              const runners = body.runners || [];
+              console.log(`${label}: ${runners.length} runner(s)`);
+              for (const runner of runners) {
+                const labels = (runner.labels || []).map((l) => l.name).sort().join(",");
+                console.log(`  - ${runner.name}: ${runner.status}${runner.busy ? " busy" : ""} [${labels}]`);
+              }
+            } catch (error) {
+              console.log(`${label}: error ${error.message}`);
+            }
+          }
+          await tryList("repository runners", `/repos/${repo}/actions/runners?per_page=100`);
+          await tryList("organization runners", `/orgs/${org}/actions/runners?per_page=100`);
+          NODE
+
+      - name: No tier is starved
+        # A starved tier cannot report on itself: its job never starts. The
+        # legs that DID get a runner therefore inspect the previous run of this
+        # workflow and report any tier whose job never picked up a runner.
+        #
+        # "Never picked up a runner" is `runner_name` empty and `steps` empty.
+        # That is the reliable signal, because a queued job may later be
+        # cancelled (by the next run's cancel-in-progress) and a cancelled job
+        # is a `completed` job - but one that never ran a single step.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          HEARTBEAT_TIERS: mac-arm64-primary,linux-arm64-standard,linux-x64
+          WORKFLOW_FILE: runner-health.yml
+          WORKFLOW_PATH: .github/workflows/runner-health.yml
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          const repo = process.env.GITHUB_REPOSITORY;
+          const token = process.env.GITHUB_TOKEN;
+          const runId = Number(process.env.GITHUB_RUN_ID);
+          const tiers = (process.env.HEARTBEAT_TIERS || "").split(",").filter(Boolean);
+          const path = process.env.WORKFLOW_PATH;
+          // A job is only judged once it is old enough that a brief queue delay
+          // cannot be mistaken for a starved pool.
+          const GRACE_MS = 60000;
+
+          async function api(url) {
+            const response = await fetch(`https://api.github.com${url}`, {
+              headers: {
+                authorization: `Bearer ${token}`,
+                accept: "application/vnd.github+json",
+                "x-github-api-version": "2022-11-28",
+              },
+            });
+            if (!response.ok) throw new Error(`GitHub API ${response.status} for ${url}`);
+            return response.json();
+          }
+
+          // Prefer the workflow-scoped endpoint; fall back to the run list when
+          // the workflow is not on the default branch yet.
+          let runs = [];
+          try {
+            const scoped = await api(`/repos/${repo}/actions/workflows/${process.env.WORKFLOW_FILE}/runs?per_page=20`);
+            runs = scoped.workflow_runs.filter((run) => run.id !== runId);
+          } catch (scopedError) {
+            console.log(`Scoped run list unavailable (${scopedError.message}); using the repository run list.`);
+            const all = await api(`/repos/${repo}/actions/runs?per_page=100`);
+            runs = all.workflow_runs.filter((run) => run.path === path && run.id !== runId);
+          }
+          if (runs.length === 0) {
+            console.log("No earlier run of this workflow yet; starvation check skipped.");
+            process.exit(0);
+          }
+
+          const problems = [];
+          for (const tier of tiers) {
+            let verdict = null;
+            for (const run of runs) {
+              const { jobs } = await api(`/repos/${repo}/actions/runs/${run.id}/jobs?per_page=50`);
+              const job = jobs.find((entry) => entry.name === `heartbeat (${tier})`);
+              if (!job) continue;
+              if (Date.now() - new Date(job.created_at).getTime() < GRACE_MS) continue;
+              // "Never picked up a runner" is `runner_name` empty and `steps`
+              // empty - no runner was ever assigned and no step ever ran.
+              // `started_at` is NOT that signal: GitHub stamps a queued job
+              // with `started_at == created_at`, and stamps a job cancelled
+              // while queued with the same value. Measured 2026-10-31.
+              const neverRan = !job.runner_name || !job.steps || job.steps.length === 0;
+              if (neverRan) {
+                verdict = "STARVED (no runner ever picked the job up)";
+              } else if (job.status === "completed") {
+                verdict = job.conclusion === "success" ? "healthy" : `failed (${job.conclusion})`;
+              } else {
+                verdict = "running";
+              }
+              break;
+            }
+            const label = verdict ?? "no evidence";
+            console.log(`tier ${tier}: ${label}`);
+            if (verdict && verdict !== "healthy" && verdict !== "running") problems.push(`${tier}: ${label}`);
+          }
+          if (problems.length > 0) {
+            console.error(`::error::Tier health problems: ${problems.join("; ")}`);
+            process.exit(1);
+          }
+          console.log("All tiers healthy.");
+          NODE
