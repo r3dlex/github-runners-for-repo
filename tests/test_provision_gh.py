@@ -421,6 +421,30 @@ def _privilege_stub(env: dict[str, str], name: str, body: str, log_name: str) ->
     env[f"STUB_{name.upper()}_LOG"] = str(stub_dir.parent / log_name)
 
 
+def _mv_stub(env: dict[str, str]) -> None:
+    """Put an `mv` stub into the sandbox.
+
+    The .path file of a runner home has to be replaced with a rename,
+    and the call is what the test asserts on.
+    """
+    stub_dir = Path(env["STUB_DIR"])
+    real_mv = shutil.which("mv", path=os.environ.get("PATH", ""))
+    assert real_mv is not None, "the sandbox needs mv and this host does not have it"
+    path = stub_dir / "mv"
+    path.write_text(MV_STUB.format(real_mv=real_mv))
+    path.chmod(0o755)
+    env["STUB_MV_LOG"] = str(stub_dir.parent / "mv-calls.log")
+
+
+def _brew_stub(env: dict[str, str]) -> None:
+    """Put a `brew` stub into the sandbox."""
+    stub_dir = Path(env["STUB_DIR"])
+    path = stub_dir / "brew"
+    path.write_text(BREW_STUB)
+    path.chmod(0o755)
+    env["STUB_BREW_LOG"] = str(stub_dir.parent / "brew-calls.log")
+
+
 def _without_sudo(env: dict[str, str]) -> None:
     """Take sudo out of the sandbox.
 
@@ -541,6 +565,33 @@ exec "${args[@]}"
 """
 
 
+# A `setpriv` stub for a host where the switch itself does not work: the
+# account cannot be changed at all. The script has to tell that apart
+# from a command that ran and failed.
+SETPRIV_STUB_THAT_CANNOT_SWITCH = """#!/usr/bin/env bash
+printf 'setpriv %s\\n' "$*" >> "$STUB_SETPRIV_LOG"
+printf 'setpriv: failed to set uid\\n' >&2
+exit 1
+"""
+
+
+# An `mv` stub: it records the call and then does it. The .path file of
+# a runner home has to be REPLACED with a rename, and the call itself is
+# what the test asserts on.
+MV_STUB = """#!/usr/bin/env bash
+printf 'mv %s\\n' "$*" >> "$STUB_MV_LOG"
+exec "{real_mv}" "$@"
+"""
+
+
+# A `brew` stub: it records the call. Homebrew refuses to run as root,
+# so the provisioning has to install as the tool user.
+BREW_STUB = """#!/usr/bin/env bash
+printf 'brew %s\\n' "$*" >> "$STUB_BREW_LOG"
+exit 0
+"""
+
+
 # A `runuser` stub, the second way root drops to another account
 # without sudo.
 RUNUSER_STUB = """#!/usr/bin/env bash
@@ -626,6 +677,7 @@ def _node_sandbox(tmp_path: Path, *, as_root: bool, with_sudo: bool) -> dict[str
     _stub("curl", CURL_PIPE_STUB)
     _stub("apt-get", NOOP_STUB)
     _stub("npm", NOOP_STUB)
+    _stub("chown", CHOWN_STUB)
     if as_root:
         _stub("id", _id_stub())
     if with_sudo:
@@ -640,6 +692,7 @@ def _node_sandbox(tmp_path: Path, *, as_root: bool, with_sudo: bool) -> dict[str
             "HOME": str(tmp_path / "home"),
             "NPM_PREFIX": str(tmp_path / "npm-prefix"),
             "STUB_SUDO_LOG": str(tmp_path / "sudo-calls.log"),
+            "STUB_CHOWN_LOG": str(tmp_path / "chown-calls.log"),
             "STUB_DIR": str(stub_dir),
         }
     )
@@ -647,7 +700,7 @@ def _node_sandbox(tmp_path: Path, *, as_root: bool, with_sudo: bool) -> dict[str
     (tmp_path / "home").mkdir(exist_ok=True)
     _assert_sandbox_shape(
         env,
-        stubbed=("curl", "apt-get", "npm"),
+        stubbed=("curl", "apt-get", "npm", "chown"),
         absent=("node", "gh", "uv", "python3"),
     )
     return env
@@ -1498,6 +1551,45 @@ class TestRunnerUserCheck:
         assert "gh: command not found" in result.stdout
 
 
+# A `stat` stub that reports a chosen owner, group and mode for ONE
+# path, and the runner user for the runner homes.
+#
+# The sandbox cannot change the owner of a file: a directory the test
+# creates belongs to the test user whatever the script does to it. The
+# stub is what lets a test say "this directory belongs to the runner
+# user" — the state that makes the bypass live.
+def _stat_stub_with_dir(env: dict[str, str], path: str, owner: str, group: str, mode: str) -> None:
+    real_stat = shutil.which("stat", path=os.environ.get("PATH", ""))
+    assert real_stat is not None, "the sandbox needs stat and this host does not have it"
+    body = f"""#!/usr/bin/env bash
+format=""
+for arg in "$@"; do
+  case "$arg" in
+    %*) format="$arg" ;;
+  esac
+done
+target="${{@: -1}}"
+if [ "$target" = "{path}" ]; then
+  case "$format" in
+    %a) printf '%s\\n' "{mode}" ;;
+    %U) printf '%s\\n' "{owner}" ;;
+    %G) printf '%s\\n' "{group}" ;;
+  esac
+  exit 0
+fi
+case "$target" in
+  *actions-runner*)
+    printf '%s\\n' "$STUB_RUNNER_OWNER"
+    exit 0
+    ;;
+esac
+exec "{real_stat}" "$@"
+"""
+    stub = Path(env["STUB_DIR"]) / "stat"
+    stub.write_text(body)
+    stub.chmod(0o755)
+
+
 class TestInstallOwnership:
     """The host-wide binary belongs to root, never to a job user.
 
@@ -1556,6 +1648,175 @@ class TestInstallOwnership:
         assert "could not set the owner" in result.stdout
 
 
+class TestGhInstallDirProtection:
+    """The dir that holds the host-wide gh is out of the runner user's reach.
+
+    unlink(2) and rename(2) are governed by the write permission on the
+    CONTAINING DIRECTORY, not by the owner or the mode of the file
+    inside it. A root-owned /usr/local/bin/gh inside a runner-owned
+    /usr/local/bin can be deleted and replaced by the runner user — and
+    the runner user is the identity that runs whatever a pull request
+    asks for — so the next job that calls `gh api` runs the attacker's
+    code with the job's own GITHUB_TOKEN.
+    """
+
+    def _gh_dir(self, env: dict[str, str]) -> Path:
+        return Path(env["GH_INSTALL_PATH"]).parent
+
+    def _chown_calls(self, env: dict[str, str]) -> list[str]:
+        log = Path(env["STUB_CHOWN_LOG"])
+        if not log.exists():
+            return []
+        return [line for line in log.read_text().splitlines() if line]
+
+    def test_the_repair_asks_for_root_to_own_the_dir_that_holds_the_gh(
+        self, tmp_path: Path
+    ) -> None:
+        """The owner of the inode does not protect the name.
+
+        The binary is chowned to root:root, but a runner-owned directory
+        around it still lets the runner user delete the gh and put
+        their own binary in its place.
+        """
+        env = _sandbox(tmp_path)
+        gh_dir = self._gh_dir(env)
+        gh_dir.mkdir(parents=True)
+        _fake_gh(Path(env["GH_INSTALL_PATH"]), VERSION)
+
+        result = _run(_install_script(env), env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        calls = self._chown_calls(env)
+        assert f"chown root:root {gh_dir}" in calls, (
+            f"the dir that holds the gh has to belong to root, recorded: {calls}"
+        )
+
+    def test_the_repair_removes_the_group_and_other_write_bits_from_that_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """The dir must not be writable by anyone but root.
+
+        This one is checked on the real filesystem: the mode of the
+        directory is what the kernel looks at, and a stub cannot prove
+        it.
+        """
+        env = _sandbox(tmp_path)
+        gh_dir = self._gh_dir(env)
+        gh_dir.mkdir(parents=True)
+        gh_dir.chmod(0o777)
+        _fake_gh(Path(env["GH_INSTALL_PATH"]), VERSION)
+
+        result = _run(_install_script(env), env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        mode = stat.S_IMODE(gh_dir.stat().st_mode)
+        assert not mode & 0o022, (
+            f"the dir that holds the gh must not be group or other writable: {oct(mode)}"
+        )
+
+    def test_a_dir_the_runner_user_can_write_is_refused(self, tmp_path: Path) -> None:
+        """The check that keeps the gh out of the runner user's reach.
+
+        The runner user owns the dir and the dir is owner writable: that
+        user can delete the gh inside it, whatever the owner of the gh
+        itself is.
+        """
+        env = _sandbox(tmp_path)
+        gh_dir = self._gh_dir(env)
+        gh_dir.mkdir(parents=True)
+        _root_host_with_runner_home(tmp_path, env, "alice")
+        _stat_stub_with_dir(env, str(gh_dir), "alice", "staff", "755")
+        script = f'source "{SCRIPT}"; assert_gh_install_dir_protected'
+
+        result = _run(script, env)
+
+        assert result.returncode != 0, "a dir the runner user can write must be refused"
+        assert "is writable by the runner user alice" in result.stdout
+
+    def test_a_group_writable_dir_is_refused(self, tmp_path: Path) -> None:
+        """A group that can write the dir can replace the gh in it."""
+        env = _sandbox(tmp_path)
+        gh_dir = self._gh_dir(env)
+        gh_dir.mkdir(parents=True)
+        gh_dir.chmod(0o775)
+        _root_host_with_runner_home(tmp_path, env, "alice")
+        script = f'source "{SCRIPT}"; assert_gh_install_dir_protected'
+
+        result = _run(script, env)
+
+        assert result.returncode != 0, "a group writable dir must be refused"
+        assert "is group writable" in result.stdout
+
+    def test_a_dir_the_runner_user_cannot_write_is_accepted(self, tmp_path: Path) -> None:
+        """The check passes for a dir the runner user cannot write."""
+        env = _sandbox(tmp_path)
+        gh_dir = self._gh_dir(env)
+        gh_dir.mkdir(parents=True)
+        gh_dir.chmod(0o755)
+        _root_host_with_runner_home(tmp_path, env, "alice")
+        script = f'source "{SCRIPT}"; assert_gh_install_dir_protected'
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "not writable by the runner user" in result.stdout
+
+    def test_the_npm_prefix_never_chowns_the_dir_that_holds_the_gh(self, tmp_path: Path) -> None:
+        """The regression: the prefix used to be chowned to the runner user.
+
+        The prefix's bin dir is made writable by the runner user — that
+        is what makes `npm install -g` work as that user. With the
+        shipped defaults the prefix was /usr/local, so that made
+        /usr/local/bin — the dir that holds the host-wide GitHub CLI —
+        writable by the runner user. The owner of the gh protects the
+        file; the owner of the dir protects the name, and the name is
+        what a job replaces.
+        """
+        env = _node_sandbox(tmp_path, as_root=True, with_sudo=False)
+        prefix = Path(env["NPM_PREFIX"])
+        gh_dir = prefix / "bin"
+        gh_dir.mkdir(parents=True)
+        env["GH_INSTALL_PATH"] = str(gh_dir / "gh")
+
+        result = _run(f'source "{SCRIPT}"; ensure_node_linux', env)
+
+        assert result.returncode != 0, (
+            "a prefix that shares its bin dir with the gh must be refused"
+        )
+        assert "holds the host-wide GitHub CLI" in result.stdout
+        calls = self._chown_calls(env)
+        for call in calls:
+            assert str(gh_dir) not in call, (
+                f"the dir that holds the gh must never be chowned: {calls}"
+            )
+
+    def test_the_npm_prefix_is_in_the_tool_home_and_on_the_runner_path(
+        self, tmp_path: Path
+    ) -> None:
+        """The prefix is a dir of the tool user's own home.
+
+        The prefix's bin dir has to be writable by the runner user, so
+        it must not be a dir that is shared with the host-wide binaries.
+        """
+        env = _node_sandbox(tmp_path, as_root=True, with_sudo=False)
+        env.pop("NPM_PREFIX", None)
+        script = (
+            f'source "{SCRIPT}"; resolve_tool_dirs; '
+            'printf "%s\\n%s\\n%s\\n" "$TOOL_USER" "$NPM_PREFIX" "$TOOL_PATH"'
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stderr
+        _tool_user, prefix, tool_path = result.stdout.split("\n")[:3]
+        assert prefix == str(Path(env["HOME"]) / ".npm"), (
+            f"the npm prefix belongs to the tool user, got {prefix}"
+        )
+        assert f"{prefix}/bin" in tool_path, (
+            f"the prefix's bin dir has to be on the runner PATH, got {tool_path}"
+        )
+
+
 class TestRootOwnedRunnerHome:
     """A runner home owned by root is not a runner user.
 
@@ -1563,7 +1824,13 @@ class TestRootOwnedRunnerHome:
     a binary the runner user cannot execute — and reports success.
     """
 
-    def test_a_root_owned_runner_home_is_refused(self, tmp_path: Path) -> None:
+    def test_a_root_owned_runner_home_is_skipped(self, tmp_path: Path) -> None:
+        """The home is skipped, the same way runner_user skips it.
+
+        The two have to agree: one of them said the host has a runner
+        user and the other said it does not, and the check has to say
+        out loud that it verified nothing as a runner user.
+        """
         env = _sandbox(tmp_path)
         _root_host_with_runner_home(tmp_path, env, "root")
         _sudo_stub(env)
@@ -1572,9 +1839,37 @@ class TestRootOwnedRunnerHome:
 
         result = _run(script, env)
 
-        assert result.returncode != 0, "a root-owned runner home must not verify"
-        assert "the runner home is owned by root" in result.stdout
-        assert "verified:" not in result.stdout, "nothing may be reported as verified"
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "owned by root" in result.stdout
+        assert "that home was skipped" in result.stdout
+        assert "the runner user check did not run" in result.stdout, (
+            "the check has to say that it did not verify the runner user"
+        )
+        log = Path(env["STUB_SUDO_LOG"])
+        calls = log.read_text().splitlines() if log.exists() else []
+        assert not any("-u root" in call for call in calls), (
+            f"the check must not run as root: {calls}"
+        )
+
+    def test_a_root_owned_runner_home_still_needs_a_gh_every_user_can_run(
+        self, tmp_path: Path
+    ) -> None:
+        """Skipping the root-owned home does not skip the check.
+
+        With no runner user left to check, the install is verified the
+        other way round: the gh has to be executable by EVERY user on
+        the host, because every job on the host runs it.
+        """
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, "root")
+        _sudo_stub(env)
+        _gh_stub(env, mode=0o700)
+        script = _verify_script(env)
+
+        result = _run(script, env)
+
+        assert result.returncode != 0, "a gh no user can run must fail the check"
+        assert "not executable by every user" in result.stdout
 
     def test_a_root_owned_runner_home_is_not_a_runner_user(self, tmp_path: Path) -> None:
         env = _sandbox(tmp_path)
@@ -1928,6 +2223,151 @@ class TestToolDirs:
         assert result.returncode == 0, result.stdout + result.stderr
         contents = path_file.read_text()
         assert ".local/bin" in contents, f"the tool dirs are missing: {contents}"
+
+
+class TestRunnerPathFile:
+    """The .path file of a runner home is replaced with a rename, as the
+    runner user, in the format the runner reads.
+
+    The runner reads the file when it starts a job: a half-written file
+    breaks the next job, and a root-owned one breaks it as well. The
+    disk-cleanup installer has always written it that way — one PATH
+    entry per line, written as the runner user and renamed into place —
+    and the provisioning has to write the same thing, or the two
+    disagree about the file they both own.
+    """
+
+    def test_the_path_file_is_replaced_with_a_rename_as_the_runner_user(
+        self, tmp_path: Path
+    ) -> None:
+        env = _sandbox(tmp_path)
+        runner_home = _root_host_with_runner_home(tmp_path, env, _current_user())
+        path_file = runner_home / ".path"
+        path_file.write_text("/usr/local/bin\n")
+        _privilege_stub(env, "setpriv", SETPRIV_STUB, "setpriv-calls.log")
+        _mv_stub(env)
+        script = f'source "{SCRIPT}"; resolve_tool_dirs; ensure_user_path_in_runner'
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        mv_calls = Path(env["STUB_MV_LOG"]).read_text().splitlines()
+        assert any("mv -f --" in call and str(path_file) in call for call in mv_calls), (
+            f"the path file was not replaced with a rename: {mv_calls}"
+        )
+        setpriv_calls = Path(env["STUB_SETPRIV_LOG"]).read_text().splitlines()
+        assert any(f"--reuid={_current_user()}" in call for call in setpriv_calls), (
+            f"the path file was not written as the runner user: {setpriv_calls}"
+        )
+
+    def test_the_path_file_holds_one_entry_per_line(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        runner_home = _root_host_with_runner_home(tmp_path, env, _current_user())
+        path_file = runner_home / ".path"
+        path_file.write_text("/usr/local/bin\n")
+        script = f'source "{SCRIPT}"; resolve_tool_dirs; ensure_user_path_in_runner'
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        lines = path_file.read_text().splitlines()
+        assert lines, "the path file is empty"
+        assert not any(":" in line for line in lines), (
+            f"the path file has to hold one PATH entry per line: {lines}"
+        )
+        assert lines[-1] == "/usr/local/bin", (
+            f"the entries that were there have to survive: {lines}"
+        )
+
+
+class TestAsUserContract:
+    """as_user has to tell a failed SWITCH from a failed COMMAND.
+
+    They are different failures: a failed switch means the check never
+    ran as the runner user, so the operator has to know that the check
+    proved nothing; a failed command means the thing the check was about
+    is broken. Reporting the command's own status for a failed switch
+    turned "the check could not run" into "the runner user cannot run
+    gh", which sends the operator after the wrong thing.
+    """
+
+    def test_a_failed_user_switch_is_reported_as_two(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, "alice")
+        _privilege_stub(env, "setpriv", SETPRIV_STUB_THAT_CANNOT_SWITCH, "setpriv-calls.log")
+        script = f'source "{SCRIPT}"; status=0; as_user alice sh -c "exit 1" || status=$?; printf "status=%s\\n" "$status"'
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "status=2" in result.stdout, (
+            f"a failed user switch has to be reported as 2: {result.stdout}"
+        )
+
+    def test_a_failed_command_keeps_its_own_status(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, "alice")
+        _privilege_stub(env, "setpriv", SETPRIV_STUB, "setpriv-calls.log")
+        script = f'source "{SCRIPT}"; status=0; as_user alice sh -c "exit 1" || status=$?; printf "status=%s\\n" "$status"'
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "status=1" in result.stdout, (
+            f"a failed command has to keep its own status: {result.stdout}"
+        )
+
+
+class TestHomebrew:
+    """Homebrew is a macOS thing.
+
+    On Linux the prefix function answered /usr/local, which put the
+    host's own binary directory on the runner PATH — where it does not
+    belong — and the Homebrew installs ran as root, which Homebrew
+    refuses to do, so the documented root flow aborted on macOS.
+    """
+
+    def test_the_homebrew_prefix_is_not_consulted_on_linux(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        script = (
+            f'source "{SCRIPT}"; uname_s=Linux; '
+            'if homebrew_prefix >/dev/null; then printf "prefix\\n"; else printf "none\\n"; fi'
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip() == "none", (
+            f"the Homebrew prefix must not be consulted on Linux: {result.stdout}"
+        )
+
+    def test_the_github_cli_is_installed_as_the_tool_user(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, _current_user())
+        _privilege_stub(env, "setpriv", SETPRIV_STUB, "setpriv-calls.log")
+        _brew_stub(env)
+        # The Homebrew prefix is pinned to a directory of the sandbox: the
+        # host's own /opt/homebrew would otherwise end up in front of the
+        # stub and the test would run the real Homebrew.
+        prefix = tmp_path / "homebrew"
+        (prefix / "bin").mkdir(parents=True)
+        script = (
+            f'source "{SCRIPT}"; homebrew_prefix() {{ printf "{prefix}"; }}; '
+            "uname_s=Darwin; resolve_tool_dirs; ensure_gh_macos"
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        brew_log = Path(env["STUB_BREW_LOG"])
+        brew_calls = brew_log.read_text().splitlines() if brew_log.exists() else []
+        assert any("install gh" in call for call in brew_calls), (
+            f"the GitHub CLI was not installed with Homebrew: {brew_calls} {result.stdout}"
+        )
+        setpriv_calls = Path(env["STUB_SETPRIV_LOG"]).read_text().splitlines()
+        assert any("brew install gh" in call for call in setpriv_calls), (
+            f"Homebrew did not run as the tool user: {setpriv_calls}"
+        )
 
 
 class TestRecordedDigests:

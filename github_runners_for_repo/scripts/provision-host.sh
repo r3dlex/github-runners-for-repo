@@ -24,17 +24,21 @@
 # root's home holds no runner directory. It is the owner of the runner
 # home, and the runner home is named by the RUNNER_HOMES knob with
 # ABSOLUTE paths (the same knob install-disk-cleanup.sh uses). A runner
-# home owned by root is REFUSED: a check that ran as root would pass for
-# a binary the runner user cannot run. When no runner home exists at all
-# the provisioning says so loudly and verifies the install the other way
-# round — the binary has to be executable by EVERY user on the host,
-# because every job on the host runs it.
+# home owned by root is SKIPPED: root is not a runner user and a check
+# that ran as root would pass for a binary the runner user cannot run.
+# When no runner home other than a root-owned one exists the provisioning
+# says so loudly and verifies the install the other way round — the
+# binary has to be executable by EVERY user on the host, because every
+# job on the host runs it.
 #
 # What it ensures:
 #   - Node.js + npm (Linux: NodeSource; macOS: Homebrew)
 #   - An npm global prefix the runner user can write to (Linux only — the
 #     default /usr prefix is root-owned and breaks `npm install -g` with
-#     EACCES for the non-root runner user)
+#     EACCES for the non-root runner user). The prefix lives in the runner
+#     user's own home: its bin directory has to be writable by the runner
+#     user, and a shared /usr/local/bin would let a job replace the
+#     host-wide GitHub CLI that lives next to it.
 #   - pip + pipx (for Python tooling installed globally on the host)
 #   - The GitHub CLI (gh). The GitHub-hosted images ship it pre-installed;
 #     a bare self-hosted host does not, so a workflow that calls `gh api`
@@ -66,7 +70,22 @@
 set -euo pipefail
 
 NODE_MAJOR="${NODE_MAJOR:-22}"
-NPM_PREFIX="${NPM_PREFIX:-/usr/local}"
+# The npm prefix: where `npm install -g` puts its packages.
+#
+# It is NOT /usr/local. The bin dir of the prefix has to be writable by
+# the runner user — that is what makes `npm install -g` work as that
+# user — and /usr/local/bin also holds the host-wide GitHub CLI.
+# unlink(2) and rename(2) are governed by the write permission on the
+# CONTAINING DIRECTORY, not by the owner or the mode of the file inside
+# it: a runner-writable /usr/local/bin lets the runner user delete
+# /usr/local/bin/gh and replace it with anything at all, and the next
+# job that calls `gh api` then runs the attacker's code with the job's
+# own GITHUB_TOKEN.
+#
+# The prefix therefore defaults to a directory of the runner user's own
+# home, and its bin dir is put on the runner PATH. Set NPM_PREFIX to
+# move it; a prefix whose bin dir holds the GitHub CLI is refused.
+NPM_PREFIX="${NPM_PREFIX:-}"
 ARCHGATE_VERSION="${ARCHGATE_VERSION:-v0.60.0}"
 # Where the GitHub CLI is installed and which release is installed. The
 # release is PINNED: the sha256 of the asset is recorded in this file and
@@ -237,7 +256,12 @@ TOOL_PATH=""
 
 # The Homebrew prefix on this host: /opt/homebrew on Apple silicon,
 # /usr/local on Intel. Empty when Homebrew is not installed.
+#
+# Homebrew is a macOS thing. On Linux the function would answer
+# /usr/local and put the host's own binary directory on the runner
+# PATH, where it does not belong.
 homebrew_prefix() {
+  [ "$uname_s" = "Darwin" ] || return 1
   if [ -d /opt/homebrew/bin ]; then
     printf '/opt/homebrew'
     return 0
@@ -265,10 +289,18 @@ resolve_tool_dirs() {
       TOOL_HOME="$home"
     fi
   fi
+  # The npm prefix belongs to the tool user as well: `npm install -g`
+  # runs as that user, and the prefix is where it writes. It defaults
+  # to a directory of that user's own home so it can never be the
+  # directory that holds the host-wide GitHub CLI — see NPM_PREFIX.
+  if [ -z "$NPM_PREFIX" ]; then
+    NPM_PREFIX="$TOOL_HOME/.npm"
+  fi
   USER_BIN_DIRS=(
     "$TOOL_HOME/.local/bin"
     "$TOOL_HOME/.bun/bin"
     "$TOOL_HOME/.archgate/bin"
+    "$NPM_PREFIX/bin"
   )
   if prefix="$(homebrew_prefix)"; then
     USER_BIN_DIRS+=("$prefix/bin")
@@ -293,6 +325,23 @@ ensure_user_path_in_shell_rc() {
   done
 }
 
+# Whether a directory is already in the runner's .path file.
+#
+# The runner reads .path as a list of PATH entries, one per line, and
+# that is the format this script writes. An older write put several
+# directories on one colon-joined line, so the colon form is checked as
+# well — otherwise the entry would be added again on every single run.
+path_file_has() {
+  local path_file="$1" bin_dir="$2" content
+  grep -Fxq -- "$bin_dir" "$path_file" 2>/dev/null && return 0
+  content="$(cat "$path_file" 2>/dev/null || true)"
+  content="${content//$'\n'/:}"
+  case ":${content}:" in
+    *":${bin_dir}:"*) return 0 ;;
+  esac
+  return 1
+}
+
 ensure_user_path_in_runner() {
   # The actions-runner service uses the .path file in the runner dir to
   # set PATH. Prepend our user-local bin dirs so the service can find
@@ -315,15 +364,44 @@ ensure_user_path_in_runner() {
     local missing=()
     local d
     for d in "${USER_BIN_DIRS[@]}"; do
-      case ":${current}:" in
-        *":${d}:"*) ;;
-        *) missing+=("$d") ;;
-      esac
+      path_file_has "$path_file" "$d" || missing+=("$d")
     done
     if [ "${#missing[@]}" -gt 0 ]; then
-      local prepend
-      prepend="$(IFS=:; echo "${missing[*]}")"
-      printf '%s\n%s\n' "$prepend" "$current" > "$path_file"
+      local owner tmp_file content
+      owner="$(dir_owner "$runner_dir")"
+      if [ -z "$owner" ]; then
+        log "WARN: cannot determine the owner of $runner_dir; leaving $path_file untouched"
+        continue
+      fi
+      # One PATH entry per line — the format the runner reads and the
+      # format the disk-cleanup installer writes.
+      content=""
+      for d in "${missing[@]}"; do
+        content="${content}${d}"$'\n'
+      done
+      if [ -n "$current" ]; then
+        case "$current" in
+          *$'\n') content="${content}${current}" ;;
+          *) content="${content}${current}"$'\n' ;;
+        esac
+      fi
+      # The file is written as the owner of the runner home and moved
+      # into place. The runner reads the file when it starts a job: a
+      # half-written file breaks the next job, and a root-owned one
+      # breaks it as well.
+      tmp_file="$path_file.tmp.$$"
+      if ! as_user "$owner" sh -c 'printf "%s" "$1" > "$2"' sh "$content" "$tmp_file"; then
+        log "ERROR: could not write $tmp_file as $owner"
+        rm -f -- "$tmp_file" 2>/dev/null || true
+        continue
+      fi
+      # rename(2) within the same directory is atomic: the runner either
+      # sees the old file or the new one, never a half-written one.
+      if ! as_user "$owner" mv -f -- "$tmp_file" "$path_file"; then
+        log "ERROR: could not replace $path_file with $tmp_file"
+        rm -f -- "$tmp_file" 2>/dev/null || true
+        continue
+      fi
       log "updated $path_file (added $(IFS=,; echo "${missing[*]}"))"
     fi
   done < <(runner_home_dirs)
@@ -347,11 +425,26 @@ ensure_node_linux() {
   # user, and a prefix that belongs to root is a prefix nobody can write
   # to.
   resolve_tool_dirs
-  local user group
+  local user group npm_bin
   user="$TOOL_USER"
   group="$(id -gn "$user" 2>/dev/null || id -gn)"
-  run_privileged mkdir -p "${NPM_PREFIX}/lib/node_modules" "${NPM_PREFIX}/bin"
-  run_privileged chown -R "${user}:${group}" "${NPM_PREFIX}/lib/node_modules" "${NPM_PREFIX}/bin"
+  npm_bin="${NPM_PREFIX}/bin"
+  # The bin dir of the prefix is made writable by the runner user, so
+  # that `npm install -g` works as that user. That is only safe when the
+  # dir does not also hold a host-wide binary: the write permission on
+  # the CONTAINING DIRECTORY is what decides whether the gh inside it can
+  # be deleted and replaced. A prefix that shares its bin dir with the
+  # GitHub CLI is refused instead of silently handing the gh to the
+  # runner user.
+  if dir_holds_the_gh "$npm_bin"; then
+    log "ERROR: the npm prefix $NPM_PREFIX puts its binaries in $npm_bin"
+    log "ERROR: that directory holds the host-wide GitHub CLI ($GH_INSTALL_PATH)"
+    log "ERROR: making it writable by $user would let a job replace the gh"
+    log "ERROR: set NPM_PREFIX to a directory that is not shared with the host binaries"
+    exit 1
+  fi
+  run_privileged mkdir -p "${NPM_PREFIX}/lib/node_modules" "$npm_bin"
+  run_privileged chown -R "${user}:${group}" "${NPM_PREFIX}/lib/node_modules" "$npm_bin"
   as_tool_user npm config set prefix "${NPM_PREFIX}"
   log "npm global prefix set to ${NPM_PREFIX} (owned by ${user})"
 }
@@ -366,7 +459,9 @@ ensure_node_macos() {
     exit 1
   fi
   log "installing Node.js via Homebrew"
-  brew install node
+  # Homebrew refuses to run as root, so the documented root flow has to
+  # install as the tool user.
+  as_tool_user brew install node
 }
 
 ensure_pipx_linux() {
@@ -386,8 +481,8 @@ ensure_pipx_macos() {
   fi
   if command -v brew >/dev/null 2>&1; then
     log "installing pipx via Homebrew"
-    brew install pipx
-    pipx ensurepath >/dev/null 2>&1 || true
+    as_tool_user brew install pipx
+    as_tool_user pipx ensurepath >/dev/null 2>&1 || true
   else
     log "WARN: Homebrew not found; skipping pipx"
   fi
@@ -689,6 +784,45 @@ install_gh_release() {
   fi
 }
 
+# The directory that holds the host-wide GitHub CLI.
+#
+# It is the directory that decides whether the gh can be replaced: the
+# write permission on the CONTAINING DIRECTORY is what unlink(2) and
+# rename(2) look at, not the owner or the mode of the file inside it.
+gh_install_dir() {
+  local dir
+  dir="$(dirname "$GH_INSTALL_PATH")"
+  # The path is canonicalised so that it can be compared with another
+  # path: a symlinked /usr/local/bin and the /usr/local it points at
+  # are the same directory.
+  if [ -d "$dir" ]; then
+    (cd "$dir" 2>/dev/null && pwd -P) || printf '%s' "$dir"
+  else
+    printf '%s' "$dir"
+  fi
+}
+
+# Whether a directory holds the GitHub CLI, or holds the directory that
+# holds it.
+#
+# A directory that holds the gh must never be writable by the runner
+# user: that user could delete the gh and put their own binary in its
+# place. A directory that HOLDS the directory that holds the gh counts
+# for the same reason — renaming the directory that holds the gh is
+# enough.
+dir_holds_the_gh() {
+  local dir="$1" gh_dir
+  [ -n "$dir" ] || return 1
+  gh_dir="$(gh_install_dir)"
+  if [ "$dir" = "$gh_dir" ]; then
+    return 0
+  fi
+  if [ "${gh_dir#"$dir"/}" != "$gh_dir" ]; then
+    return 0
+  fi
+  return 1
+}
+
 # Repair the mode and the owner of an installed gh.
 #
 # A fresh install gets them from `install -m 0755`. A gh that is already
@@ -704,6 +838,12 @@ install_gh_release() {
 # something else, and the next job that calls `gh api` then runs the
 # attacker's code with its own GITHUB_TOKEN. Handing a host-wide binary
 # to the runner user is exactly the privilege the fleet does not grant.
+#
+# The DIRECTORY that holds the binary is repaired as well. unlink(2) and
+# rename(2) are governed by the write permission on the containing
+# directory, so a root-owned gh inside a runner-owned /usr/local/bin can
+# still be deleted and replaced by the runner user: the owner of the
+# inode protects the file, the owner of the directory protects the NAME.
 repair_gh_install() {
   if ! run_privileged chmod 0755 "$GH_INSTALL_PATH"; then
     log "ERROR: could not make $GH_INSTALL_PATH world executable"
@@ -712,6 +852,21 @@ repair_gh_install() {
   if ! run_privileged chown root:root "$GH_INSTALL_PATH"; then
     log "ERROR: could not set the owner of $GH_INSTALL_PATH to root:root"
     log "ERROR: $GH_INSTALL_PATH is a host-wide binary and must not belong to a job user"
+    return 1
+  fi
+  local gh_dir
+  gh_dir="$(gh_install_dir)"
+  if ! run_privileged chown root:root "$gh_dir"; then
+    log "ERROR: could not set the owner of $gh_dir to root:root"
+    log "ERROR: $gh_dir holds $GH_INSTALL_PATH and must not belong to a job user"
+    return 1
+  fi
+  # The group and the other write bits go: a directory that a group or
+  # every user on the host can write is a directory the gh can be
+  # replaced in.
+  if ! run_privileged chmod go-w "$gh_dir"; then
+    log "ERROR: could not remove the group and other write bits from $gh_dir"
+    log "ERROR: $gh_dir holds $GH_INSTALL_PATH and must not be writable by anyone but root"
     return 1
   fi
 }
@@ -816,7 +971,9 @@ ensure_gh_macos() {
     return
   fi
   log "installing the GitHub CLI via Homebrew"
-  brew install gh
+  # Homebrew refuses to run as root, so the documented root flow has to
+  # install as the tool user.
+  as_tool_user brew install gh
 }
 
 # The user-local tools are installed for the TOOL USER — the runner
@@ -877,13 +1034,21 @@ ensure_archgate() {
     previous_exit_trap="$(trap -p EXIT)"
     # shellcheck disable=SC2064
     trap "rm -rf '$tmpdir'" EXIT
-    as_tool_user bash -c '
+    if ! as_tool_user bash -c '
       set -e
       git clone --depth 1 --branch "$1" https://github.com/archgate/cli.git "$2/archgate" 2>&1 | tail -2
       cd "$2/archgate" && bun install >/dev/null
       mkdir -p "$3/.archgate/bin"
       bun build "$2/archgate/src/cli.ts" --compile --bytecode --outfile "$3/.archgate/bin/archgate"
-    ' _ "$ARCHGATE_VERSION" "$tmpdir" "$TOOL_HOME"
+    ' _ "$ARCHGATE_VERSION" "$tmpdir" "$TOOL_HOME"; then
+      # The build failed. The caller's trap has to be back in place
+      # before the script leaves, or the cleanup it registered never
+      # runs — `trap - EXIT` clears EVERY EXIT trap.
+      log "ERROR: could not build archgate $ARCHGATE_VERSION from source"
+      restore_exit_trap "$previous_exit_trap"
+      rm -rf "$tmpdir"
+      exit 1
+    fi
     log "archgate $("$TOOL_HOME/.archgate/bin/archgate" --version) installed to $TOOL_HOME/.archgate/bin/archgate"
     restore_exit_trap "$previous_exit_trap"
     rm -rf "$tmpdir"
@@ -931,13 +1096,50 @@ as_user() {
   fi
 
   if [ "$(id -u)" -eq 0 ]; then
+    # A pinned escalation command is honoured even for root: an operator
+    # who set $PROVISION_SUDO expects it to be the way the script
+    # reaches another account. The default is empty on a root host —
+    # root needs no escalation — and a command that is not a sudo
+    # cannot switch users at all, so only a real sudo is used here.
+    if [ -n "$PROVISION_SUDO" ] && is_sudo "$PROVISION_SUDO"; then
+      if [ "$NON_INTERACTIVE" = "1" ]; then
+        "$PROVISION_SUDO" -n -u "$user" -- "$@"
+      else
+        "$PROVISION_SUDO" -u "$user" -- "$@"
+      fi
+      return $?
+    fi
+    # Root needs NO escalation command at all: setpriv, runuser and su
+    # can all drop to another account. They are tried in that order and
+    # sudo comes last — a root host does not always have sudo
+    # installed, and requiring it would fail a perfectly good host over
+    # a missing helper.
+    #
+    # A failed SWITCH is reported as 2 and not as the status of the
+    # command: the command never ran, so its status says nothing about
+    # what happened, and the caller has to be able to tell the two
+    # apart.
+    #
+    # The probe that tells the two apart runs `env` and not `true`:
+    # `true` is a shell builtin, and a switch helper EXECs the command
+    # it was given, so a builtin is not something it can run.
+    local status=0
     if command -v setpriv >/dev/null 2>&1; then
-      setpriv --reuid="$user" --regid="$(id -g "$user")" --init-groups -- "$@"
-      return
+      setpriv --reuid="$user" --regid="$(id -g "$user")" --init-groups -- "$@" || status=$?
+      if [ "$status" != "0" ] &&
+        ! setpriv --reuid="$user" --regid="$(id -g "$user")" --init-groups -- env >/dev/null 2>&1; then
+        log "ERROR: could not switch to $user"
+        return 2
+      fi
+      return "$status"
     fi
     if command -v runuser >/dev/null 2>&1; then
-      runuser -u "$user" -- "$@"
-      return
+      runuser -u "$user" -- "$@" || status=$?
+      if [ "$status" != "0" ] && ! runuser -u "$user" -- env >/dev/null 2>&1; then
+        log "ERROR: could not switch to $user"
+        return 2
+      fi
+      return "$status"
     fi
     if command -v su >/dev/null 2>&1; then
       # su takes the command as ONE string, so the arguments are quoted
@@ -946,8 +1148,12 @@ as_user() {
       for arg in "$@"; do
         quoted="$quoted $(quote_for_shell "$arg")"
       done
-      su -s /bin/sh -c "exec$quoted" "$user"
-      return
+      su -s /bin/sh -c "exec$quoted" "$user" || status=$?
+      if [ "$status" != "0" ] && ! su -s /bin/sh -c "exec env" "$user" >/dev/null 2>&1; then
+        log "ERROR: could not switch to $user"
+        return 2
+      fi
+      return "$status"
     fi
   fi
 
@@ -1058,8 +1264,9 @@ runner_home_owners() {
 #
 # A runner home owned by root is NOT a runner user: root bypasses the
 # mode bits, so a check that ran as root would pass for a binary the
-# runner user cannot execute. Such a home is skipped here and refused
-# by the check that uses the owner.
+# runner user cannot execute. Such a home is skipped here, and the check
+# that uses the owner skips it too — it falls back to the
+# world-executable proof when no other runner home is left.
 runner_user() {
   local owner
   while IFS= read -r owner; do
@@ -1095,16 +1302,172 @@ user_home() {
 # nothing about the other users.
 world_executable() {
   local file="$1" mode other
-  mode="$(stat -c '%a' "$file" 2>/dev/null || true)"
-  if [ -z "$mode" ]; then
-    mode="$(stat -f '%Lp' "$file" 2>/dev/null || true)"
-  fi
+  mode="$(path_mode "$file")"
   [ -n "$mode" ] || return 1
   other="${mode: -1}"
   case "$other" in
     1 | 3 | 5 | 7) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# The mode of a path, in octal. GNU stat prints it with -c, BSD stat
+# with -f; the last three digits are the permission bits.
+path_mode() {
+  local mode
+  mode="$(stat -c '%a' "$1" 2>/dev/null || true)"
+  if [ -z "$mode" ]; then
+    mode="$(stat -f '%Lp' "$1" 2>/dev/null || true)"
+  fi
+  printf '%s' "$mode"
+}
+
+# The user that owns a path.
+path_owner() {
+  local owner
+  owner="$(stat -c '%U' "$1" 2>/dev/null || true)"
+  if [ -z "$owner" ]; then
+    owner="$(stat -f '%Su' "$1" 2>/dev/null || true)"
+  fi
+  printf '%s' "$owner"
+}
+
+# The group that owns a path.
+path_group() {
+  local group
+  group="$(stat -c '%G' "$1" 2>/dev/null || true)"
+  if [ -z "$group" ]; then
+    group="$(stat -f '%Sg' "$1" 2>/dev/null || true)"
+  fi
+  printf '%s' "$group"
+}
+
+# The owner of a directory. The same stat formats as path_owner, with a
+# name of its own so the intent reads at the call site.
+dir_owner() {
+  path_owner "$1"
+}
+
+# Whether a user is a member of a group.
+user_in_group() {
+  local user="$1" group="$2" groups g
+  [ -n "$user" ] || return 1
+  [ -n "$group" ] || return 1
+  groups="$(id -Gn "$user" 2>/dev/null || true)"
+  for g in $groups; do
+    if [ "$g" = "$group" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Whether a user can write to a path.
+#
+# The kernel decides it from the mode, the owner and the group: the
+# owner bits apply to the owner, the group bits to the members of the
+# group and the other bits to everybody else. The check is asked for
+# here rather than probed with a write, because a probe cannot answer
+# the question for a user the script cannot become.
+writable_by_user() {
+  local path="$1" user="$2" mode owner group bit
+  mode="$(path_mode "$path")"
+  [ -n "$mode" ] || return 1
+  mode="${mode: -3}"
+  owner="$(path_owner "$path")"
+  group="$(path_group "$path")"
+
+  # the other bits: every user on the host can write
+  bit="${mode:2:1}"
+  case "$bit" in
+    2 | 3 | 6 | 7) return 0 ;;
+  esac
+
+  # the group bits: the members of the group can write
+  bit="${mode:1:1}"
+  case "$bit" in
+    2 | 3 | 6 | 7)
+      if user_in_group "$user" "$group"; then
+        return 0
+      fi
+      ;;
+  esac
+
+  # the owner bits: the owner can write
+  bit="${mode:0:1}"
+  case "$bit" in
+    2 | 3 | 6 | 7)
+      if [ "$owner" = "$user" ]; then
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
+# Assert that the runner user cannot REPLACE the GitHub CLI.
+#
+# The binary is root-owned and world executable, and that is not enough:
+# unlink(2) and rename(2) are governed by the write permission on the
+# CONTAINING DIRECTORY, not by the owner or the mode of the file inside
+# it. A root-owned /usr/local/bin/gh inside a runner-owned /usr/local/bin
+# can be deleted and replaced by the runner user — and the runner user
+# is the identity that executes whatever a pull request asks for — so
+# the next job that calls `gh api` runs the attacker's code with the
+# job's own GITHUB_TOKEN.
+#
+# The invariant is therefore about the DIRECTORY that holds the gh:
+#   - the runner user must not be able to write to it, and
+#   - it must not be group or other writable.
+#
+# The check reads the mode, the owner and the group of that directory
+# instead of trying a write as the runner user: a write only answers
+# the question for the user the script can become, and the whole point
+# is the user it CANNOT become.
+assert_gh_install_dir_protected() {
+  local dir mode runner group_bit other_bit
+  dir="$(gh_install_dir)"
+  mode="$(path_mode "$dir")"
+  if [ -z "$mode" ]; then
+    log "ERROR: could not read the mode of $dir"
+    log "ERROR: the directory that holds $GH_INSTALL_PATH could not be checked"
+    return 1
+  fi
+  mode="${mode: -3}"
+
+  runner="$(runner_user || true)"
+  if [ -z "$runner" ]; then
+    log "WARN: no runner home found — the runner user check on $dir did not run"
+    log "WARN: set RUNNER_HOMES to the runner home(s) on this host to have it verified"
+  fi
+
+  # The group and the other bits first: a dir that a group or every
+  # user on the host can write is a dir the gh can be replaced in, no
+  # matter who the runner user is.
+  group_bit="${mode:1:1}"
+  other_bit="${mode:2:1}"
+  case "$group_bit" in
+    2 | 3 | 6 | 7)
+      log "ERROR: $dir is group writable"
+      log "ERROR: a member of the group could replace $GH_INSTALL_PATH"
+      return 1
+      ;;
+  esac
+  case "$other_bit" in
+    2 | 3 | 6 | 7)
+      log "ERROR: $dir is writable by every user on this host"
+      log "ERROR: any of them could replace $GH_INSTALL_PATH"
+      return 1
+      ;;
+  esac
+
+  if [ -n "$runner" ] && writable_by_user "$dir" "$runner"; then
+    log "ERROR: $dir is writable by the runner user $runner"
+    log "ERROR: that user could replace $GH_INSTALL_PATH with a binary of their own"
+    return 1
+  fi
+
+  log "verified: $dir is not writable by the runner user and not group or other writable"
 }
 
 # Assert that the runner user can really run gh. The binary is root-owned
@@ -1135,37 +1498,21 @@ verify_gh_runnable() {
       ;;
   esac
 
-  local owners user status
+  local owners user status checked=0
   owners="$(runner_home_owners)"
-  if [ -z "$owners" ]; then
-    # No runner home on this host: the runner user cannot be determined,
-    # so the check cannot run as that user. That is NOT a reason to
-    # fail a host that was just provisioned — the toolchain is there and
-    # the job PATH carries it. The install is verified the other way
-    # round instead: the binary has to be executable by EVERY user on
-    # the host, because every job on the host runs it.
-    log "WARN: no runner home found — the runner user check did not run"
-    log "WARN: set RUNNER_HOMES to the runner home(s) on this host to have it verified"
-    if [ ! -x "$GH_INSTALL_PATH" ]; then
-      log "ERROR: $GH_INSTALL_PATH is not there"
-      exit 1
-    fi
-    if ! world_executable "$GH_INSTALL_PATH"; then
-      log "ERROR: $GH_INSTALL_PATH is not executable by every user on this host"
-      log "ERROR: jobs that call 'gh api' would fail with 'gh: command not found'"
-      exit 1
-    fi
-    log "verified: $GH_INSTALL_PATH is executable by every user on this host"
-    return
-  fi
-
   while IFS= read -r user; do
     [ -n "$user" ] || continue
     if [ "$(id -u "$user" 2>/dev/null || true)" = "0" ]; then
-      log "ERROR: the runner home is owned by root ($user)"
-      log "ERROR: a check that runs as root passes for a gh the runner user cannot run"
-      exit 1
+      # A runner home owned by root is NOT a runner user: root bypasses
+      # the mode bits, so a check that runs as root passes for a binary
+      # the runner user cannot execute. The home is skipped here, the
+      # same way runner_user skips it — the two have to agree, or one
+      # of them says the host has a runner user and the other says it
+      # does not.
+      log "WARN: a runner home is owned by root ($user) — that home was skipped"
+      continue
     fi
+    checked=1
     if as_user "$user" env PATH="$DEFAULT_JOB_PATH" "$GH_INSTALL_PATH" --version >/dev/null 2>&1; then
       log "verified: $user can run gh at $GH_INSTALL_PATH"
     else
@@ -1180,6 +1527,28 @@ verify_gh_runnable() {
       exit 1
     fi
   done <<<"$owners"
+
+  if [ "$checked" = "0" ]; then
+    # No runner home on this host — or only one that belongs to root:
+    # the runner user cannot be determined, so the check cannot run as
+    # that user. That is NOT a reason to fail a host that was just
+    # provisioned — the toolchain is there and the job PATH carries it.
+    # The install is verified the other way round instead: the binary
+    # has to be executable by EVERY user on the host, because every job
+    # on the host runs it.
+    log "WARN: no runner home found — the runner user check did not run"
+    log "WARN: set RUNNER_HOMES to the runner home(s) on this host to have it verified"
+    if [ ! -x "$GH_INSTALL_PATH" ]; then
+      log "ERROR: $GH_INSTALL_PATH is not there"
+      exit 1
+    fi
+    if ! world_executable "$GH_INSTALL_PATH"; then
+      log "ERROR: $GH_INSTALL_PATH is not executable by every user on this host"
+      log "ERROR: jobs that call 'gh api' would fail with 'gh: command not found'"
+      exit 1
+    fi
+    log "verified: $GH_INSTALL_PATH is executable by every user on this host"
+  fi
 }
 
 # The gh on the default job PATH, if there is one. A tarball install
@@ -1217,6 +1586,7 @@ verify_gh_runnable_macos() {
     case ":${TOOL_PATH}:" in
       *":${prefix}/bin:"*)
         log "verified: the GitHub CLI is at $gh_path and $prefix/bin is on the runner PATH"
+        verify_gh_runs_as_the_runner_user "$gh_path"
         return
         ;;
     esac
@@ -1225,9 +1595,41 @@ verify_gh_runnable_macos() {
   # PATH is found by every job on the host, Homebrew or not.
   if job_gh="$(job_path_gh)"; then
     log "verified: the GitHub CLI is at $job_gh, on the default job PATH"
+    verify_gh_runs_as_the_runner_user "$job_gh"
     return
   fi
   log "ERROR: no GitHub CLI found — not at $gh_path and not on the default job PATH"
+  log "ERROR: jobs that call 'gh api' would fail with 'gh: command not found'"
+  exit 1
+}
+
+# Run the GitHub CLI as the runner user and say out loud what happened.
+#
+# A gh the runner user cannot execute dies in every job with "gh:
+# command not found" while the provisioning reports success, so the
+# check runs the binary as that user. The check cannot always run as
+# that user — a host without a way to switch accounts says so instead
+# of pretending that it verified something.
+verify_gh_runs_as_the_runner_user() {
+  local gh_path="$1" runner status=0
+  runner="$(runner_user || true)"
+  if [ -z "$runner" ]; then
+    log "WARN: no runner home found — the runner user check on $gh_path did not run"
+    return
+  fi
+  # The status is captured here and not after the if: the status of an
+  # if statement is the status of the branch that ran, and a condition
+  # that is false leaves it at zero.
+  as_user "$runner" "$gh_path" --version >/dev/null 2>&1 || status=$?
+  if [ "$status" = "0" ]; then
+    log "verified: $runner can run the GitHub CLI at $gh_path"
+    return
+  fi
+  if [ "$status" = "2" ]; then
+    log "WARN: could not verify that $runner can run $gh_path — the check could not run as $runner"
+    return
+  fi
+  log "ERROR: $runner cannot run the GitHub CLI at $gh_path"
   log "ERROR: jobs that call 'gh api' would fail with 'gh: command not found'"
   exit 1
 }
@@ -1245,6 +1647,9 @@ main() {
       ensure_node_linux
       ensure_pipx_linux
       ensure_gh_linux
+      # The gh has to be out of the reach of the runner user — not only
+      # the binary, the directory that holds it.
+      assert_gh_install_dir_protected || exit 1
       ;;
     Darwin)
       ensure_node_macos

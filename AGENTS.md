@@ -157,7 +157,8 @@ it; if a host rebuild loses the toolchain, re-running `provision` restores
 it.
 
 `provision` is normally run **as root** (the toolchain goes to `/usr/local`
-and the npm prefix has to be chowned). Run as the runner user instead and
+and the npm prefix in the runner user's home has to be chowned). Run as
+the runner user instead and
 every privileged step escalates with `sudo`, interactively by default so a
 watched invocation can answer the password prompt;
 `gh-runners provision --non-interactive` uses `sudo -n` instead, where a
@@ -172,12 +173,25 @@ provisioning runs as root and root's home holds no runner directory. A
 runner home under the invoking account's own home is found as well,
 because that is where it lives on a host that is provisioned by the
 account that owns the runner. Every runner home on the host is checked,
-and a runner home owned by root is refused: root is not a runner user,
+and a runner home owned by root is skipped: root is not a runner user,
 and a check that ran as root would prove nothing. Without a runner home
-the provisioning says so loudly and checks the install the other way
-round — the binary has to be executable by every user on the host —
-rather than verifying the invoking user, which would pass for a `gh` the
-runner user cannot execute.
+other than a root-owned one the provisioning says so loudly and checks
+the install the other way round — the binary has to be executable by
+every user on the host — rather than verifying the invoking user, which
+would pass for a `gh` the runner user cannot execute.
+
+The GitHub CLI is a **host-wide** binary: `/usr/local/bin/gh` belongs to
+root, and so does the directory that holds it. `unlink(2)` and
+`rename(2)` are governed by the write permission on the **containing
+directory**, not by the ownership or the mode of the file, so a
+root-owned `gh` inside a runner-writable `/usr/local/bin` can still be
+deleted and replaced by the runner user — and the runner user runs
+arbitrary pull-request code. The provisioning therefore keeps the npm
+prefix in the runner user's own home (`$HOME/.npm`), never in a prefix
+shared with the host binaries, and it verifies that the directory of
+`GH_INSTALL_PATH` is root-owned and neither group nor other writable.
+Do not weaken that check: it is the difference between a host-wide `gh`
+and a `gh` any job on the host can replace.
 
 The flow for one runner:
 
