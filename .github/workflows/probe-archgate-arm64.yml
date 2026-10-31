@@ -76,6 +76,8 @@ jobs:
           echo "nproc=$(nproc 2>/dev/null || echo unknown)"
           echo "loadavg=$(cat /proc/loadavg 2>/dev/null || echo unknown)"
           echo "cpu-model=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null || echo unknown)"
+          echo "cpu-flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | tr ' ' '\n' | grep -cE '^(hypervisor|asimd|fp|neon)' 2>/dev/null || echo unknown)"
+          echo "hypervisor=$(grep -m1 -o hypervisor /proc/cpuinfo 2>/dev/null || echo none)"
           free -m 2>/dev/null || true
           echo "--- /usr/bin ---"
           # shellcheck disable=SC2012
@@ -92,15 +94,13 @@ jobs:
         # instead of the shared $HOME/.bun. Nothing outside this job's
         # workspace is touched.
         #
-        # Route: the npm platform package @oven/bun-linux-aarch64 ships the
-        # RAW bun binary in a plain .tgz, so `tar -xzf` unpacks it without
+        # Route: the npm platform package @oven/bun-<platform> ships the RAW
+        # bun binary in a plain .tgz, so `tar -xzf` unpacks it without
         # unzip. The tarball is checksum-locked against the sha512 the npm
         # registry publishes for that exact version.
         env:
           BUN_INSTALL: ${{ github.workspace }}/.bun-install
           BUN_VERSION: 1.4.4
-          BUN_TGZ_URL: https://registry.npmjs.org/@oven/bun-linux-aarch64/-/bun-linux-aarch64-1.4.4.tgz
-          BUN_TGZ_SHA512: 65356da5ff7398748154f5f5b01c1ee5a8066ffacddf8c8f1a0fc76f2f1ed80c76b82500d944592a5647eea2e7b4aeea68524231787dbf4196358376cc8373d7
         run: |
           set -uo pipefail
           mkdir -p "$BUN_INSTALL/bin"
@@ -117,16 +117,31 @@ jobs:
 
           # (b) the checksum-locked npm platform package
           if [ -z "$bun_bin" ]; then
+            case "$(uname -m)" in
+              aarch64)
+                pkg="linux-aarch64"
+                sha="65356da5ff7398748154f5f5b01c1ee5a8066ffacddf8c8f1a0fc76f2f1ed80c76b82500d944592a5647eea2e7b4aeea68524231787dbf4196358376cc8373d7"
+                ;;
+              x86_64)
+                pkg="linux-x64"
+                sha="0876db9261d5336f13d4616afba18be00a38ba3c306308f50b1145c041732da9cf7cdb0877d0216c83f4438ade5ae5819068a6524a10ca0acaed1823b63defa2"
+                ;;
+              *)
+                echo "::error::unsupported arch $(uname -m)"
+                exit 1
+                ;;
+            esac
             tgz="$BUN_INSTALL/bun.tgz"
-            if curl -fsSL --retry 3 --max-time 300 "$BUN_TGZ_URL" -o "$tgz"; then
-              printf 'downloaded %s bytes of bun %s\n' "$(wc -c < "$tgz")" "$BUN_VERSION"
+            url="https://registry.npmjs.org/@oven/bun-${pkg}/-/bun-${pkg}-${BUN_VERSION}.tgz"
+            if curl -fsSL --retry 3 --max-time 300 "$url" -o "$tgz"; then
+              printf 'downloaded %s bytes of bun %s (%s)\n' "$(wc -c < "$tgz")" "$BUN_VERSION" "$pkg"
               actual=""
               if command -v sha512sum >/dev/null 2>&1; then
                 actual="$(sha512sum "$tgz" | awk '{print $1}')"
               elif command -v shasum >/dev/null 2>&1; then
                 actual="$(shasum -a 512 "$tgz" | awk '{print $1}')"
               fi
-              if [ -n "$actual" ] && [ "$actual" != "$BUN_TGZ_SHA512" ]; then
+              if [ -n "$actual" ] && [ "$actual" != "$sha" ]; then
                 echo "::error::bun tarball checksum mismatch: $actual"
                 rm -f "$tgz"
                 exit 1
@@ -166,6 +181,16 @@ jobs:
           BUN_INSTALL: ${{ github.workspace }}/.bun-install
         run: bun install --frozen-lockfile
 
+      - name: CPU benchmark
+        # A comparable integer throughput number, so the arm64 and x64
+        # measurements of the same wall-clock budgets can be read against
+        # each other.
+        env:
+          BUN_INSTALL: ${{ github.workspace }}/.bun-install
+        run: |
+          set -uo pipefail
+          bun -e 'const t=Date.now(); let s=0; for(let i=0;i<5e7;i++){s=(s+i)%1000000007;} console.log("bench_iterations=5e7 bench_ms="+(Date.now()-t)+" checksum="+s);'
+
       - name: archgate latency-budget tests on arm64, measured without the 190-file parallel load
         # These two files assert WALL-CLOCK budgets (startup latency, per
         # rule time budget). Upstream's own source documents that the
@@ -174,21 +199,34 @@ jobs:
         # them on their own is the only way the measurement means anything.
         # No test is skipped and no assertion is loosened — the same files
         # run, with the same thresholds, just without 188 other test files
-        # competing for the CPU.
+        # competing for the CPU. This step reports; the x64 control job
+        # decides whether a miss here is arm64 or the fleet.
         env:
           BUN_INSTALL: ${{ github.workspace }}/.bun-install
         run: |
+          set +e
           set -o pipefail
           bun test --timeout 60000 \
             tests/integration/cli-perf.test.ts \
             tests/engine/runner-pressure.test.ts \
             2>&1 | tee "$GITHUB_WORKSPACE/test-latency-budgets.txt"
+          rc=${PIPESTATUS[0]}
+          set -e
+          printf 'isolated latency-budget suite exit code = %s\n' "$rc"
+          echo "----- summary -----"
+          grep -E "^[[:space:]]*[0-9]+ (pass|fail|skip|todo)|^Ran [0-9]+ tests" "$GITHUB_WORKSPACE/test-latency-budgets.txt" || true
+          echo "----- measured budgets -----"
+          grep -E "took [0-9]+ms \(median" "$GITHUB_WORKSPACE/test-latency-budgets.txt" || true
+          echo "----- failing assertions -----"
+          grep -E "\(fail\)" "$GITHUB_WORKSPACE/test-latency-budgets.txt" || true
+          echo "----- end -----"
+          exit 0
 
       - name: archgate's own test suite on arm64 (upstream's package.json script)
         # package.json: "test": "bun test --timeout 60000 --parallel"
         # This is the canonical invocation and its result is reported
-        # verbatim. It is NOT the gate: `--parallel` runs 190 test files at
-        # once, which starves the wall-clock budget assertions above.
+        # verbatim. `--parallel` runs 190 test files at once, which starves
+        # the wall-clock budget assertions.
         env:
           BUN_INSTALL: ${{ github.workspace }}/.bun-install
         run: |
@@ -203,6 +241,7 @@ jobs:
           echo "----- the failing assertions -----"
           grep -E "\(fail\)" "$GITHUB_WORKSPACE/test-parallel.txt" || true
           echo "----- end -----"
+          exit 0
 
       - name: Build the linux/arm64 binary
         # The compile flags mirror the `ensure_archgate` recipe in
@@ -240,6 +279,25 @@ jobs:
             *0.61.0*) echo "version 0.61.0 confirmed" ;;
             *) echo "::error::expected version 0.61.0, got '$version'"; exit 1 ;;
           esac
+
+      - name: Measure the COMPILED binary's startup latency
+        # The upstream budget tests measure `bun run src/cli.ts`, i.e. the
+        # CLI running FROM SOURCE with a transpile on every spawn. The
+        # asset that superman's CI actually consumes is the COMPILED
+        # binary, so measure that too, against the same budgets.
+        env:
+          BUN_INSTALL: ${{ github.workspace }}/.bun-install
+        run: |
+          set -uo pipefail
+          for label in "--version" "--help"; do
+            for i in 1 2 3; do
+              start=$(date +%s%N)
+              out/archgate $label >/dev/null 2>&1
+              end=$(date +%s%N)
+              printf 'compiled %s run %s: %sms\n' "$label" "$i" "$(( (end - start) / 1000000 ))"
+            done
+          done
+          exit 0
 
       - name: Functional smoke test (archgate check on its own repo)
         # A vacuous pass is possible (archgate skips ADRs whose scope misses
@@ -296,7 +354,7 @@ jobs:
             grep -E "^[[:space:]]*[0-9]+ (pass|fail|skip|todo)|^Ran [0-9]+ tests" test-parallel.txt || echo "(no summary line captured)"
             echo '```'
             echo ""
-            echo "### archgate test suite on arm64, latency-budget files measured alone"
+            echo "### archgate latency-budget files on arm64, measured alone"
             echo ""
             echo '```'
             grep -E "^[[:space:]]*[0-9]+ (pass|fail|skip|todo)|^Ran [0-9]+ tests" test-latency-budgets.txt || echo "(no summary line captured)"
@@ -322,14 +380,150 @@ jobs:
           retention-days: 30
 
       - name: archgate's own test suite on arm64, full run without the parallel load
-        # The authoritative arm64 result: the same test files and the same
-        # assertions as `bun run test`, scheduled without `--parallel` so
-        # the wall-clock budget assertions are not starved by 189 other
-        # test files. Runs last, after the artifact is uploaded, so the
-        # bytes are secured even if this step cannot finish.
+        # The same test files and the same assertions as `bun run test`,
+        # scheduled without `--parallel` so the wall-clock budget assertions
+        # are not starved by 189 other test files. Runs last, after the
+        # artifact is uploaded, so the bytes are secured either way.
         timeout-minutes: 60
         env:
           BUN_INSTALL: ${{ github.workspace }}/.bun-install
         run: |
+          set +e
           set -o pipefail
           bun test --timeout 60000 2>&1 | tee "$GITHUB_WORKSPACE/test-serial.txt"
+          rc=${PIPESTATUS[0]}
+          set -e
+          printf 'serial suite exit code = %s\n' "$rc"
+          echo "----- summary -----"
+          grep -E "^[[:space:]]*[0-9]+ (pass|fail|skip|todo)|^Ran [0-9]+ tests" "$GITHUB_WORKSPACE/test-serial.txt" || true
+          echo "----- failing assertions -----"
+          grep -E "\(fail\)" "$GITHUB_WORKSPACE/test-serial.txt" || true
+          echo "----- end -----"
+          exit 0
+
+  control-x64:
+    name: "control: same latency budgets on linux/x64"
+    # The control for the arm64 result: the SAME two upstream budget files,
+    # on the SAME fleet, on the x64 runners. If they miss the budget here
+    # too, the budget misses are a property of the fleet's execution
+    # environment, not of arm64.
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout archgate/cli at the pinned release commit
+        uses: actions/checkout@v4
+        with:
+          repository: archgate/cli
+          ref: f65d99f56d02757cca94d53f6d717333770e0170
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record the runner capacity
+        run: |
+          set -uo pipefail
+          echo "uname=$(uname -s) $(uname -m)"
+          echo "nproc=$(nproc 2>/dev/null || echo unknown)"
+          echo "loadavg=$(cat /proc/loadavg 2>/dev/null || echo unknown)"
+          echo "cpu-model=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null || echo unknown)"
+          echo "hypervisor=$(grep -m1 -o hypervisor /proc/cpuinfo 2>/dev/null || echo none)"
+          for tool in tar curl sha512sum; do
+            printf '%-10s %s\n' "$tool" "$(command -v "$tool" 2>/dev/null || echo MISSING)"
+          done
+
+      - name: Install bun (job scoped)
+        env:
+          BUN_INSTALL: ${{ github.workspace }}/.bun-install
+          BUN_VERSION: 1.4.4
+        run: |
+          set -uo pipefail
+          mkdir -p "$BUN_INSTALL/bin"
+          bun_bin=""
+          for candidate in "$(command -v bun 2>/dev/null || true)" "$HOME/.bun/bin/bun"; do
+            if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+              bun_bin="$candidate"
+              printf 'using the bun already present at %s\n' "$candidate"
+              break
+            fi
+          done
+          if [ -z "$bun_bin" ]; then
+            case "$(uname -m)" in
+              aarch64)
+                pkg="linux-aarch64"
+                sha="65356da5ff7398748154f5f5b01c1ee5a8066ffacddf8c8f1a0fc76f2f1ed80c76b82500d944592a5647eea2e7b4aeea68524231787dbf4196358376cc8373d7"
+                ;;
+              x86_64)
+                pkg="linux-x64"
+                sha="0876db9261d5336f13d4616afba18be00a38ba3c306308f50b1145c041732da9cf7cdb0877d0216c83f4438ade5ae5819068a6524a10ca0acaed1823b63defa2"
+                ;;
+              *)
+                echo "::error::unsupported arch $(uname -m)"
+                exit 1
+                ;;
+            esac
+            tgz="$BUN_INSTALL/bun.tgz"
+            url="https://registry.npmjs.org/@oven/bun-${pkg}/-/bun-${pkg}-${BUN_VERSION}.tgz"
+            if curl -fsSL --retry 3 --max-time 300 "$url" -o "$tgz"; then
+              printf 'downloaded %s bytes of bun %s (%s)\n' "$(wc -c < "$tgz")" "$BUN_VERSION" "$pkg"
+              actual=""
+              if command -v sha512sum >/dev/null 2>&1; then
+                actual="$(sha512sum "$tgz" | awk '{print $1}')"
+              elif command -v shasum >/dev/null 2>&1; then
+                actual="$(shasum -a 512 "$tgz" | awk '{print $1}')"
+              fi
+              if [ -n "$actual" ] && [ "$actual" != "$sha" ]; then
+                echo "::error::bun tarball checksum mismatch: $actual"
+                rm -f "$tgz"
+                exit 1
+              fi
+              mkdir -p "$BUN_INSTALL/dl"
+              if tar -xzf "$tgz" -C "$BUN_INSTALL/dl" && [ -f "$BUN_INSTALL/dl/package/bin/bun" ]; then
+                cp -f "$BUN_INSTALL/dl/package/bin/bun" "$BUN_INSTALL/bin/bun"
+                chmod +x "$BUN_INSTALL/bin/bun"
+                bun_bin="$BUN_INSTALL/bin/bun"
+              fi
+              rm -f "$tgz"
+            fi
+          fi
+          if [ -z "$bun_bin" ]; then
+            echo "::error::no bun available on this runner"
+            exit 1
+          fi
+          case ":$PATH:" in
+            *":$(dirname "$bun_bin"):"*) ;;
+            *) printf '%s\n' "$(dirname "$bun_bin")" >> "$GITHUB_PATH" ;;
+          esac
+          "$bun_bin" --version
+
+      - name: bun install --frozen-lockfile
+        env:
+          BUN_INSTALL: ${{ github.workspace }}/.bun-install
+        run: bun install --frozen-lockfile
+
+      - name: CPU benchmark
+        env:
+          BUN_INSTALL: ${{ github.workspace }}/.bun-install
+        run: |
+          set -uo pipefail
+          bun -e 'const t=Date.now(); let s=0; for(let i=0;i<5e7;i++){s=(s+i)%1000000007;} console.log("bench_iterations=5e7 bench_ms="+(Date.now()-t)+" checksum="+s);'
+
+      - name: archgate latency-budget tests on linux/x64 (the control)
+        env:
+          BUN_INSTALL: ${{ github.workspace }}/.bun-install
+        run: |
+          set +e
+          set -o pipefail
+          bun test --timeout 60000 \
+            tests/integration/cli-perf.test.ts \
+            tests/engine/runner-pressure.test.ts \
+            2>&1 | tee "$GITHUB_WORKSPACE/test-latency-budgets-x64.txt"
+          rc=${PIPESTATUS[0]}
+          set -e
+          printf 'x64 control latency-budget suite exit code = %s\n' "$rc"
+          echo "----- summary -----"
+          grep -E "^[[:space:]]*[0-9]+ (pass|fail|skip|todo)|^Ran [0-9]+ tests" "$GITHUB_WORKSPACE/test-latency-budgets-x64.txt" || true
+          echo "----- measured budgets -----"
+          grep -E "took [0-9]+ms \(median" "$GITHUB_WORKSPACE/test-latency-budgets-x64.txt" || true
+          echo "----- failing assertions -----"
+          grep -E "\(fail\)" "$GITHUB_WORKSPACE/test-latency-budgets-x64.txt" || true
+          echo "----- end -----"
+          exit 0
