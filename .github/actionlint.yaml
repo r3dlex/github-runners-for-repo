@@ -1,0 +1,12 @@
+# Custom self-hosted runner labels for this org's tier pools. actionlint only
+# knows GitHub's built-in labels, so the tier labels this repo uses to narrow a
+# runner pool have to be declared here or every workflow that uses them is
+# reported as using an unknown label.
+self-hosted-runner:
+  labels:
+    - arm64-primary
+    - arm64-standard
+    - r3dlex-org
+    - r3dlex-linux-arm64
+    - mac-arm64
+    - dpua-validation
