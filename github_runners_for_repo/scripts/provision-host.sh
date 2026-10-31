@@ -23,9 +23,12 @@
 # The runner user is NOT taken from $HOME: provisioning runs as root and
 # root's home holds no runner directory. It is the owner of the runner
 # home, and the runner home is named by the RUNNER_HOMES knob with
-# ABSOLUTE paths (the same knob install-disk-cleanup.sh uses). The
-# provisioning fails when no runner home is found: a check that verified
-# the invoking user would pass for a binary the runner user cannot run.
+# ABSOLUTE paths (the same knob install-disk-cleanup.sh uses). A runner
+# home owned by root is REFUSED: a check that ran as root would pass for
+# a binary the runner user cannot run. When no runner home exists at all
+# the provisioning says so loudly and verifies the install the other way
+# round — the binary has to be executable by EVERY user on the host,
+# because every job on the host runs it.
 #
 # What it ensures:
 #   - Node.js + npm (Linux: NodeSource; macOS: Homebrew)
@@ -42,8 +45,13 @@
 #     Actions job PATH. The release is pinned and the download is checked
 #     against a recorded sha256 before it is unpacked: the binary ends up
 #     root-owned and world executable, so every job on the host runs it.
+#     The owner is ALWAYS root:root — never the user that happens to run
+#     the provisioning — because a host-wide binary the runner user owns
+#     is a binary every job on the host can replace.
 #     On macOS gh comes from Homebrew: the pinned release install is
 #     Linux-only, and the Homebrew prefix is not on the Linux job PATH.
+#     The prefix is added to the runner's .path file so the macOS jobs
+#     find the Homebrew gh.
 #   - uv (the Python package manager — installed by the official astral
 #     installer to ~/.local/bin/uv and added to the user's shell rc)
 #   - bun (the TypeScript runtime archgate is built with)
@@ -84,6 +92,11 @@ RUNNER_HOMES="${RUNNER_HOMES:-/home/redlexgilgamesh.guest/actions-runner-linux /
 read -r -a RUNNER_HOME_LIST <<<"$RUNNER_HOMES"
 
 log() { printf '[provision] %s\n' "$*"; }
+
+# A message that must not be swallowed by a command substitution. The
+# caller captures stdout, so a message on stdout would end up in the
+# captured value instead of reaching the operator.
+log_stderr() { printf '[provision] %s\n' "$*" >&2; }
 
 # The command used to escalate to root for the writes that need it. It is
 # empty when the script already runs as root. It can be pinned from the
@@ -206,22 +219,76 @@ uname_m="$(uname -m)"
 # user.
 DEFAULT_JOB_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-# user-local bin dirs that must end up on the runner's PATH
-USER_BIN_DIRS=(
-  "$HOME/.local/bin"
-  "$HOME/.bun/bin"
-  "$HOME/.archgate/bin"
-)
+# The user-local bin dirs that must end up on the runner's PATH, and the
+# user they belong to.
+#
+# They are the dirs of the TOOL USER's home — the runner user — and NOT
+# of the user that happens to run the provisioning: a tool in a home the
+# job cannot read is a tool the job cannot run. When the provisioning
+# runs as root, the dirs of root's home (/root/.local/bin and friends)
+# are on the runner's PATH and reach nobody.
+#
+# The Homebrew prefix is in the list as well: on macOS the GitHub CLI
+# comes from Homebrew, and that prefix is not on the default job PATH.
+USER_BIN_DIRS=()
+TOOL_USER=""
+TOOL_HOME=""
+TOOL_PATH=""
+
+# The Homebrew prefix on this host: /opt/homebrew on Apple silicon,
+# /usr/local on Intel. Empty when Homebrew is not installed.
+homebrew_prefix() {
+  if [ -d /opt/homebrew/bin ]; then
+    printf '/opt/homebrew'
+    return 0
+  fi
+  if [ -d /usr/local/bin ]; then
+    printf '/usr/local'
+    return 0
+  fi
+  return 1
+}
+
+# Resolve the tool user, its home and the bin dirs that hold the tools.
+#
+# The runner user is preferred: the tools belong to the account the
+# jobs run as. When no runner home can be found the invoking user is
+# used — that is the "provision as the runner user" flow, where the two
+# are the same account and nothing moves.
+resolve_tool_dirs() {
+  local user home prefix
+  TOOL_USER="$(id -un)"
+  TOOL_HOME="$HOME"
+  if user="$(runner_user)" && [ -n "$user" ]; then
+    if home="$(user_home "$user")" && [ -n "$home" ]; then
+      TOOL_USER="$user"
+      TOOL_HOME="$home"
+    fi
+  fi
+  USER_BIN_DIRS=(
+    "$TOOL_HOME/.local/bin"
+    "$TOOL_HOME/.bun/bin"
+    "$TOOL_HOME/.archgate/bin"
+  )
+  if prefix="$(homebrew_prefix)"; then
+    USER_BIN_DIRS+=("$prefix/bin")
+  fi
+  TOOL_PATH="$(IFS=:; echo "${USER_BIN_DIRS[*]}")"
+}
 
 ensure_user_path_in_shell_rc() {
   # Persist PATH additions so interactive shells and the `bash -lc` jobs
   # run by `actions/runner` see the new tools. Idempotent.
+  #
+  # The rc file belongs to the TOOL USER, so the tools are on the PATH
+  # of the account that owns them.
+  resolve_tool_dirs
   local rc_file
-  for rc_file in "$HOME/.bashrc" "$HOME/.profile"; do
+  for rc_file in "$TOOL_HOME/.bashrc" "$TOOL_HOME/.profile"; do
     [ -f "$rc_file" ] || continue
     if ! grep -qF "# runner-provision PATH" "$rc_file" 2>/dev/null; then
-      printf '\n# runner-provision PATH\nexport PATH="%s:$PATH"\n' \
-        "$(IFS=:; echo "${USER_BIN_DIRS[*]}")" >> "$rc_file"
+      as_tool_user bash -c 'printf "\n# runner-provision PATH\nexport PATH=\"%s:$PATH\"\n" "$1" >> "$2"' \
+        _ "$TOOL_PATH" "$rc_file"
     fi
   done
 }
@@ -230,9 +297,17 @@ ensure_user_path_in_runner() {
   # The actions-runner service uses the .path file in the runner dir to
   # set PATH. Prepend our user-local bin dirs so the service can find
   # uv, bun, and archgate.
+  #
+  # The runner dirs are the ones on this host — see runner_home_dirs:
+  # the RUNNER_HOMES knob AND the legacy glob under $HOME. The knob
+  # alone is not enough on a host that is provisioned by the account
+  # that owns the runner: there the knob still holds the fleet default
+  # and the .path file of the runner that is actually there would never
+  # be written.
+  resolve_tool_dirs
   local runner_dir
-  for runner_dir in "$HOME/actions-runner"*; do
-    [ -d "$runner_dir" ] || continue
+  while IFS= read -r runner_dir; do
+    [ -n "$runner_dir" ] || continue
     local path_file="$runner_dir/.path"
     [ -f "$path_file" ] || continue
     local current
@@ -251,7 +326,7 @@ ensure_user_path_in_runner() {
       printf '%s\n%s\n' "$prepend" "$current" > "$path_file"
       log "updated $path_file (added $(IFS=,; echo "${missing[*]}"))"
     fi
-  done
+  done < <(runner_home_dirs)
 }
 
 ensure_node_linux() {
@@ -266,12 +341,18 @@ ensure_node_linux() {
   # The default npm prefix (/usr) is root-owned, so `npm install -g` fails
   # with EACCES for the runner user. Point the prefix at a directory the
   # runner user owns and is already on PATH.
+  #
+  # The owner is the TOOL USER — the runner user — and not the user that
+  # runs the provisioning: the jobs run `npm install -g` as the runner
+  # user, and a prefix that belongs to root is a prefix nobody can write
+  # to.
+  resolve_tool_dirs
   local user group
-  user="$(id -un)"
-  group="$(id -gn)"
+  user="$TOOL_USER"
+  group="$(id -gn "$user" 2>/dev/null || id -gn)"
   run_privileged mkdir -p "${NPM_PREFIX}/lib/node_modules" "${NPM_PREFIX}/bin"
   run_privileged chown -R "${user}:${group}" "${NPM_PREFIX}/lib/node_modules" "${NPM_PREFIX}/bin"
-  npm config set prefix "${NPM_PREFIX}"
+  as_tool_user npm config set prefix "${NPM_PREFIX}"
   log "npm global prefix set to ${NPM_PREFIX} (owned by ${user})"
 }
 
@@ -398,6 +479,27 @@ gh_expected_sha256() {
   esac
 }
 
+# The sha256 of the upstream CHECKSUM FILE of a pinned release.
+#
+# The checksum file is fetched only as corroboration for the digest
+# recorded above, and it arrives from the same origin as the asset — so
+# the file itself is pinned here as well. A file that is not the one
+# this repository recorded is not trusted to corroborate anything: the
+# recorded asset digest still decides, and the install continues.
+#
+# The recorded file is next to this script, in the repository.
+gh_checksums_sha256() {
+  local version="$1"
+  case "$version" in
+    2.103.3)
+      printf 'f756e7859d90dbb5e85aae5194206c37da220bec9bac23d3d659078a8e766fdc'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # The sha256 of a file. GNU coreutils and the BSD tools spell this
 # differently and the script runs on both.
 file_sha256() {
@@ -416,8 +518,9 @@ file_sha256() {
 
 # The sha256 upstream publishes for an asset, read from the release's
 # checksum file. This is corroboration only — the file arrives from the
-# same origin as the asset. Fails when the file cannot be fetched or has
-# no entry for the asset.
+# same origin as the asset. Fails when the file cannot be fetched, when
+# it is not the file this repository recorded, or when it has no entry
+# for the asset.
 upstream_sha256() {
   local tmpdir="$1" version="$2" asset="$3" sums candidate digest name
   sums="$tmpdir/checksums.txt"
@@ -425,6 +528,22 @@ upstream_sha256() {
     "https://github.com/cli/cli/releases/download/v${version}/gh_${version}_checksums.txt" \
     -o "$sums"; then
     return 1
+  fi
+  # A pinned release has a pinned checksum FILE as well. A file that is
+  # not the recorded one — a re-published checksum, or a tampered one —
+  # is not used to corroborate anything: the recorded asset digest
+  # decides, and the install continues on it.
+  local pinned recorded
+  pinned="$(gh_checksums_sha256 "$version" || true)"
+  if [ -n "$pinned" ]; then
+    recorded="$(file_sha256 "$sums" || true)"
+    if [ "$recorded" != "$pinned" ]; then
+      # The messages go to stderr: the caller captures stdout, and a
+      # message on stdout would end up in the captured digest.
+      log_stderr "WARN: the upstream checksum file for $version is not the one this repository recorded"
+      log_stderr "WARN: it is not used to corroborate the digest; the recorded digest decides"
+      return 1
+    fi
   fi
   while IFS= read -r candidate; do
     # The line is "<digest>  <asset>"; the asset name has to match
@@ -497,12 +616,15 @@ verify_gh_asset() {
   fi
 
   # Corroboration: the upstream checksum file has to agree with the digest
-  # the install just checked the download against.
+  # the install just checked the download against. The file is the one
+  # this repository recorded (see upstream_sha256), so a disagreement
+  # means the recorded digest and the recorded file disagree with EACH
+  # OTHER — one of the two is wrong, and the install stops.
   if [ -z "$upstream" ]; then
-    log "WARN: could not read the upstream checksum file for $asset; the pinned digest was used"
+    log "WARN: could not use the upstream checksum file for $asset; the pinned digest was used"
   elif [ "$upstream" != "$expected" ]; then
-    log "ERROR: the upstream checksum file disagrees with the sha256 for $asset"
-    log "ERROR: upstream $upstream, expected $expected"
+    log "ERROR: the upstream checksum file disagrees with the recorded sha256 for $asset"
+    log "ERROR: upstream $upstream, recorded $expected"
     return 1
   fi
 
@@ -574,13 +696,22 @@ install_gh_release() {
 # a mode that keeps the runner user out — and then every job on the host
 # dies with "gh: command not found" while the provisioning reports
 # success. The mode is repaired instead of assumed.
+#
+# The owner is repaired to root:root and NEVER to the user that runs the
+# provisioning. /usr/local/bin/gh is a HOST-WIDE binary: every job on
+# the host runs it. A gh the runner user owns is a gh that every job —
+# and every pull request that runs on this host — can replace with
+# something else, and the next job that calls `gh api` then runs the
+# attacker's code with its own GITHUB_TOKEN. Handing a host-wide binary
+# to the runner user is exactly the privilege the fleet does not grant.
 repair_gh_install() {
   if ! run_privileged chmod 0755 "$GH_INSTALL_PATH"; then
     log "ERROR: could not make $GH_INSTALL_PATH world executable"
     return 1
   fi
-  if ! run_privileged chown "$(id -un):$(id -gn)" "$GH_INSTALL_PATH"; then
-    log "ERROR: could not set the owner of $GH_INSTALL_PATH"
+  if ! run_privileged chown root:root "$GH_INSTALL_PATH"; then
+    log "ERROR: could not set the owner of $GH_INSTALL_PATH to root:root"
+    log "ERROR: $GH_INSTALL_PATH is a host-wide binary and must not belong to a job user"
     return 1
   fi
 }
@@ -688,36 +819,43 @@ ensure_gh_macos() {
   brew install gh
 }
 
+# The user-local tools are installed for the TOOL USER — the runner
+# user — because a job runs as that user. When the provisioning runs as
+# root, the tools land in the runner user's home and NOT in /root: a
+# tool in a home the job cannot read is a tool the job cannot run.
 ensure_uv() {
-  if command -v uv >/dev/null 2>&1; then
-    log "uv $(uv --version | head -1) already present"
+  resolve_tool_dirs
+  if [ -x "$TOOL_HOME/.local/bin/uv" ]; then
+    log "uv already present at $TOOL_HOME/.local/bin/uv"
     return
   fi
-  log "installing uv via astral.sh (to ~/.local/bin/uv)"
-  curl -fsSL https://astral.sh/uv/install.sh | sh
+  log "installing uv via astral.sh (to $TOOL_HOME/.local/bin/uv)"
+  as_tool_user bash -c 'curl -fsSL https://astral.sh/uv/install.sh | sh'
 }
 
 ensure_bun() {
-  if command -v bun >/dev/null 2>&1; then
-    log "bun $(bun --version) already present"
+  resolve_tool_dirs
+  if [ -x "$TOOL_HOME/.bun/bin/bun" ]; then
+    log "bun already present at $TOOL_HOME/.bun/bin/bun"
     return
   fi
   log "installing bun (needed to build archgate from source on linux/arm64)"
-  curl -fsSL https://bun.sh/install | bash
+  as_tool_user bash -c 'curl -fsSL https://bun.sh/install | bash'
 }
 
 # Build the native archgate binary on linux/arm64 (no upstream release
 # asset for that platform). On linux/x64 and macOS the official install
 # script downloads a prebuilt platform binary to the same location.
 ensure_archgate() {
-  if command -v archgate >/dev/null 2>&1 || [ -x "$HOME/.archgate/bin/archgate" ]; then
-    log "archgate $(archgate --version 2>/dev/null || ~/.archgate/bin/archgate --version) already present"
+  resolve_tool_dirs
+  if [ -x "$TOOL_HOME/.archgate/bin/archgate" ]; then
+    log "archgate $("$TOOL_HOME/.archgate/bin/archgate" --version 2>/dev/null) already present"
     return
   fi
 
   if [ "$uname_s" = "Linux" ] && [ "$uname_m" = "aarch64" ]; then
     log "building archgate $ARCHGATE_VERSION from source for linux/arm64"
-    if ! command -v bun >/dev/null 2>&1; then
+    if ! command -v bun >/dev/null 2>&1 && [ ! -x "$TOOL_HOME/.bun/bin/bun" ]; then
       log "ERROR: bun is required to build archgate from source; rerun with bun available"
       exit 1
     fi
@@ -726,7 +864,11 @@ ensure_archgate() {
       exit 1
     fi
     local tmpdir
-    tmpdir="$(mktemp -d)"
+    tmpdir="$(tool_tmpdir)" || {
+      log "ERROR: could not create a temp dir for the archgate build"
+      log "ERROR: the build runs as $TOOL_USER and needs a temp dir it can write to"
+      exit 1
+    }
     # The trap that was in place before is put back below, so a caller
     # that registered a cleanup of its own does not lose it: `trap - EXIT`
     # clears EVERY EXIT trap, and this function runs after the gh install
@@ -735,49 +877,176 @@ ensure_archgate() {
     previous_exit_trap="$(trap -p EXIT)"
     # shellcheck disable=SC2064
     trap "rm -rf '$tmpdir'" EXIT
-    git clone --depth 1 --branch "$ARCHGATE_VERSION" \
-      https://github.com/archgate/cli.git "$tmpdir/archgate" 2>&1 | tail -2
-    ( cd "$tmpdir/archgate" && bun install >/dev/null )
-    mkdir -p "$HOME/.archgate/bin"
-    bun build "$tmpdir/archgate/src/cli.ts" --compile --bytecode \
-      --outfile "$HOME/.archgate/bin/archgate"
-    log "archgate $(~/.archgate/bin/archgate --version) installed to ~/.archgate/bin/archgate"
+    as_tool_user bash -c '
+      set -e
+      git clone --depth 1 --branch "$1" https://github.com/archgate/cli.git "$2/archgate" 2>&1 | tail -2
+      cd "$2/archgate" && bun install >/dev/null
+      mkdir -p "$3/.archgate/bin"
+      bun build "$2/archgate/src/cli.ts" --compile --bytecode --outfile "$3/.archgate/bin/archgate"
+    ' _ "$ARCHGATE_VERSION" "$tmpdir" "$TOOL_HOME"
+    log "archgate $("$TOOL_HOME/.archgate/bin/archgate" --version) installed to $TOOL_HOME/.archgate/bin/archgate"
     restore_exit_trap "$previous_exit_trap"
     rm -rf "$tmpdir"
   else
-    log "installing archgate $ARCHGATE_VERSION via official install script (to ~/.archgate/bin)"
-    curl -fsSL https://cli.archgate.dev/install-unix | sh
+    log "installing archgate $ARCHGATE_VERSION via official install script (to $TOOL_HOME/.archgate/bin)"
+    as_tool_user bash -c 'curl -fsSL https://cli.archgate.dev/install-unix | sh'
   fi
+}
+
+# Quote an argument for a shell command string.
+quote_for_shell() {
+  printf "'%s'" "${1//\'/\'\\\'\'}"
 }
 
 # Run a command as another user.
 #
-# The escalation command is the pinned $PROVISION_SUDO, so a sandbox that
-# pins it does not escalate at all. Only a real sudo can become another
-# user; any other escalation command runs the command as the invoking user.
-# Root still needs sudo for this — becoming another user is the one thing
-# it cannot do on its own. The escalation is interactive unless
-# --non-interactive was passed, so a missing password can be answered.
+# Becoming another user needs privilege, and how that privilege is
+# obtained depends on who runs the script:
+#
+#   - Root needs NO escalation command at all: setpriv, runuser and su
+#     can all drop to another account. They are tried in that order and
+#     sudo comes last — a root host does not always have sudo
+#     installed, and requiring it would fail a perfectly good host over
+#     a missing helper.
+#   - Any other user can only reach another account through a real
+#     sudo.
+#
+# A pinned escalation command that is not a sudo cannot switch users at
+# all: it runs the command as the INVOKING user. For the check that
+# verifies the runner user that is the worst possible outcome — root
+# bypasses the mode bits, so the check would pass for a binary the
+# runner user cannot execute. That case is refused with exit code 2
+# instead of quietly running the command as the wrong user.
+#
+# Exit codes: 0 the command ran, 1 it ran and failed, 2 the user could
+# not be switched to at all.
 as_user() {
   local user="$1"
   shift
-  if [ "$(id -un)" = "$user" ]; then
+  local invoking
+  invoking="$(id -un)"
+  if [ "$invoking" = "$user" ]; then
     "$@"
     return
   fi
+
+  if [ "$(id -u)" -eq 0 ]; then
+    if command -v setpriv >/dev/null 2>&1; then
+      setpriv --reuid="$user" --regid="$(id -g "$user")" --init-groups -- "$@"
+      return
+    fi
+    if command -v runuser >/dev/null 2>&1; then
+      runuser -u "$user" -- "$@"
+      return
+    fi
+    if command -v su >/dev/null 2>&1; then
+      # su takes the command as ONE string, so the arguments are quoted
+      # into it.
+      local quoted="" arg
+      for arg in "$@"; do
+        quoted="$quoted $(quote_for_shell "$arg")"
+      done
+      su -s /bin/sh -c "exec$quoted" "$user"
+      return
+    fi
+  fi
+
   local escalate="$PROVISION_SUDO"
   if [ -z "$escalate" ]; then
     escalate="sudo"
   fi
-  if is_sudo "$escalate"; then
-    if [ "$NON_INTERACTIVE" = "1" ]; then
-      "$escalate" -n -u "$user" -- "$@"
-    else
-      "$escalate" -u "$user" -- "$@"
-    fi
-  else
-    "$escalate" "$@"
+  if ! is_sudo "$escalate"; then
+    log "ERROR: cannot run a command as $user"
+    log "ERROR: '$escalate' is not a sudo and cannot switch users; the command would run as $invoking"
+    return 2
   fi
+  if [ "$NON_INTERACTIVE" = "1" ]; then
+    "$escalate" -n -u "$user" -- "$@"
+  else
+    "$escalate" -u "$user" -- "$@"
+  fi
+}
+
+# Run a command as the user the user-local tools belong to, with that
+# user's home and the tool bin dirs on the PATH.
+as_tool_user() {
+  resolve_tool_dirs
+  if [ "$TOOL_USER" = "$(id -un)" ]; then
+    env HOME="$TOOL_HOME" PATH="$TOOL_PATH:$PATH" "$@"
+    return
+  fi
+  as_user "$TOOL_USER" env HOME="$TOOL_HOME" PATH="$TOOL_PATH:$PATH" "$@"
+}
+
+# A temp dir the TOOL USER can write to.
+#
+# The installs that run as the tool user need a directory they own:
+# mktemp -d makes one owned by the invoking user, and a root-owned 0700
+# temp dir cannot be cloned into by the runner user.
+tool_tmpdir() {
+  local dir
+  dir="$(mktemp -d)" || return 1
+  if [ "$TOOL_USER" != "$(id -un)" ]; then
+    if ! run_privileged chown "$TOOL_USER" "$dir"; then
+      rm -rf "$dir"
+      return 1
+    fi
+  fi
+  printf '%s' "$dir"
+}
+
+# The runner homes on this host, one per line.
+#
+# The RUNNER_HOMES knob names them with absolute paths. The glob under
+# $HOME is the way the runner home was found before the knob existed,
+# and it still matters on a host that is provisioned by the account that
+# owns the runner: there the knob holds the fleet default, not this
+# host's runner home. The glob matches nothing when the provisioning
+# runs as root — root's home holds no runner directory — which is
+# exactly why the knob exists.
+#
+# Both halves of the script use this list, so the runner home that is
+# verified is the runner home whose .path file is written.
+runner_home_dirs() {
+  local dir seen=""
+  for dir in "${RUNNER_HOME_LIST[@]:-}"; do
+    [ -n "$dir" ] || continue
+    [ -d "$dir" ] || continue
+    case "$seen" in
+      *"|$dir|"*) continue ;;
+    esac
+    seen="$seen|$dir|"
+    printf '%s\n' "$dir"
+  done
+  for dir in "$HOME"/actions-runner*; do
+    [ -d "$dir" ] || continue
+    case "$seen" in
+      *"|$dir|"*) continue ;;
+    esac
+    seen="$seen|$dir|"
+    printf '%s\n' "$dir"
+  done
+}
+
+# The owners of the runner homes on this host, one per line.
+#
+# Every existing home is looked at: two runner homes on one host can
+# belong to different users, and verifying only the first one would
+# leave the second unchecked.
+runner_home_owners() {
+  local runner_dir owner
+  while IFS= read -r runner_dir; do
+    [ -n "$runner_dir" ] || continue
+    owner="$(stat -c '%U' "$runner_dir" 2>/dev/null || true)"
+    if [ -z "$owner" ]; then
+      owner="$(stat -f '%Su' "$runner_dir" 2>/dev/null || true)"
+    fi
+    # An id with no passwd entry comes back as UNKNOWN; that is not a user
+    # to run a job as.
+    if [ -n "$owner" ] && [ "$owner" != "UNKNOWN" ]; then
+      printf '%s\n' "$owner"
+    fi
+  done < <(runner_home_dirs)
 }
 
 # The user the runner service runs as. It is the owner of the runner home
@@ -787,27 +1056,55 @@ as_user() {
 # back to root and the "the runner user can run gh" check verified root
 # instead of the user a job actually runs as.
 #
-# The runner home is named by the RUNNER_HOMES knob with absolute paths.
-# When none of them exists the user cannot be determined, and this fails
-# instead of falling back to the invoking user: a fallback would verify
-# root and pass vacuously.
+# A runner home owned by root is NOT a runner user: root bypasses the
+# mode bits, so a check that ran as root would pass for a binary the
+# runner user cannot execute. Such a home is skipped here and refused
+# by the check that uses the owner.
 runner_user() {
-  local runner_dir owner
-  for runner_dir in "${RUNNER_HOME_LIST[@]:-}"; do
-    [ -n "$runner_dir" ] || continue
-    [ -d "$runner_dir" ] || continue
-    owner="$(stat -c '%U' "$runner_dir" 2>/dev/null || true)"
-    if [ -z "$owner" ]; then
-      owner="$(stat -f '%Su' "$runner_dir" 2>/dev/null || true)"
-    fi
-    # An id with no passwd entry comes back as UNKNOWN; that is not a user
-    # to run a job as.
-    if [ -n "$owner" ] && [ "$owner" != "UNKNOWN" ]; then
-      printf '%s' "$owner"
-      return 0
-    fi
-  done
+  local owner
+  while IFS= read -r owner; do
+    [ -n "$owner" ] || continue
+    [ "$(id -u "$owner" 2>/dev/null || true)" = "0" ] && continue
+    printf '%s' "$owner"
+    return 0
+  done < <(runner_home_owners)
   return 1
+}
+
+# The home directory of a user, from the passwd database.
+#
+# The shell expands ~user through the same database, so this works on
+# Linux and on macOS — macOS has no getent. An unknown user leaves the
+# tilde unexpanded, which is how the failure is detected.
+user_home() {
+  local user="$1" home=""
+  # A user name is a passwd entry, not a shell fragment: only the
+  # characters a passwd name can hold are accepted.
+  case "$user" in
+    "" | - | + | *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  home="$(eval "printf '%s' ~${user}" 2>/dev/null || true)"
+  case "$home" in
+    "" | "~" | "~"*) return 1 ;;
+  esac
+  printf '%s' "$home"
+}
+
+# Whether a file can be executed by EVERY user on the host. The "other"
+# execute bit is what says that: the owner and the group bits say
+# nothing about the other users.
+world_executable() {
+  local file="$1" mode other
+  mode="$(stat -c '%a' "$file" 2>/dev/null || true)"
+  if [ -z "$mode" ]; then
+    mode="$(stat -f '%Lp' "$file" 2>/dev/null || true)"
+  fi
+  [ -n "$mode" ] || return 1
+  other="${mode: -1}"
+  case "$other" in
+    1 | 3 | 5 | 7) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Assert that the runner user can really run gh. The binary is root-owned
@@ -821,16 +1118,8 @@ runner_user() {
 # cannot execute.
 verify_gh_runnable() {
   if [ "$uname_s" != "Linux" ]; then
-    # The pinned release install is Linux-only; on macOS gh comes from
-    # Homebrew, whose prefix is not on the Linux job PATH.
+    verify_gh_runnable_macos
     return
-  fi
-  local user
-  if ! user="$(runner_user)"; then
-    log "ERROR: no runner home found — cannot verify the runner user"
-    log "ERROR: set RUNNER_HOMES to the runner home(s) on this host"
-    log "ERROR: a check that ran as the invoking user would pass for a gh the runner user cannot run"
-    exit 1
   fi
   # The binary that is verified is the one this script installed, not
   # whatever `gh` the PATH happens to resolve to: an older gh somewhere
@@ -845,17 +1134,110 @@ verify_gh_runnable() {
       exit 1
       ;;
   esac
-  if as_user "$user" env PATH="$DEFAULT_JOB_PATH" "$GH_INSTALL_PATH" --version >/dev/null 2>&1; then
-    log "verified: $user can run gh at $GH_INSTALL_PATH"
-  else
-    log "ERROR: $user cannot run gh at $GH_INSTALL_PATH"
-    log "ERROR: jobs that call 'gh api' would fail with 'gh: command not found'"
-    exit 1
+
+  local owners user status
+  owners="$(runner_home_owners)"
+  if [ -z "$owners" ]; then
+    # No runner home on this host: the runner user cannot be determined,
+    # so the check cannot run as that user. That is NOT a reason to
+    # fail a host that was just provisioned — the toolchain is there and
+    # the job PATH carries it. The install is verified the other way
+    # round instead: the binary has to be executable by EVERY user on
+    # the host, because every job on the host runs it.
+    log "WARN: no runner home found — the runner user check did not run"
+    log "WARN: set RUNNER_HOMES to the runner home(s) on this host to have it verified"
+    if [ ! -x "$GH_INSTALL_PATH" ]; then
+      log "ERROR: $GH_INSTALL_PATH is not there"
+      exit 1
+    fi
+    if ! world_executable "$GH_INSTALL_PATH"; then
+      log "ERROR: $GH_INSTALL_PATH is not executable by every user on this host"
+      log "ERROR: jobs that call 'gh api' would fail with 'gh: command not found'"
+      exit 1
+    fi
+    log "verified: $GH_INSTALL_PATH is executable by every user on this host"
+    return
   fi
+
+  while IFS= read -r user; do
+    [ -n "$user" ] || continue
+    if [ "$(id -u "$user" 2>/dev/null || true)" = "0" ]; then
+      log "ERROR: the runner home is owned by root ($user)"
+      log "ERROR: a check that runs as root passes for a gh the runner user cannot run"
+      exit 1
+    fi
+    if as_user "$user" env PATH="$DEFAULT_JOB_PATH" "$GH_INSTALL_PATH" --version >/dev/null 2>&1; then
+      log "verified: $user can run gh at $GH_INSTALL_PATH"
+    else
+      status=$?
+      if [ "$status" = "2" ]; then
+        log "ERROR: could not verify that $user can run gh at $GH_INSTALL_PATH"
+        log "ERROR: the check could not run as $user, so nothing was verified"
+      else
+        log "ERROR: $user cannot run gh at $GH_INSTALL_PATH"
+        log "ERROR: jobs that call 'gh api' would fail with 'gh: command not found'"
+      fi
+      exit 1
+    fi
+  done <<<"$owners"
+}
+
+# The gh on the default job PATH, if there is one. A tarball install
+# puts it in /usr/local/bin, and that dir is on every job's PATH.
+job_path_gh() {
+  local dir
+  local IFS=:
+  for dir in $DEFAULT_JOB_PATH; do
+    if [ -x "$dir/gh" ]; then
+      printf '%s' "$dir/gh"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Assert that the macOS jobs can find the GitHub CLI.
+#
+# On macOS the pinned release install is Linux-only: gh comes from
+# Homebrew, and the Homebrew prefix is not on the default job PATH.
+# The prefix is added to the runner's .path file, and this check says
+# out loud whether the binary is there — a macOS host that reports
+# success without a gh the job can run is the exact failure this check
+# exists for.
+verify_gh_runnable_macos() {
+  local prefix gh_path job_gh
+  if ! prefix="$(homebrew_prefix)"; then
+    log "WARN: no Homebrew prefix on this host — the GitHub CLI check did not run"
+    log "WARN: install Homebrew or set up gh on the runner PATH by hand"
+    return
+  fi
+  gh_path="$prefix/bin/gh"
+  if [ -x "$gh_path" ]; then
+    resolve_tool_dirs
+    case ":${TOOL_PATH}:" in
+      *":${prefix}/bin:"*)
+        log "verified: the GitHub CLI is at $gh_path and $prefix/bin is on the runner PATH"
+        return
+        ;;
+    esac
+  fi
+  # The gh does not have to come from Homebrew: a gh on the default job
+  # PATH is found by every job on the host, Homebrew or not.
+  if job_gh="$(job_path_gh)"; then
+    log "verified: the GitHub CLI is at $job_gh, on the default job PATH"
+    return
+  fi
+  log "ERROR: no GitHub CLI found — not at $gh_path and not on the default job PATH"
+  log "ERROR: jobs that call 'gh api' would fail with 'gh: command not found'"
+  exit 1
 }
 
 main() {
   parse_args "$@"
+
+  # The tool dirs are resolved once, up front: every install and every
+  # PATH update below works with the same account and the same home.
+  resolve_tool_dirs
 
   case "$uname_s" in
     Linux)

@@ -109,7 +109,7 @@ def provision(config: RunnerConfig, non_interactive: bool = False) -> None:
     """Provision the runner host with the toolchain jobs expect.
 
     A bare self-hosted host lacks the toolchain a GitHub-hosted runner ships
-    with (Node/npm, pipx). Without it, jobs that call ``npm`` or ``node``
+    with (Node/npm, pipx, gh). Without it, jobs that call ``npm`` or ``node``
     fail with "command not found" and silently fall back to the
     GitHub-hosted leg. This runs the bundled idempotent provisioning script
     so re-running is safe.

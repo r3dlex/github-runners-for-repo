@@ -34,6 +34,18 @@ VERSION = "2.103.3"
 ARCH = "arm64"
 ASSET = f"gh_{VERSION}_linux_{ARCH}.tar.gz"
 
+# The checksum file of the pinned release, as this repository records it.
+# The script pins the digest of THIS file, so the chain is: the digest
+# the script records, the file the repository records, and the digest of
+# that file.
+CHECKSUMS_FILE = SCRIPT.parent / f"gh_{VERSION}_checksums.txt"
+
+
+def _current_user() -> str:
+    """The name of the user that runs the test."""
+    return subprocess.run(["id", "-un"], capture_output=True, text=True, check=True).stdout.strip()
+
+
 # The release the script installs when nothing else is asked for, and the
 # digest upstream publishes for its arm64 asset. The script records that
 # digest, so the download is checked against a constant the repository
@@ -229,15 +241,31 @@ printf 'install %s\\n' "$*" >> "$STUB_INSTALL_LOG"
 exec "{real_install}" "$@"
 """
 
+# A `chown` stub: it records the ownership it was asked to set and
+# changes nothing.
+#
+# The sandbox cannot hand a file to root:root without root, and the
+# ownership of a host-wide binary is exactly what the repair has to get
+# right — so the ARGUMENTS are what the tests assert on.
+CHOWN_STUB = """#!/usr/bin/env bash
+printf 'chown %s\\n' "$*" >> "$STUB_CHOWN_LOG"
+if [ -n "${STUB_CHOWN_FAILS:-}" ]; then
+  printf 'chown: changing ownership: Operation not permitted\\n' >&2
+  exit 1
+fi
+exit 0
+"""
+
 
 def _sandbox(tmp_path: Path, arch: str = ARCH) -> dict[str, str]:
     """Environment that pins the install to the sandbox.
 
-    `curl` is stubbed, `SUDO` is pinned to "env" so the install runs as the
-    test user instead of asking for a password, and `HOME` is empty so the
-    runner user falls back to the current one. The PATH holds only the
-    binaries the script shells out to, so what the host happens to have
-    installed cannot change what the script does.
+    `curl` is stubbed, `PROVISION_SUDO` is pinned to "env" so the install
+    runs as the test user instead of asking for a password, and `HOME`
+    points at an empty directory so the invoking user's home cannot
+    decide what the script does. The PATH holds only the binaries the
+    script shells out to, so what the host happens to have installed
+    cannot change what the script does.
     """
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir(exist_ok=True)
@@ -257,6 +285,9 @@ def _sandbox(tmp_path: Path, arch: str = ARCH) -> dict[str, str]:
     install = stub_dir / "install"
     install.write_text(INSTALL_STUB.format(real_install=shutil.which("install", path=host_path)))
     install.chmod(0o755)
+    chown = stub_dir / "chown"
+    chown.write_text(CHOWN_STUB)
+    chown.chmod(0o755)
 
     tarball = _write_release_tarball(tmp_path, arch)
     digest = _sha256(tarball)
@@ -274,35 +305,45 @@ def _sandbox(tmp_path: Path, arch: str = ARCH) -> dict[str, str]:
             "STUB_TARBALL": str(tarball),
             "STUB_CHECKSUMS": str(checksums),
             "STUB_PINNED_SHA256": digest,
+            "STUB_CHECKSUMS_SHA256": _sha256(checksums),
             "STUB_CALL_LOG": str(tmp_path / "curl-calls.log"),
             "STUB_TAR_LOG": str(tmp_path / "tar-calls.log"),
             "STUB_INSTALL_LOG": str(tmp_path / "install-calls.log"),
+            "STUB_CHOWN_LOG": str(tmp_path / "chown-calls.log"),
             "STUB_DIR": str(stub_dir),
         }
     )
     (tmp_path / "home").mkdir(exist_ok=True)
     _assert_sandbox_shape(
         env,
-        stubbed=("curl", "tar", "install"),
+        stubbed=("curl", "tar", "install", "chown"),
         absent=("node", "npm", "gh", "uv", "python3"),
     )
     return env
 
 
+def _digest_overrides() -> str:
+    """The recorded digests, replaced by the ones the sandbox serves.
+
+    The sandbox serves its own tarball and its own checksum file, so
+    the digests this repository records are replaced by the digests of
+    those files. Everything else is the production path — the
+    comparison, the failure and the order in which the check runs.
+    """
+    return (
+        'gh_expected_sha256() { printf "%s" "$STUB_PINNED_SHA256"; }; '
+        'gh_checksums_sha256() { printf "%s" "$STUB_CHECKSUMS_SHA256"; }; '
+    )
+
+
 def _install_script(env: dict[str, str], *, pin: bool = True) -> str:
     """The script that installs gh against the sandbox.
-
-    The recorded digest is replaced by the digest of the fake release
-    tarball: the sandbox serves its own tarball, and the digest of that
-    tarball is of course not the one upstream publishes. Everything else
-    is the production path — the comparison, the failure and the order in
-    which the check runs.
 
     With `pin=False` the production digest table is left alone: the
     release under test then is not in it, which is what the fail-closed
     behaviour is about.
     """
-    override = 'gh_expected_sha256() { printf "%s" "$STUB_PINNED_SHA256"; }; ' if pin else ""
+    override = _digest_overrides() if pin else ""
     return f'source "{SCRIPT}"; {override}uname_m=aarch64; ensure_gh_linux'
 
 
@@ -365,15 +406,47 @@ def _sudo_stub(env: dict[str, str]) -> None:
     env["STUB_SUDO_LOG"] = str(stub_dir.parent / "sudo-calls.log")
 
 
-# An `id` stub that claims to be root. Only `-u` is faked, so the script
-# derives an empty escalation command; every other query is answered by
-# the real id. The real id is looked up on the host instead of being
-# hardcoded, so the stub works wherever the test runs.
+def _privilege_stub(env: dict[str, str], name: str, body: str, log_name: str) -> None:
+    """Put a privilege-dropping stub into the sandbox.
+
+    `setpriv` and `runuser` are the ways root becomes another account
+    without sudo. They are only in the sandbox when a test asks for
+    them: a host that has them must not silently take a different path
+    than a host that does not.
+    """
+    stub_dir = Path(env["STUB_DIR"])
+    path = stub_dir / name
+    path.write_text(body)
+    path.chmod(0o755)
+    env[f"STUB_{name.upper()}_LOG"] = str(stub_dir.parent / log_name)
+
+
+def _without_sudo(env: dict[str, str]) -> None:
+    """Take sudo out of the sandbox.
+
+    A root host does not always have sudo installed, and requiring it
+    would fail a perfectly good host over a missing helper.
+    """
+    stub_dir = Path(env["STUB_DIR"])
+    sudo = stub_dir / "sudo"
+    if sudo.exists():
+        sudo.unlink()
+    env.pop("STUB_SUDO_LOG", None)
+
+
+# An `id` stub that claims to be root. Only the bare `-u` is faked, so
+# the script derives an empty escalation command; every other query is
+# answered by the real id. The real id is looked up on the host instead
+# of being hardcoded, so the stub works wherever the test runs.
+#
+# `id -u <user>` is NOT faked: the script asks it whether the runner
+# user is root, and a stub that answered "0" for every user would make
+# every runner home look root-owned.
 def _id_stub() -> str:
     real_id = shutil.which("id", path=os.environ.get("PATH", ""))
     assert real_id is not None, "the sandbox needs id and this host does not have it"
     return f"""#!/usr/bin/env bash
-if [ "${{1:-}}" = "-u" ]; then
+if [ "${{1:-}}" = "-u" ] && [ "$#" -eq 1 ]; then
   printf '0\\n'
   exit 0
 fi
@@ -390,8 +463,12 @@ def _root_id_stub() -> str:
     assert real_id is not None, "the sandbox needs id and this host does not have it"
     return f"""#!/usr/bin/env bash
 case "${{1:-}}" in
-  -u) printf '0\\n'; exit 0 ;;
-  -un) printf 'root\\n'; exit 0 ;;
+  -u)
+    if [ "$#" -eq 1 ]; then printf '0\\n'; exit 0; fi
+    ;;
+  -un)
+    if [ "$#" -eq 1 ]; then printf 'root\\n'; exit 0; fi
+    ;;
 esac
 exec "{real_id}" "$@"
 """
@@ -414,6 +491,81 @@ for arg in "$@"; do
   esac
 done
 exec "{real_stat}" "$@"
+"""
+
+
+# A `stat` stub that reports a DIFFERENT owner per runner home. Two
+# runner homes on one host can belong to different users, and the check
+# has to look at every one of them.
+def _stat_stub_per_home() -> str:
+    real_stat = shutil.which("stat", path=os.environ.get("PATH", ""))
+    assert real_stat is not None, "the sandbox needs stat and this host does not have it"
+    return f"""#!/usr/bin/env bash
+for arg in "$@"; do
+  case "$arg" in
+    *runner-a*)
+      printf '%s\\n' "$STUB_OWNER_A"
+      exit 0
+      ;;
+    *runner-b*)
+      printf '%s\\n' "$STUB_OWNER_B"
+      exit 0
+      ;;
+  esac
+done
+exec "{real_stat}" "$@"
+"""
+
+
+# A `setpriv` stub: it records how the script asked to drop privileges
+# and then runs the command it was handed, as the user it was told to
+# become. The sandbox cannot change the user itself, so the identity the
+# command runs as has to be passed to it instead.
+SETPRIV_STUB = """#!/usr/bin/env bash
+printf 'setpriv %s\\n' "$*" >> "$STUB_SETPRIV_LOG"
+user=""
+args=()
+after=0
+for arg in "$@"; do
+  if [ "$after" = "1" ]; then
+    args+=("$arg")
+    continue
+  fi
+  case "$arg" in
+    --reuid=*) user="${arg#--reuid=}" ;;
+    --) after=1 ;;
+  esac
+done
+export STUB_SUDO_USER="$user"
+exec "${args[@]}"
+"""
+
+
+# A `runuser` stub, the second way root drops to another account
+# without sudo.
+RUNUSER_STUB = """#!/usr/bin/env bash
+printf 'runuser %s\\n' "$*" >> "$STUB_RUNUSER_LOG"
+user=""
+args=()
+after=0
+for arg in "$@"; do
+  if [ "$after" = "1" ]; then
+    args+=("$arg")
+    continue
+  fi
+  case "$arg" in
+    -u) after=2 ;;
+    --) after=1 ;;
+    *)
+      if [ "$after" = "2" ]; then
+        user="$arg"
+        after=1
+      fi
+      ;;
+  esac
+done
+export STUB_SUDO_USER="$user"
+exec "${args[@]}"
 """
 
 
@@ -566,6 +718,12 @@ def _job_path(env: dict[str, str]) -> str:
     )
 
 
+def _verify_script(env: dict[str, str], *, job_path: str | None = None) -> str:
+    """The script that runs the runner-user check against the sandbox."""
+    path = _job_path(env) if job_path is None else job_path
+    return f'source "{SCRIPT}"; uname_s=Linux; DEFAULT_JOB_PATH="{path}"; verify_gh_runnable'
+
+
 def _root_host_with_runner_home(tmp_path: Path, env: dict[str, str], owner: str) -> Path:
     """Make the sandbox look like a root host that has a runner home.
 
@@ -590,6 +748,26 @@ def _root_host_with_runner_home(tmp_path: Path, env: dict[str, str], owner: str)
     runner_home.mkdir(parents=True)
     env["RUNNER_HOMES"] = str(runner_home)
     return runner_home
+
+
+def _two_runner_homes(
+    tmp_path: Path, env: dict[str, str], owner_a: str, owner_b: str
+) -> tuple[Path, Path]:
+    """A host with two runner homes that belong to DIFFERENT users."""
+    stub_dir = Path(env["STUB_DIR"])
+    for name, body in (("id", _root_id_stub()), ("stat", _stat_stub_per_home())):
+        path = stub_dir / name
+        path.write_text(body)
+        path.chmod(0o755)
+    env["STUB_OWNER_A"] = owner_a
+    env["STUB_OWNER_B"] = owner_b
+
+    home_a = tmp_path / "runner-homes" / "runner-a"
+    home_b = tmp_path / "runner-homes" / "runner-b"
+    home_a.mkdir(parents=True)
+    home_b.mkdir(parents=True)
+    env["RUNNER_HOMES"] = f"{home_a} {home_b}"
+    return home_a, home_b
 
 
 class TestScript:
@@ -907,12 +1085,34 @@ class TestInstall:
         env = _sandbox(tmp_path)
         install_path = Path(env["GH_INSTALL_PATH"])
         Path(env["STUB_CHECKSUMS"]).write_text(f"{'1' * 64}  {ASSET}\n")
+        # The sandbox serves the tampered file and the script trusts
+        # exactly the file it was handed.
+        env["STUB_CHECKSUMS_SHA256"] = _sha256(Path(env["STUB_CHECKSUMS"]))
 
         result = _run(_install_script(env), env)
 
         assert result.returncode != 0
         assert "upstream checksum file disagrees" in result.stdout
         assert not install_path.exists()
+
+    def test_a_checksum_file_that_is_not_the_recorded_one_does_not_block(
+        self, tmp_path: Path
+    ) -> None:
+        """A re-published checksum file must not block a valid pinned install.
+
+        The recorded digest is the anchor and it already decided; a
+        checksum file that is not the one this repository recorded is
+        simply not used to corroborate anything.
+        """
+        env = _sandbox(tmp_path)
+        install_path = Path(env["GH_INSTALL_PATH"])
+        Path(env["STUB_CHECKSUMS"]).write_text(f"{'1' * 64}  {ASSET}\n")
+
+        result = _run(_install_script(env), env)
+
+        assert result.returncode == 0, result.stderr
+        assert "is not the one this repository recorded" in result.stderr
+        assert install_path.exists(), "the recorded digest decides, and it matched"
 
     def test_the_install_does_not_swallow_the_callers_cleanup(self, tmp_path: Path) -> None:
         """Only the trap the install installed may be removed again.
@@ -923,9 +1123,7 @@ class TestInstall:
         env = _sandbox(tmp_path)
         script = (
             'trap "echo caller-cleanup" EXIT; '
-            f'source "{SCRIPT}"; '
-            'gh_expected_sha256() { printf "%s" "$STUB_PINNED_SHA256"; }; '
-            "uname_m=aarch64; ensure_gh_linux"
+            f'source "{SCRIPT}"; ' + _digest_overrides() + "uname_m=aarch64; ensure_gh_linux"
         )
 
         result = _run(script, env)
@@ -945,9 +1143,7 @@ class TestInstall:
         env["STUB_PINNED_SHA256"] = "0" * 64
         script = (
             'trap "echo caller-cleanup" EXIT; '
-            f'source "{SCRIPT}"; '
-            'gh_expected_sha256() { printf "%s" "$STUB_PINNED_SHA256"; }; '
-            "uname_m=aarch64; ensure_gh_linux"
+            f'source "{SCRIPT}"; ' + _digest_overrides() + "uname_m=aarch64; ensure_gh_linux"
         )
 
         result = _run(script, env)
@@ -972,9 +1168,7 @@ class TestInstall:
         env["STUB_DOWNLOAD_FAILS"] = "1"
         script = (
             'trap "echo caller-cleanup" EXIT; '
-            f'source "{SCRIPT}"; '
-            'gh_expected_sha256() { printf "%s" "$STUB_PINNED_SHA256"; }; '
-            "uname_m=aarch64; ensure_gh_linux"
+            f'source "{SCRIPT}"; ' + _digest_overrides() + "uname_m=aarch64; ensure_gh_linux"
         )
 
         result = _run(script, env)
@@ -1000,9 +1194,7 @@ class TestInstall:
         env["STUB_CHECKSUMS"] = str(checksums)
         script = (
             'trap "echo caller-cleanup" EXIT; '
-            f'source "{SCRIPT}"; '
-            'gh_expected_sha256() { printf "%s" "$STUB_PINNED_SHA256"; }; '
-            "uname_m=aarch64; ensure_gh_linux"
+            f'source "{SCRIPT}"; ' + _digest_overrides() + "uname_m=aarch64; ensure_gh_linux"
         )
 
         result = _run(script, env)
@@ -1128,18 +1320,26 @@ class TestRunnerUser:
         assert result.returncode != 0, "the runner user cannot be determined"
         assert result.stdout.strip() == "", "no user may be invented"
 
-    def test_without_a_runner_home_the_check_fails_loudly(self, tmp_path: Path) -> None:
-        """The provisioning has to say that it could not verify anything."""
+    def test_without_a_runner_home_the_check_says_it_did_not_verify(self, tmp_path: Path) -> None:
+        """No runner home means no runner user — the check says so.
+
+        It does NOT fail the provisioning: the toolchain is installed and
+        the job PATH carries it, and a host that is provisioned before
+        the runner is installed is a normal thing to be. The check that
+        runs as the runner user happens when there IS a runner home.
+        """
         env = _sandbox(tmp_path)
         _root_host_with_runner_home(tmp_path, env, "redlexgilgamesh.guest")
         env["RUNNER_HOMES"] = str(tmp_path / "no-such-runner-home")
-        script = f'source "{SCRIPT}"; uname_s=Linux; verify_gh_runnable'
+        _gh_stub(env)
+        script = _verify_script(env)
 
         result = _run(script, env)
 
-        assert result.returncode != 0, "the check must fail the install"
+        assert result.returncode == 0, result.stdout + result.stderr
         assert "no runner home found" in result.stdout
-        assert "cannot verify the runner user" in result.stdout
+        assert "the runner user check did not run" in result.stdout
+        assert "verified:" in result.stdout, "the install is still verified"
 
     def test_a_root_invocation_verifies_the_runner_user_and_not_root(self, tmp_path: Path) -> None:
         """The check must not pass vacuously because it ran as root.
@@ -1296,6 +1496,483 @@ class TestRunnerUserCheck:
         assert result.returncode != 0, "the check must fail the install"
         assert "is not on the default job PATH" in result.stdout
         assert "gh: command not found" in result.stdout
+
+
+class TestInstallOwnership:
+    """The host-wide binary belongs to root, never to a job user.
+
+    /usr/local/bin/gh is shared by every job on the host. A gh the
+    runner user owns is a gh that every job — and every pull request
+    that runs on this host — can replace with something else, and the
+    next job that calls `gh api` then runs the attacker's code with its
+    own GITHUB_TOKEN.
+    """
+
+    def _chown_calls(self, env: dict[str, str]) -> list[str]:
+        log = Path(env["STUB_CHOWN_LOG"])
+        if not log.exists():
+            return []
+        return [line for line in log.read_text().splitlines() if line]
+
+    def test_the_repair_chowns_the_binary_to_root(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        _fake_gh(Path(env["GH_INSTALL_PATH"]), VERSION)
+
+        result = _run(_install_script(env), env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        calls = self._chown_calls(env)
+        assert calls, "the repair did not set an owner at all"
+        assert f"chown root:root {env['GH_INSTALL_PATH']}" in calls, (
+            f"the host-wide binary has to belong to root, recorded: {calls}"
+        )
+
+    def test_the_repair_never_chowns_the_binary_to_the_invoking_user(self, tmp_path: Path) -> None:
+        """The regression: the repair used to chown to whoever ran it."""
+        env = _sandbox(tmp_path)
+        _fake_gh(Path(env["GH_INSTALL_PATH"]), VERSION)
+        invoking = subprocess.run(
+            ["id", "-un"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+        result = _run(_install_script(env), env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        calls = self._chown_calls(env)
+        owners = [call.split()[1] for call in calls if len(call.split()) > 1]
+        assert invoking not in " ".join(owners), (
+            f"the binary must not belong to the invoking user {invoking}, recorded: {calls}"
+        )
+
+    def test_a_repair_that_cannot_chown_fails_the_install(self, tmp_path: Path) -> None:
+        """A binary that stays owned by a job user is not a repaired binary."""
+        env = _sandbox(tmp_path)
+        env["STUB_CHOWN_FAILS"] = "1"
+        _fake_gh(Path(env["GH_INSTALL_PATH"]), VERSION)
+
+        result = _run(_install_script(env), env)
+
+        assert result.returncode != 0, "the install must fail when the owner cannot be set"
+        assert "could not set the owner" in result.stdout
+
+
+class TestRootOwnedRunnerHome:
+    """A runner home owned by root is not a runner user.
+
+    Root bypasses the mode bits, so a check that ran as root passes for
+    a binary the runner user cannot execute — and reports success.
+    """
+
+    def test_a_root_owned_runner_home_is_refused(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, "root")
+        _sudo_stub(env)
+        _gh_stub(env)
+        script = _verify_script(env)
+
+        result = _run(script, env)
+
+        assert result.returncode != 0, "a root-owned runner home must not verify"
+        assert "the runner home is owned by root" in result.stdout
+        assert "verified:" not in result.stdout, "nothing may be reported as verified"
+
+    def test_a_root_owned_runner_home_is_not_a_runner_user(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, "root")
+        script = f'source "{SCRIPT}"; runner_user'
+
+        result = _run(script, env)
+
+        assert result.returncode != 0, "root is not a runner user"
+        assert result.stdout.strip() == "", "no user may be invented"
+
+
+class TestEscalation:
+    """The check has to run AS the runner user — or say that it did not.
+
+    A pinned escalation command that is not a sudo cannot switch users:
+    it runs the command as the invoking user. For this check that means
+    root, which bypasses the mode bits — the check would report success
+    for a binary the runner user cannot execute.
+    """
+
+    def test_a_non_sudo_escalation_cannot_verify_the_runner_user(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, "redlexgilgamesh.guest")
+        identity = tmp_path / "gh-identity"
+        env["STUB_GH_IDENTITY_FILE"] = str(identity)
+        _gh_stub(env)
+        # PROVISION_SUDO is pinned to "env" — it cannot switch users.
+        script = _verify_script(env)
+
+        result = _run(script, env)
+
+        assert result.returncode != 0, "the check must not pass when it did not verify"
+        assert "could not verify" in result.stdout
+        assert "verified:" not in result.stdout, "nothing may be reported as verified"
+        assert not identity.exists(), "gh must not run as the wrong user at all"
+
+    def test_a_root_host_uses_setpriv_when_there_is_no_sudo(self, tmp_path: Path) -> None:
+        """Root needs no sudo to become another user."""
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, "redlexgilgamesh.guest")
+        _privilege_stub(env, "setpriv", SETPRIV_STUB, "setpriv-calls.log")
+        identity = tmp_path / "gh-identity"
+        env["STUB_GH_IDENTITY_FILE"] = str(identity)
+        _gh_stub(env)
+        script = _verify_script(env)
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "verified: redlexgilgamesh.guest can run gh" in result.stdout
+        log = Path(env["STUB_SETPRIV_LOG"])
+        assert log.exists(), "setpriv was not used"
+        assert "--reuid=redlexgilgamesh.guest" in log.read_text()
+        assert identity.read_text().strip() == "redlexgilgamesh.guest"
+
+    def test_a_root_host_uses_runuser_when_there_is_no_setpriv(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, "redlexgilgamesh.guest")
+        _privilege_stub(env, "runuser", RUNUSER_STUB, "runuser-calls.log")
+        identity = tmp_path / "gh-identity"
+        env["STUB_GH_IDENTITY_FILE"] = str(identity)
+        _gh_stub(env)
+        script = _verify_script(env)
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "verified: redlexgilgamesh.guest can run gh" in result.stdout
+        log = Path(env["STUB_RUNUSER_LOG"])
+        assert log.exists(), "runuser was not used"
+        assert "redlexgilgamesh.guest" in log.read_text()
+        assert identity.read_text().strip() == "redlexgilgamesh.guest"
+
+    def test_a_root_host_without_any_way_to_switch_users_says_so(self, tmp_path: Path) -> None:
+        """The diagnostic must not claim the jobs would break.
+
+        The real problem is a missing helper, not a gh the job cannot
+        run — and saying the jobs would die with "gh: command not
+        found" sends the operator after the wrong thing.
+        """
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, "redlexgilgamesh.guest")
+        _without_sudo(env)
+        _gh_stub(env)
+        script = _verify_script(env)
+
+        result = _run(script, env)
+
+        assert result.returncode != 0, "the check must fail when it did not verify"
+        assert "could not verify" in result.stdout
+        assert "gh: command not found" not in result.stdout, (
+            "the jobs would not break — the check could not run"
+        )
+
+
+class TestNoRunnerHome:
+    """Without a runner home the install is verified the other way round.
+
+    The binary has to be executable by EVERY user on the host, because
+    every job on the host runs it.
+    """
+
+    def _without_a_runner_home(self, tmp_path: Path, env: dict[str, str]) -> None:
+        _root_host_with_runner_home(tmp_path, env, "redlexgilgamesh.guest")
+        env["RUNNER_HOMES"] = str(tmp_path / "no-such-runner-home")
+
+    def test_a_gh_that_only_root_can_run_fails_the_check(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        self._without_a_runner_home(tmp_path, env)
+        _gh_stub(env, mode=0o700)
+        script = _verify_script(env)
+
+        result = _run(script, env)
+
+        assert result.returncode != 0, "a gh no user can run must fail the check"
+        assert "not executable by every user" in result.stdout
+
+    def test_a_gh_every_user_can_run_passes_the_check(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        self._without_a_runner_home(tmp_path, env)
+        _gh_stub(env, mode=0o755)
+        script = _verify_script(env)
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "executable by every user" in result.stdout
+
+
+class TestEveryRunnerHome:
+    """Two runner homes on one host can belong to different users."""
+
+    def test_every_runner_home_is_verified(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        _two_runner_homes(tmp_path, env, "alice", "bob")
+        _sudo_stub(env)
+        _gh_stub(env)
+        script = _verify_script(env)
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        calls = Path(env["STUB_SUDO_LOG"]).read_text().splitlines()
+        assert any("-u alice" in call for call in calls), f"alice was not verified: {calls}"
+        assert any("-u bob" in call for call in calls), f"bob was not verified: {calls}"
+
+
+class TestMacos:
+    """On macOS gh comes from Homebrew — and the prefix has to be on the
+    runner's PATH, or every job on the host dies with "gh: command not
+    found" while the provisioning reports success."""
+
+    def _prefix(self, tmp_path: Path) -> Path:
+        prefix = tmp_path / "homebrew"
+        (prefix / "bin").mkdir(parents=True)
+        return prefix
+
+    def test_the_macos_check_reports_a_missing_gh(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        prefix = self._prefix(tmp_path)
+        empty = tmp_path / "empty-job-path"
+        empty.mkdir()
+        script = (
+            f'source "{SCRIPT}"; homebrew_prefix() {{ printf "{prefix}"; }}; '
+            f'DEFAULT_JOB_PATH="{empty}"; uname_s=Darwin; verify_gh_runnable'
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode != 0, "a missing gh must fail the check"
+        assert "no GitHub CLI found" in result.stdout
+
+    def test_the_macos_check_verifies_the_installed_gh(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        prefix = self._prefix(tmp_path)
+        gh = prefix / "bin" / "gh"
+        gh.write_text("#!/bin/sh\necho 'gh version 2.103.3 (2026-01-01)'\n")
+        gh.chmod(0o755)
+        script = (
+            f'source "{SCRIPT}"; homebrew_prefix() {{ printf "{prefix}"; }}; '
+            "uname_s=Darwin; verify_gh_runnable"
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "verified: the GitHub CLI is at" in result.stdout
+
+    def test_the_macos_check_accepts_a_gh_on_the_default_job_path(self, tmp_path: Path) -> None:
+        """The gh does not have to come from Homebrew.
+
+        A tarball install puts gh in /usr/local/bin, and that dir is on
+        the default job PATH — the check must not fail that host.
+        """
+        env = _sandbox(tmp_path)
+        prefix = self._prefix(tmp_path)
+        job_bin = tmp_path / "job-bin"
+        job_bin.mkdir()
+        gh = job_bin / "gh"
+        gh.write_text("#!/bin/sh\necho 'gh version 2.103.3 (2026-01-01)'\n")
+        gh.chmod(0o755)
+        script = (
+            f'source "{SCRIPT}"; homebrew_prefix() {{ printf "{prefix}"; }}; '
+            f'DEFAULT_JOB_PATH="{job_bin}"; uname_s=Darwin; verify_gh_runnable'
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "on the default job PATH" in result.stdout
+
+    def test_the_homebrew_prefix_is_on_the_runner_path(self, tmp_path: Path) -> None:
+        """The prefix has to reach the runner's .path file.
+
+        The runner service builds the job PATH from that file — the
+        Homebrew prefix is not on the default job PATH.
+        """
+        env = _sandbox(tmp_path)
+        prefix = self._prefix(tmp_path)
+        runner_home = tmp_path / "runner-homes" / "actions-runner-linux"
+        runner_home.mkdir(parents=True)
+        path_file = runner_home / ".path"
+        path_file.write_text("/usr/local/bin\n")
+        env["RUNNER_HOMES"] = str(runner_home)
+        script = (
+            f'source "{SCRIPT}"; homebrew_prefix() {{ printf "{prefix}"; }}; '
+            "ensure_user_path_in_runner"
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert f"{prefix}/bin" in path_file.read_text()
+
+
+class TestToolDirs:
+    """The tools belong to the runner user, not to whoever provisioned.
+
+    The provisioning runs as root, and root's home holds no runner
+    directory — so a $HOME-based lookup put the tool dirs in
+    /root/.local/bin, where no job can read them.
+    """
+
+    def test_the_tool_dirs_come_from_the_runner_user_not_from_home(self, tmp_path: Path) -> None:
+        env = _sandbox(tmp_path)
+        # The runner home belongs to the user that runs the test, so the
+        # home that the script has to use is the one of that user.
+        _root_host_with_runner_home(tmp_path, env, _current_user())
+        script = f'source "{SCRIPT}"; resolve_tool_dirs; printf "%s\\n" "$TOOL_HOME" "$TOOL_USER"'
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stderr
+        tool_home, tool_user = result.stdout.split("\n")[:2]
+        assert tool_user == _current_user()
+        assert tool_home == str(Path.home()), (
+            f"the tool dirs have to come from the runner user's home, got {tool_home}"
+        )
+        assert tool_home != env["HOME"], "the invoking user's home must not decide"
+
+    def test_the_tool_install_runs_as_the_runner_user(self, tmp_path: Path) -> None:
+        """The tools have to be installed AS the runner user.
+
+        A tool that lands in /root/.local/bin is a tool no job can run:
+        the job runs as the runner user, and the .path file of that
+        runner points at the runner user's dirs. The installer has to
+        run as that user, not as whoever ran the provisioning.
+        """
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, _current_user())
+        _privilege_stub(env, "setpriv", SETPRIV_STUB, "setpriv-calls.log")
+        identity = tmp_path / "tool-identity"
+        script = (
+            f'source "{SCRIPT}"; resolve_tool_dirs; '
+            "as_tool_user bash -c 'printf '%s' \"$STUB_SUDO_USER\" > \"$1\"' _ "
+            f'"{identity}"'
+        )
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert identity.read_text().strip() == _current_user(), (
+            "the tool install did not run as the runner user"
+        )
+
+    def test_the_temp_dir_of_a_tool_install_belongs_to_the_tool_user(self, tmp_path: Path) -> None:
+        """The temp dir of a tool install has to be the tool user's.
+
+        The installs that run as the runner user clone into a temp dir,
+        and a root-owned 0700 temp dir cannot be cloned into by the
+        runner user — the build would fail on a host that has everything
+        it needs.
+        """
+        env = _sandbox(tmp_path)
+        _root_host_with_runner_home(tmp_path, env, _current_user())
+        script = f'source "{SCRIPT}"; resolve_tool_dirs; tool_tmpdir'
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.strip(), "no temp dir was created"
+        calls = Path(env["STUB_CHOWN_LOG"]).read_text().splitlines()
+        assert any(_current_user() in call for call in calls), (
+            f"the temp dir was not given to the tool user: {calls}"
+        )
+
+    def test_the_runner_path_file_is_written_for_the_runner_homes(self, tmp_path: Path) -> None:
+        """The .path file of the runner home has to be updated.
+
+        The runner dir is named by the RUNNER_HOMES knob and is not
+        under $HOME: the provisioning runs as root, and a glob under
+        root's home matched nothing.
+        """
+        env = _sandbox(tmp_path)
+        runner_home = tmp_path / "runner-homes" / "actions-runner-linux"
+        runner_home.mkdir(parents=True)
+        path_file = runner_home / ".path"
+        path_file.write_text("/usr/local/bin\n")
+        env["RUNNER_HOMES"] = str(runner_home)
+        script = f'source "{SCRIPT}"; resolve_tool_dirs; ensure_user_path_in_runner'
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        contents = path_file.read_text()
+        assert ".local/bin" in contents, f"the tool dirs are missing: {contents}"
+
+    def test_the_path_file_of_a_runner_home_under_the_invoking_home_is_updated(
+        self, tmp_path: Path
+    ) -> None:
+        """The knob is not the only way to find the runner home.
+
+        A host that is provisioned by the account that owns the runner
+        keeps that runner home under the account's home, and there the
+        knob still holds the fleet default. The .path file of the
+        runner that is really on the host has to be updated too, or the
+        tools never reach the job PATH of that runner.
+        """
+        env = _sandbox(tmp_path)
+        home = Path(env["HOME"])
+        home.mkdir(parents=True, exist_ok=True)
+        runner_home = home / "actions-runner-mac-1"
+        runner_home.mkdir(parents=True)
+        path_file = runner_home / ".path"
+        path_file.write_text("/usr/local/bin\n")
+        script = f'source "{SCRIPT}"; resolve_tool_dirs; ensure_user_path_in_runner'
+
+        result = _run(script, env)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        contents = path_file.read_text()
+        assert ".local/bin" in contents, f"the tool dirs are missing: {contents}"
+
+
+class TestRecordedDigests:
+    """The recorded digests have to be the ones upstream publishes.
+
+    The digests in the script and the checksum file this repository
+    records are two copies of the same fact — a test that compares them
+    with each other proves nothing. The file the repository records is
+    pinned by its own digest, so the chain is: the script's digest, the
+    recorded file, and the digest of that file.
+    """
+
+    def test_the_recorded_checksum_file_is_the_one_the_script_pins(self, tmp_path: Path) -> None:
+        recorded = CHECKSUMS_FILE
+        assert recorded.exists(), f"{recorded} is missing"
+        env = _sandbox(tmp_path)
+        script = f'source "{SCRIPT}"; gh_checksums_sha256 2.103.3'
+        result = _run(script, env)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == _sha256(recorded), (
+            "the script pins a checksum file that is not the one in the repository"
+        )
+
+    def test_the_recorded_digests_are_the_ones_the_checksum_file_has(self, tmp_path: Path) -> None:
+        """A typo or a swapped arch has to fail here, not on a host."""
+        env = _sandbox(tmp_path)
+        script = (
+            f'source "{SCRIPT}"; gh_expected_sha256 2.103.3 arm64; '
+            'printf "\\n"; gh_expected_sha256 2.103.3 amd64'
+        )
+        result = _run(script, env)
+        assert result.returncode == 0, result.stderr
+        arm64, amd64 = result.stdout.split("\n")[:2]
+
+        upstream = {}
+        for line in CHECKSUMS_FILE.read_text().splitlines():
+            digest, _, name = line.partition(" ")
+            upstream[name.strip()] = digest
+
+        assert arm64 == upstream[f"gh_{VERSION}_linux_arm64.tar.gz"], (
+            "the recorded arm64 digest is not the one upstream publishes"
+        )
+        assert amd64 == upstream[f"gh_{VERSION}_linux_amd64.tar.gz"], (
+            "the recorded amd64 digest is not the one upstream publishes"
+        )
 
 
 class TestSudoExpansion:

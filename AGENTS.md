@@ -96,7 +96,7 @@ uv run gh-runners remove --name <NAME>
 │   ├── github_api.py            # GitHub API interactions
 │   ├── runner_manager.py        # Native actions/runner binary lifecycle
 │   └── scripts/
-│       ├── provision-host.sh    # Idempotent host toolchain provisioning (Node/npm, pipx)
+│       ├── provision-host.sh    # Idempotent host toolchain provisioning (Node/npm, pipx, gh)
 │       ├── cleanup-host-disk.sh # Pressure-adaptive disk reclaim routine (timer-driven)
 │       └── install-disk-cleanup.sh  # Installs the routine + its two systemd units
 ├── tools/
@@ -162,14 +162,22 @@ every privileged step escalates with `sudo`, interactively by default so a
 watched invocation can answer the password prompt;
 `gh-runners provision --non-interactive` uses `sudo -n` instead, where a
 missing password fails the provisioning rather than hanging on a prompt.
-The provisioning ends with a check that the **runner user** can really run
-`gh` under the default job `PATH`. The runner user is the owner of the
-runner home, named by the `RUNNER_HOMES` knob with **absolute paths**
-(same knob as `install-disk-cleanup.sh`) — never derived from `$HOME`,
-because provisioning runs as root and root's home holds no runner
-directory. Without a runner home the provisioning fails loudly rather
-than verifying the invoking user, which would pass for a `gh` the runner
-user cannot execute.
+On Linux the provisioning ends with a check that the **runner user** can
+really run `gh` under the default job `PATH`; on macOS the equivalent
+check is that Homebrew's `gh` is on the runner's `.path` file. The runner
+user is the owner of the runner home, named by the `RUNNER_HOMES` knob
+with **absolute paths** (same knob as `install-disk-cleanup.sh`) — never
+a hardcoded name, and never taken from the invoking user's `$HOME` alone:
+provisioning runs as root and root's home holds no runner directory. A
+runner home under the invoking account's own home is found as well,
+because that is where it lives on a host that is provisioned by the
+account that owns the runner. Every runner home on the host is checked,
+and a runner home owned by root is refused: root is not a runner user,
+and a check that ran as root would prove nothing. Without a runner home
+the provisioning says so loudly and checks the install the other way
+round — the binary has to be executable by every user on the host —
+rather than verifying the invoking user, which would pass for a `gh` the
+runner user cannot execute.
 
 The flow for one runner:
 

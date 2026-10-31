@@ -37,7 +37,7 @@ def main(argv: list[str] | None = None) -> None:
 
     provision_p = subparsers.add_parser(
         "provision",
-        help="Provision the host with the toolchain jobs expect (Node/npm, pipx)",
+        help="Provision the host with the toolchain jobs expect (Node/npm, pipx, gh)",
     )
     provision_p.add_argument(
         "--non-interactive",

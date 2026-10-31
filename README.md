@@ -50,7 +50,8 @@ gap once per host:
   (`GH_VERSION`, default `v2.103.3`) is installed to `GH_INSTALL_PATH`
   (default `/usr/local/bin/gh`) after the download is checked against a
   recorded sha256; on macOS `gh` comes from Homebrew, because the pinned
-  release is Linux-only.
+  release is Linux-only. The Homebrew prefix is added to the runner's
+  `.path` file, so the jobs find `gh` there too.
 
 ```bash
 gh-runners provision        # safe to re-run; checks before it installs
@@ -73,7 +74,13 @@ accepts `sudo -E` when the invoking user holds the `SETENV` tag; on a host
 where it does not, the NodeSource install has to be run by a user that
 does.)
 
-### The runner home has to exist
+The runner-user check has to *switch* users — a check that runs as root
+proves nothing, because root bypasses the mode bits. When the
+provisioning cannot escalate (no `sudo` and the invoking user is not
+root) the check **fails loudly** instead of pretending it verified
+something: run the provisioning as root, or as a user that can `sudo`.
+
+### The runner-user check
 
 The provisioning ends with a check that the **runner user** — the owner of
 the runner home, never hardcoded — can really run `gh --version` under the
@@ -90,11 +97,25 @@ provisioning runs as root and root's home holds no runner directory:
 RUNNER_HOMES=/home/runner/actions-runner gh-runners provision
 ```
 
-When no runner home is found the provisioning **fails loudly** (`no runner
-home found — cannot verify the runner user`) instead of quietly verifying
-the invoking user. Install the runner first (`gh-runners install
---target-dir <runner home>`) or point `RUNNER_HOMES` at the runner home
-that is going to be used.
+A runner home under the provisioning account's own home is found as well
+— that is where it lives on a host that is provisioned by the account
+that owns the runner. Every runner home on the host is checked, not just
+the first one: two runner homes on one host can belong to different
+users. A runner home **owned by root** is refused — root is not a runner
+user, and a check that ran as root would verify nothing.
+
+When no runner home is found the provisioning **says so loudly** (`no
+runner home found — the runner user check did not run`) and checks the
+install the other way round: the binary has to be executable by *every*
+user on the host, because every job on the host runs it. A host that is
+provisioned before the runner is installed is a normal thing to be, so
+this does not fail the provisioning — point `RUNNER_HOMES` at the runner
+home that is going to be used to have the runner-user check run as well.
+
+`/usr/local/bin/gh` itself belongs to **root**, never to the user that
+runs the provisioning: it is a host-wide binary, and a `gh` the runner
+user owns is a `gh` that every job on the host — and every pull request
+that runs on it — can replace.
 
 ## Host disk management
 
@@ -305,6 +326,15 @@ gh-runners configure --name r3dlex-runner-1
 
 # Start it as a launchd service (persistent across reboots)
 gh-runners start --service
+```
+
+Provisioning before the runner is installed is fine — the runner-user
+check simply reports that it did not run and checks the `gh` install
+instead. To have that check really run as the runner user, point
+`RUNNER_HOMES` at the runner home and provision once more:
+
+```bash
+RUNNER_HOMES="$PWD/runners/mac-1" gh-runners provision
 ```
 
 Run the same sequence in another directory for each additional runner.
