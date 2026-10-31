@@ -5,11 +5,97 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# Bounds the whole run, including time spent queued for a runner. A tier with
+# no available runner leaves its job queued; this turns that into a bounded
+# failure instead of an indefinite hang. cancel-in-progress stays false so a
+# starved tier reports the timeout rather than a confusing "cancelled".
+timeout-minutes: 30
+
+concurrency:
+  group: runner-health
+  cancel-in-progress: false
+
 jobs:
   heartbeat:
-    runs-on: [self-hosted, ubuntu-latest]
+    name: heartbeat (${{ matrix.tier }})
+    runs-on: [self-hosted, "${{ matrix.os }}", "${{ matrix.arch }}"]
     timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tier: mac-arm64-primary
+            os: macOS
+            arch: arm64-primary
+            expect_os: Darwin
+            expect_arch: arm64
+          - tier: linux-arm64-standard
+            os: Linux
+            arch: arm64-standard
+            expect_os: Linux
+            expect_arch: arm64
+          - tier: linux-x64
+            os: Linux
+            arch: X64
+            expect_os: Linux
+            expect_arch: x64
     steps:
-      - run: echo "alive on $(hostname) at $(date -u +%FT%TZ)"
-      - run: uname -a
-      - run: docker --version || true
+      - name: Liveness
+        run: |
+          set -euo pipefail
+          echo "runner=$RUNNER_NAME host=$(hostname) at $(date -u +%FT%TZ)"
+          uname -a
+
+      - name: Required tooling is present
+        run: |
+          set -euo pipefail
+          for tool in git node; do
+            if command -v "$tool" >/dev/null 2>&1; then
+              echo "$tool: $(command -v "$tool")"
+            else
+              echo "::error::$tool is not on PATH"
+              exit 1
+            fi
+          done
+          if command -v docker >/dev/null 2>&1; then
+            docker --version || true
+          else
+            echo "docker: not installed on this runner (informational)"
+          fi
+
+      - name: Platform assertion
+        run: |
+          set -euo pipefail
+          os="$(uname -s)"
+          arch="$(node -p 'process.arch')"
+          echo "uname_s=$os uname_m=$(uname -m) node_arch=$arch"
+          if [ "$os" != "${{ matrix.expect_os }}" ]; then
+            echo "::error::wrong OS: expected ${{ matrix.expect_os }}, got $os"
+            exit 1
+          fi
+          if [ "$arch" != "${{ matrix.expect_arch }}" ]; then
+            echo "::error::wrong architecture: expected ${{ matrix.expect_arch }}, got $arch"
+            exit 1
+          fi
+
+      - name: Work directory is writable
+        run: |
+          set -euo pipefail
+          probe="$RUNNER_TEMP/runner-health-probe-$$"
+          printf 'ok\n' > "$probe"
+          cat "$probe"
+          rm -f "$probe"
+
+      - name: Disk headroom
+        run: |
+          set -euo pipefail
+          df -h "$RUNNER_TEMP" | tail -1
+          avail_kb="$(df -Pk "$RUNNER_TEMP" | awk 'NR==2 {print $4}')"
+          echo "free_kb=$avail_kb"
+          if [ "$avail_kb" -lt 1048576 ]; then
+            echo "::error::less than 1GiB free on the runner work volume"
+            exit 1
+          fi
