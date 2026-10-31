@@ -34,11 +34,22 @@ def _function_source(*names: str) -> str:
 
     The functions are copied verbatim out of the script, so the test drives
     the shipped code and not a copy of it.
+
+    A function the script does not have is emitted as an empty definition
+    instead of raising: a test written against a newer script then still
+    RUNS against an older one and fails on the BEHAVIOUR it is about,
+    rather than dying in the extractor.
     """
     lines = PROVISION.read_text().splitlines()
     chunks = []
     for name in names:
-        start = next(i for i, line in enumerate(lines) if line.startswith(f"{name}() {{"))
+        start = next(
+            (i for i, line in enumerate(lines) if line.startswith(f"{name}() {{")),
+            None,
+        )
+        if start is None:
+            chunks.append(f"{name}() {{ :; }}")
+            continue
         end = next(i for i in range(start, len(lines)) if lines[i] == "}")
         chunks.append("\n".join(lines[start : end + 1]))
     return "\n".join(chunks)
@@ -61,7 +72,13 @@ def _update_path_file(
     script = "\n".join(
         [
             "log() { printf '[provision] %s\\n' \"$*\"; }",
-            _function_source("path_file_has", "home_parents", "ensure_user_path_in_runner"),
+            _function_source(
+                "path_file_has",
+                "dir_owner",
+                "as_user",
+                "home_parents",
+                "ensure_user_path_in_runner",
+            ),
             "ensure_user_path_in_runner",
         ]
     )
@@ -258,6 +275,119 @@ class TestRunnerHomeEnumeration:
             )
 
 
+class TestPathFileUpdate:
+    """HIGH 1: the .path file must be replaced, not truncated in place.
+
+    The runner reads its .path file when it starts a job. A file that is
+    truncated in place and rewritten therefore hands the next job a
+    truncated or empty PATH, and the job loses uv, bun and archgate — and
+    the file is written on every provision run, so the window is not
+    theoretical.
+    """
+
+    @staticmethod
+    def _update_with_a_reader(home: Path, parents: Path, path_file: Path) -> str:
+        """Update the .path file while a reader holds the old one open.
+
+        The reader keeps its own descriptor on the file. If the file was
+        replaced (written to a temporary file and renamed), the reader
+        still sees the COMPLETE old content. If it was truncated in
+        place, the reader sees the new content — or a truncated file.
+        """
+        script = "\n".join(
+            [
+                "log() { printf '[provision] %s\\n' \"$*\"; }",
+                _function_source(
+                    "path_file_has",
+                    "dir_owner",
+                    "as_user",
+                    "home_parents",
+                    "ensure_user_path_in_runner",
+                ),
+                'exec 9<"$PATH_FILE"',
+                "ensure_user_path_in_runner",
+                "printf 'READER:'",
+                "cat <&9",
+            ]
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(home),
+                "RUNNER_HOME_PARENTS": str(parents),
+                "PATH_FILE": str(path_file),
+            }
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"failed: {result.stderr}"
+        return result.stdout.split("READER:", 1)[-1]
+
+    def test_a_reader_holding_the_file_open_still_sees_the_old_path(self, tmp_path: Path) -> None:
+        fleet = tmp_path / "homes" / "guest"
+        runner = fleet / "actions-runner-linux"
+        runner.mkdir(parents=True)
+        path_file = runner / ".path"
+        path_file.write_text("/usr/local/bin:/usr/bin\n")
+
+        reader_output = self._update_with_a_reader(tmp_path, tmp_path / "homes", path_file)
+
+        assert "/usr/local/bin:/usr/bin" in reader_output, (
+            "a reader that holds the .path file open across the update must "
+            f"still see the complete old PATH: {reader_output!r}"
+        )
+        assert ".local/bin" not in reader_output, (
+            "the file was truncated in place instead of replaced: the reader "
+            f"that holds it open sees the NEW content: {reader_output!r}"
+        )
+        assert path_file.read_text().count("\n") == 2, (
+            "the file itself must carry the new entries and the old line"
+        )
+
+    def test_a_fragment_with_glob_characters_is_not_taken_for_present(self, tmp_path: Path) -> None:
+        """The membership test must compare FIXED strings.
+
+        The fragment was interpolated into a `case` pattern, so it was a
+        glob: the owner home "runner[1]" made the pattern match the
+        different directory "runner1", the entry was judged to be there
+        already, and the runner never got the tool.
+        """
+        homes = tmp_path / "homes"
+        owner = homes / "runner[1]"
+        runner = owner / "actions-runner-linux"
+        runner.mkdir(parents=True)
+        path_file = runner / ".path"
+        # A DIFFERENT directory whose name the glob would match.
+        path_file.write_text(f"{os.path.realpath(homes / 'runner1')}/.local/bin\n")
+
+        _update_path_file(tmp_path, parents=homes)
+
+        content = path_file.read_text()
+        expected = f"{os.path.realpath(owner)}/.local/bin"
+        assert expected in content, (
+            f"the fragment {expected} is not in the file and must be added: {content!r}"
+        )
+
+    def test_an_empty_path_file_gets_no_trailing_blank_line(self, tmp_path: Path) -> None:
+        """A blank line is a PATH fragment that does not exist."""
+        fleet = tmp_path / "homes" / "guest"
+        runner = fleet / "actions-runner-linux"
+        runner.mkdir(parents=True)
+        path_file = runner / ".path"
+        path_file.write_text("")
+
+        _update_path_file(tmp_path, parents=tmp_path / "homes")
+
+        content = path_file.read_text()
+        assert content.strip(), "the entries have to be written"
+        assert not content.endswith("\n\n"), f"the file must not end with a blank line: {content!r}"
+
+
 class TestHomeParentSelection:
     """Only the home parent of THIS platform may be scanned.
 
@@ -279,3 +409,27 @@ class TestHomeParentSelection:
     def test_an_explicit_parent_overrides_the_default(self) -> None:
         parents = _home_parents({"RUNNER_HOME_PARENTS": "/srv/homes"})
         assert parents == ["/srv/homes"]
+
+    def test_an_explicitly_empty_parent_list_scans_nothing(self) -> None:
+        """An explicitly empty list means "the runner homes are not there".
+
+        An UNSET variable means "use the platform default". The two were
+        the same thing, so an operator who set the variable to the empty
+        string — to say "the runner homes are somewhere else" — silently
+        got the platform default instead and the provision wrote the
+        .path file of every runner on the host.
+        """
+        assert _home_parents({"RUNNER_HOME_PARENTS": ""}) == []
+
+    def test_an_explicitly_empty_parent_list_updates_no_runner(self, tmp_path: Path) -> None:
+        fleet = tmp_path / "homes" / "guest"
+        runner = fleet / "actions-runner-linux"
+        runner.mkdir(parents=True)
+        path_file = runner / ".path"
+        path_file.write_text("/usr/local/bin:/usr/bin\n")
+
+        _update_path_file(tmp_path, {"RUNNER_HOME_PARENTS": ""}, parents=tmp_path / "homes")
+
+        assert path_file.read_text() == "/usr/local/bin:/usr/bin\n", (
+            "an explicitly empty parent list must not scan anything"
+        )

@@ -20,6 +20,8 @@ docker) running against the machine that hosts the test.
 from __future__ import annotations
 
 import os
+import platform
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -41,6 +43,34 @@ INSTALLER = (
 )
 
 DAY = 86400.0
+
+
+def _make_runnable(binary: Path) -> None:
+    """Make a COPIED system binary executable on macOS.
+
+    A copy of an Apple platform binary keeps its signature but is killed
+    with SIGKILL the moment it is executed outside its original location:
+    the platform loader refuses the relocated signed image, so the process
+    dies before it can hold anything. The signature is removed and an
+    ad-hoc one applied instead, which is what a locally built binary
+    looks like.
+
+    On Linux there is no such restriction, so the copy runs as it is.
+    """
+    if platform.system() != "Darwin":
+        return
+    subprocess.run(
+        ["codesign", "--remove-signature", str(binary)],
+        check=False,
+        capture_output=True,
+    )
+    result = subprocess.run(
+        ["codesign", "-s", "-", str(binary)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"could not sign {binary}: {result.stderr}"
 
 
 def _age(path: Path, days: float) -> None:
@@ -299,6 +329,11 @@ class TestRunnerPathFile:
             {
                 "RUNNER_HOMES": str(home),
                 "INSTALL_PATH": str(install_path),
+                # The unit directory is moved out of systemd's way: an
+                # install that changes the install path while leaving the
+                # units in a live systemd directory is refused (it would
+                # rewrite the live runner-disk-cleanup.service).
+                "UNIT_DIR": str(home.parent / "units"),
             }
         )
         result = subprocess.run(
@@ -368,6 +403,29 @@ class TestRunnerPathFile:
             f"the colon-joined line must survive the install untouched, got {lines}"
         )
 
+    def test_a_fragment_with_glob_characters_is_not_taken_for_present(self, tmp_path: Path) -> None:
+        """The membership test must compare FIXED strings.
+
+        The fragment was interpolated into a `case` pattern, so it was a
+        glob: the install directory "opt[1]" made the pattern match the
+        DIFFERENT directory "opt1", the entry was judged to be there
+        already, and the runner never got the routine on its PATH.
+        """
+        home = tmp_path / "actions-runner-linux"
+        home.mkdir()
+        path_file = home / ".path"
+        install_path = tmp_path / "opt[1]" / "bin" / "runner-disk-cleanup.sh"
+        install_path.parent.mkdir(parents=True)
+        # A DIFFERENT directory whose name the glob would match.
+        path_file.write_text(f"{tmp_path / 'opt1' / 'bin'}\n")
+
+        self._update(home, install_path)
+
+        content = path_file.read_text()
+        assert str(install_path.parent) in content, (
+            f"the install directory must be added: {content!r}"
+        )
+
     def test_a_missing_install_directory_is_not_added(self, tmp_path: Path) -> None:
         """The guarantee has to be alive: a dead entry helps nobody.
 
@@ -381,7 +439,13 @@ class TestRunnerPathFile:
         install_path = tmp_path / "verify" / "missing" / "runner-disk-cleanup.sh"
 
         env = os.environ.copy()
-        env.update({"RUNNER_HOMES": str(home), "INSTALL_PATH": str(install_path)})
+        env.update(
+            {
+                "RUNNER_HOMES": str(home),
+                "INSTALL_PATH": str(install_path),
+                "UNIT_DIR": str(home.parent / "units"),
+            }
+        )
         result = subprocess.run(
             ["bash", "-c", 'source "$INSTALLER"; ensure_runner_path'],
             env={**env, "INSTALLER": str(INSTALLER)},
@@ -405,7 +469,14 @@ def _installer(overrides: dict[str, str], command: str) -> subprocess.CompletedP
     operator did NOT set it.
     """
     env = os.environ.copy()
-    for knob in ("SANDBOX", "SANDBOX_ROOT", "RUNNER_HOMES", "INSTALL_PATH", "UNIT_DIR"):
+    for knob in (
+        "SANDBOX",
+        "SANDBOX_ROOT",
+        "RUNNER_HOMES",
+        "INSTALL_PATH",
+        "UNIT_DIR",
+        "SYSTEMD_UNIT_DIRS",
+    ):
         env.pop(knob, None)
     env.update(overrides)
     env["INSTALLER"] = str(INSTALLER)
@@ -512,8 +583,56 @@ class TestInstallerSandbox:
             f"the refusal has to name the knob the operator has to set, got {result.stdout}"
         )
 
-    def test_naming_the_runner_homes_explicitly_is_allowed(self, tmp_path: Path) -> None:
-        """The guard must not block the legitimate mixed run."""
+    def test_naming_the_runner_homes_explicitly_is_not_enough(self, tmp_path: Path) -> None:
+        """BLOCKER 2: the documented flow must not rewrite the live unit.
+
+        The documentation told the operator that naming RUNNER_HOMES was
+        enough to make a verification run safe. It is not: the unit
+        directory was still the live /etc/systemd/system, so the run
+        rewrote the LIVE runner-disk-cleanup.service to execute the
+        verification's path. The live timer then failed on every tick and
+        the root filesystem filled up.
+        """
+        home = tmp_path / "actions-runner-linux"
+        home.mkdir()
+        # The "live" systemd directory, pointed at a sandbox so the test
+        # can look at it. SYSTEMD_UNIT_DIRS is the installer's own knob
+        # for it; on the host it is the real set of directories systemd
+        # reads.
+        live_units = tmp_path / "live-systemd"
+        live_units.mkdir()
+
+        result = _installer(
+            {
+                "RUNNER_HOMES": str(home),
+                "INSTALL_PATH": str(tmp_path / "verify" / "runner-disk-cleanup.sh"),
+                "UNIT_DIR": str(live_units),
+                "SYSTEMD_UNIT_DIRS": str(live_units),
+            },
+            'source "$INSTALLER"',
+        )
+
+        assert result.returncode != 0, (
+            "a run that changes the install path while its units still go "
+            "to a live systemd directory must be refused"
+        )
+        assert "UNIT_DIR" in result.stdout, (
+            f"the refusal has to name the knob the operator has to set, got {result.stdout}"
+        )
+        assert not (live_units / "runner-disk-cleanup.service").exists(), (
+            "the live unit file must not be rewritten by a refused run"
+        )
+        assert not (live_units / "runner-disk-cleanup.timer").exists(), (
+            "the live timer file must not be rewritten by a refused run"
+        )
+
+    def test_a_fully_isolated_run_is_allowed(self, tmp_path: Path) -> None:
+        """The guard must not block the legitimate isolated run.
+
+        A verification run names the runner homes, the install path AND a
+        unit directory that systemd does not read. Nothing live is
+        touched, so it is allowed.
+        """
         home = tmp_path / "actions-runner-linux"
         home.mkdir()
 
@@ -521,11 +640,42 @@ class TestInstallerSandbox:
             {
                 "RUNNER_HOMES": str(home),
                 "INSTALL_PATH": str(tmp_path / "verify" / "runner-disk-cleanup.sh"),
+                "UNIT_DIR": str(tmp_path / "units"),
             },
             'source "$INSTALLER"',
         )
 
         assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+
+    def test_the_live_run_is_still_allowed(self, tmp_path: Path) -> None:
+        """The live defaults are a coherent run and must not be refused."""
+        result = _installer({}, 'source "$INSTALLER"')
+
+        assert result.returncode == 0, f"{result.stdout}{result.stderr}"
+
+    def test_units_outside_systemd_with_the_live_install_path_are_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """The mirror image: an isolated unit directory cannot enable the
+        LIVE timer.
+
+        The unit files would go somewhere systemd never reads, but the
+        install path is still the live one, so the run would enable the
+        LIVE runner-disk-cleanup.timer while the operator believes the run
+        is isolated.
+        """
+        result = _installer(
+            {"UNIT_DIR": str(tmp_path / "units")},
+            'source "$INSTALLER"',
+        )
+
+        assert result.returncode != 0, (
+            "a run that moves the units away from systemd but keeps the live "
+            "install path must be refused"
+        )
+        assert "INSTALL_PATH" in result.stdout, (
+            f"the refusal has to name the knob the operator has to set, got {result.stdout}"
+        )
 
     def test_fix_runner_ownership_leaves_a_home_outside_the_sandbox_alone(
         self, tmp_path: Path
@@ -772,6 +922,11 @@ class TestRunnerOwnerDerivation:
             {
                 "RUNNER_HOMES": str(runner_home),
                 "UNIT_DIR": str(unit_dir),
+                # The install path is a sandbox path as well: a run that
+                # points the unit directory away from systemd while leaving
+                # the install path at the live default is a mixed run and
+                # is refused (see the installer's guard).
+                "INSTALL_PATH": str(tmp_path / "verify" / "runner-disk-cleanup.sh"),
                 "INSTALLER": str(INSTALLER),
             }
         )
@@ -837,6 +992,7 @@ class TestRunnerOwnerDerivation:
             {
                 "RUNNER_HOMES": str(runner_home),
                 "UNIT_DIR": str(unit_dir),
+                "INSTALL_PATH": str(tmp_path / "verify" / "runner-disk-cleanup.sh"),
                 "INSTALLER": str(INSTALLER),
             }
         )
@@ -1028,7 +1184,12 @@ def _managed_interpreter(home: Path, version: str = "3.11") -> Path:
     """A uv managed CPython tree under the sandbox home."""
     tree = home / ".local" / "share" / "uv" / "python" / f"cpython-{version}-linux-aarch64-gnu"
     (tree / "bin").mkdir(parents=True)
-    (tree / "bin" / "python3").write_text("#!/bin/sh\n")
+    interpreter = tree / "bin" / "python3"
+    interpreter.write_text("#!/bin/sh\n")
+    # The interpreter is executable, like the real one: the recency check
+    # only looks at executables, and a fixture that is not one would not
+    # exercise it.
+    interpreter.chmod(0o755)
     return tree
 
 
@@ -1347,4 +1508,429 @@ class TestProcCollector:
         assert fast == slow, f"the two collectors must return the same paths: {fast} != {slow}"
         assert any(str(target) in path for path in fast), (
             f"the open descriptor must be found: {fast}"
+        )
+
+
+def _fake_proc(tmp_path: Path) -> Path:
+    """A synthetic /proc for the liveness collectors.
+
+    PROC_ROOT is the routine's own knob for the process filesystem. The
+    liveness rules are the safety net of this routine, so they have to be
+    provable on every platform — not only on the Linux fleet, where the
+    real /proc happens to exist.
+    """
+    proc = tmp_path / "proc"
+    (proc / "self").mkdir(parents=True)
+    return proc
+
+
+def _fake_pid(proc: Path, pid: str, comm: str = "runner") -> Path:
+    """A process directory in the synthetic /proc."""
+    d = proc / pid
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "comm").write_text(f"{comm}\n")
+    return d
+
+
+class TestExecutableLiveness:
+    """BLOCKER 1: the executable of a live process must protect its tree.
+
+    The liveness guard could not see a RUNNING executable: both
+    collectors only read /proc/<pid>/cwd and /proc/<pid>/fd/*, and
+    /proc/<pid>/exe is a magic symlink — the kernel keeps no descriptor
+    for the executable image. The toolchain sweep deletes exactly that
+    class of path (a managed CPython, a mise install, a rust toolchain),
+    so the guard did not protect the paths this routine adds.
+    """
+
+    @staticmethod
+    def _sweep_caches_with_proc(home: Path, tmp_path: Path, proc: Path, tier: int = 3) -> str:
+        """Run the cache sweep against a synthetic /proc."""
+        env = _env(home, tmp_path)
+        env.update(
+            {
+                "CLEANUP_SCRIPT": str(SCRIPT),
+                "TIER": str(tier),
+                "PROC_ROOT": str(proc),
+            }
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$CLEANUP_SCRIPT"; collect_inuse; prune_caches "$TIER"',
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"cache sweep failed: {result.stderr}"
+        return result.stdout
+
+    def test_a_managed_interpreter_a_live_process_runs_survives(
+        self, runner_home: Path, tmp_path: Path
+    ) -> None:
+        """The tree that a job is EXECUTING must never be swept.
+
+        The interpreter of a running job is not an open file of that
+        job: the kernel keeps no descriptor for the executable image, so
+        /proc/<pid>/fd says nothing about it. Without reading
+        /proc/<pid>/exe the sweep deletes the interpreter out from under
+        the process that is running it, and every child the job spawns
+        afterwards fails with ENOENT.
+        """
+        tree = _managed_interpreter(tmp_path)
+        _age(tree, 60)
+        target = tree / "bin" / "python3"
+
+        proc = _fake_proc(tmp_path)
+        pid = _fake_pid(proc, "4242")
+        (pid / "exe").symlink_to(target)
+
+        output = self._sweep_caches_with_proc(runner_home, tmp_path, proc)
+
+        assert tree.exists(), (
+            f"the managed interpreter a live process is running must never be swept: {output}"
+        )
+
+    @staticmethod
+    def _exec_paths(proc: Path, home: Path, tmp_path: Path, collector: str) -> list[str]:
+        env = _env(home, tmp_path)
+        env.update({"CLEANUP_SCRIPT": str(SCRIPT), "PROC_ROOT": str(proc)})
+        script = (
+            'source "$CLEANUP_SCRIPT"; INUSE_PATHS=(); EXEC_PATHS=(); '
+            '"$COLLECTOR"; printf "%s\\n" "${EXEC_PATHS[@]:-}"'
+        )
+        env["COLLECTOR"] = collector
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"collector failed: {result.stderr}"
+        return [line for line in result.stdout.splitlines() if line]
+
+    def test_both_collectors_see_the_executable_of_a_live_process(
+        self, runner_home: Path, tmp_path: Path
+    ) -> None:
+        """Both collectors have to look at /proc/<pid>/exe.
+
+        The two collectors are proven to return the same set, so both
+        have to read the executable — otherwise the fast collector would
+        report a live interpreter as free and the slow one would protect
+        it, and which one runs depends on whether the host has `ls`.
+        """
+        tree = _managed_interpreter(tmp_path)
+        target = tree / "bin" / "python3"
+
+        proc = _fake_proc(tmp_path)
+        pid = _fake_pid(proc, "4242")
+        (pid / "exe").symlink_to(target)
+
+        for collector in ("collect_inuse_proc_ls", "collect_inuse_proc_readlink"):
+            found = self._exec_paths(proc, runner_home, tmp_path, collector)
+            assert str(target) in found, (
+                f"{collector} must see the executable of a live process: {found}"
+            )
+
+    def test_a_symlink_target_containing_an_arrow_is_not_truncated(
+        self, runner_home: Path, tmp_path: Path
+    ) -> None:
+        """A path that contains " -> " must survive the collection.
+
+        "ls -l" prints "name -> target", and the target was taken after
+        the FIRST " -> " in the line. A target that itself contains
+        " -> " was truncated, and a truncated path matches nothing — a
+        silently broken liveness check.
+        """
+        weird = tmp_path / "weird -> dir"
+        weird.mkdir()
+
+        proc = _fake_proc(tmp_path)
+        pid = _fake_pid(proc, "4242")
+        (pid / "fd").mkdir()
+        (pid / "fd" / "3").symlink_to(weird)
+
+        env = _env(runner_home, tmp_path)
+        env.update({"CLEANUP_SCRIPT": str(SCRIPT), "PROC_ROOT": str(proc)})
+        script = (
+            'source "$CLEANUP_SCRIPT"; INUSE_PATHS=(); EXEC_PATHS=(); '
+            'collect_inuse_proc_ls; printf "%s\\n" "${INUSE_PATHS[@]:-}"'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"collector failed: {result.stderr}"
+        collected = [line for line in result.stdout.splitlines() if line]
+        assert str(weird) in collected, (
+            f"a target that contains ' -> ' must not be truncated: {collected}"
+        )
+
+    def test_a_running_interpreter_survives_the_toolchain_sweep(
+        self, runner_home: Path, tmp_path: Path
+    ) -> None:
+        """The same rule, with a REAL process.
+
+        The synthetic /proc proves the rule is implemented; this proves
+        it end to end: the kernel points /proc/<pid>/exe at the binary
+        the process is running, and the sweep has to leave that binary
+        alone.
+        """
+        tree = _managed_interpreter(tmp_path)
+        target = tree / "bin" / "python3"
+        # A real binary, so the kernel's /proc/<pid>/exe names it. The
+        # content is copied and the mode set explicitly: copy2 also
+        # copies the extended attributes, which a copy onto another
+        # volume refuses.
+        shutil.copyfile("/bin/sleep", target)
+        target.chmod(0o755)
+        _make_runnable(target)
+        # The tree is aged AFTER the copy: a fresh file would survive the
+        # sweep on its mtime alone and the test would prove nothing.
+        _age(tree, 60)
+
+        holder = subprocess.Popen([str(target), "30"], cwd=tmp_path)
+        try:
+            time.sleep(0.5)
+            assert holder.poll() is None, (
+                "the fixture binary did not start, so the test would prove "
+                f"nothing (exit {holder.poll()})"
+            )
+            output = _sweep_caches(runner_home, tmp_path, tier=3)
+        finally:
+            holder.terminate()
+            holder.wait()
+
+        assert tree.exists(), (
+            f"the interpreter a live process is running must never be swept: {output}"
+        )
+
+    def test_a_toolchain_used_recently_is_not_swept(
+        self, runner_home: Path, tmp_path: Path
+    ) -> None:
+        """The second line of defence: a recently RUN interpreter is kept.
+
+        The tree's mtime is the sweep's staleness signal and it says
+        nothing about use. A toolchain that a job uses every day was
+        installed months ago, so its mtime is old — and it is exactly
+        what the sweep deletes. The interpreter's access time is the
+        signal that says "it was run", and it is the only one that
+        survives the process that ran it exiting.
+        """
+        tree = _managed_interpreter(tmp_path)
+        interpreter = tree / "bin" / "python3"
+        _age(tree, 60)
+        # Executed just now: the access time is fresh, the mtime is not.
+        now = time.time()
+        os.utime(interpreter, (now, now - 60 * DAY))
+
+        output = _sweep_caches(runner_home, tmp_path, tier=3)
+
+        assert tree.exists(), (
+            f"a toolchain whose interpreter was run today must not be reclaimed: {output}"
+        )
+
+
+class TestOwnerHomeSweep:
+    """MEDIUM 1: every owner home is swept, not just the first one.
+
+    The knob takes a LIST. A host with two runner homes owned by two
+    different users has two owner homes, and sweeping only the first one
+    left the second user's toolchains growing without bound while the
+    routine reported green.
+    """
+
+    def test_the_toolchains_of_every_owner_home_are_swept(self, tmp_path: Path) -> None:
+        owner_a = tmp_path / "owner-a"
+        owner_b = tmp_path / "owner-b"
+        home_a = owner_a / "actions-runner-linux"
+        home_b = owner_b / "actions-runner-linux"
+        home_a.mkdir(parents=True)
+        home_b.mkdir(parents=True)
+
+        tree_b = _managed_interpreter(owner_b)
+        _age(tree_b, 60)
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "RUNNER_HOMES": f"{home_a} {home_b}",
+                "HOME_DIR": str(owner_a),
+                "DATA_MOUNT": str(tmp_path / "no-data-mount"),
+                "TMP_DIR": str(tmp_path / "tmp"),
+                "LOCK_FILE": str(tmp_path / "cleanup.lock"),
+                "WATCH_PCT": "0",
+                "ELEVATED_PCT": "0",
+                "CRITICAL_PCT": "0",
+                "TARGET_PCT": "0",
+                "MAX_PASSES": "1",
+                "CLEANUP_SCRIPT": str(SCRIPT),
+                "TIER": "3",
+            }
+        )
+        result = subprocess.run(
+            ["bash", "-c", 'source "$CLEANUP_SCRIPT"; collect_inuse; prune_caches "$TIER"'],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"cache sweep failed: {result.stderr}"
+
+        assert not tree_b.exists(), (
+            f"the owner home of the SECOND runner home must be swept too: {result.stdout}"
+        )
+
+
+class TestSystemPruneGuards:
+    """MEDIUM 2: the system prune is guarded by activity, not by hope.
+
+    The apt package index and the crash dumps live outside every watched
+    root, so the in-use scan says nothing about them. They used to be
+    dropped unconditionally, while the documentation promised that
+    every destructive step is guarded.
+    """
+
+    @staticmethod
+    def _prune_system(tmp_path: Path, comm: str | None) -> list[str]:
+        """Run prune_system with recording stand-ins for the host tools.
+
+        `rm`, `journalctl`, `apt-get` and `docker` record their arguments
+        instead of doing anything, so the test never touches the machine
+        it runs on.
+        """
+        fake_bin = tmp_path / "fake-bin"
+        fake_bin.mkdir()
+        record = tmp_path / "calls.log"
+        for name in ("docker", "rm", "journalctl", "apt-get"):
+            stand_in = fake_bin / name
+            stand_in.write_text(
+                f'#!/bin/sh\nprintf "%s %s\\n" "{name}" "$*" >> "$CALL_RECORD"\nexit 0\n'
+            )
+            stand_in.chmod(0o755)
+
+        proc = _fake_proc(tmp_path)
+        if comm is not None:
+            _fake_pid(proc, "4242", comm)
+
+        env = _env(tmp_path / "runner", tmp_path)
+        env.update(
+            {
+                "CLEANUP_SCRIPT": str(SCRIPT),
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "CALL_RECORD": str(record),
+                "PROC_ROOT": str(proc),
+            }
+        )
+        result = subprocess.run(
+            ["bash", "-c", 'source "$CLEANUP_SCRIPT"; prune_system 2 0'],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"prune_system failed: {result.stderr}"
+        if not record.exists():
+            return []
+        return record.read_text().splitlines()
+
+    def test_the_apt_index_is_kept_while_a_package_manager_runs(self, tmp_path: Path) -> None:
+        """A job that installs a package needs the index it installs FROM."""
+        calls = self._prune_system(tmp_path, "apt-get")
+
+        assert not [c for c in calls if "/var/lib/apt/lists" in c], (
+            f"the apt index must not be dropped while apt is running: {calls}"
+        )
+
+    def test_the_apt_index_is_dropped_when_no_package_manager_runs(self, tmp_path: Path) -> None:
+        """The guard is an activity check, not a permanent exemption."""
+        calls = self._prune_system(tmp_path, "bash")
+
+        assert [c for c in calls if "/var/lib/apt/lists" in c], (
+            f"the apt index has to be reclaimed when nothing is installing: {calls}"
+        )
+
+
+class TestRunnerHomePaths:
+    """LOW: a runner home is always an absolute path.
+
+    A relative value makes every path derived from it relative as well,
+    and the cache sweep would then delete paths relative to the unit's
+    working directory (/).
+    """
+
+    def test_a_relative_runner_home_is_made_absolute(self, tmp_path: Path) -> None:
+        env = _env(tmp_path / "actions-runner-linux", tmp_path)
+        env.update({"CLEANUP_SCRIPT": str(SCRIPT), "RUNNER_HOMES": "relative/actions-runner"})
+        result = subprocess.run(
+            ["bash", "-c", 'source "$CLEANUP_SCRIPT"; printf "%s\\n" "${RUNNER_HOME_LIST[@]}"'],
+            env=env,
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        entries = [line for line in result.stdout.splitlines() if line]
+        assert entries, "the runner home must be listed"
+        for entry in entries:
+            assert entry.startswith("/"), (
+                f"a relative runner home would make the sweep delete paths relative to /: {entry}"
+            )
+
+
+class TestUnitFileWrite:
+    """LOW: the unit files are replaced, not truncated in place.
+
+    `tee` truncates the live unit in place, and a daemon-reload that
+    races the write loads a half-written unit. A rename(2) within the
+    directory is atomic, so systemd only ever sees the complete unit.
+    """
+
+    def test_the_unit_files_are_replaced_atomically(self, tmp_path: Path) -> None:
+        unit_dir = tmp_path / "units"
+        unit_dir.mkdir()
+        service = unit_dir / "runner-disk-cleanup.service"
+        service.write_text("old content\n")
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "RUNNER_HOMES": str(tmp_path / "runner"),
+                "INSTALL_PATH": str(tmp_path / "verify" / "runner-disk-cleanup.sh"),
+                "UNIT_DIR": str(unit_dir),
+                "UNIT_FILE": str(service),
+                "INSTALLER": str(INSTALLER),
+            }
+        )
+        script = (
+            # SUDO is emptied so the test can never block on a password
+            # prompt: the unit files are written into a sandbox
+            # directory, so no privilege is needed.
+            'exec 9<"$UNIT_FILE"; source "$INSTALLER"; SUDO=""; install_units; '
+            'printf "READER:"; cat <&9'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"install_units failed: {result.stderr}"
+
+        reader_output = result.stdout.split("READER:", 1)[-1]
+        assert "old content" in reader_output, (
+            "the unit file was truncated in place instead of replaced: a "
+            f"reader that holds it open sees the new content: {reader_output!r}"
+        )
+        assert not list(unit_dir.glob(".runner-disk-cleanup.*")), (
+            "the temporary unit files must be renamed away, not left behind"
         )

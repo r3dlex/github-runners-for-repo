@@ -50,12 +50,24 @@
 #   1. mtime — the runner writes into an active job's checkout continuously, so
 #      a live job's directory is never stale by mtime. The age window is
 #      never zero, so this backstop always runs.
-#   2. /proc — the working directory and open files of EVERY live process
-#      are read directly, and any path under a watched root is treated as in
-#      use regardless of age. actions/runner never changes its own working
-#      directory (it sets the child's instead), so the process that holds a
-#      checkout is the child the runner spawned — node, git, bash. Matching
-#      on the runner's own command line would protect nothing.
+#   2. /proc — the working directory, the open files, the mapped files and the
+#      EXECUTABLE of EVERY live process are read directly, and any path under
+#      a watched root is treated as in use regardless of age. actions/runner
+#      never changes its own working directory (it sets the child's instead),
+#      so the process that holds a checkout is the child the runner spawned —
+#      node, git, bash. Matching on the runner's own command line would
+#      protect nothing.
+#
+# The executable image is read on its own account. /proc/<pid>/exe is a magic
+# symlink, NOT an open file descriptor: the kernel keeps no fd for the
+# executable image, and a mapped shared library is not an fd either. A process
+# that is RUNNING a binary therefore leaves no trace in /proc/<pid>/fd, and a
+# sweep that only reads the working directory and the descriptors cannot see
+# it. That matters for the installed toolchain trees: a job executing a
+# managed CPython from ~/.local/share/uv/python would have its interpreter
+# deleted from under it, and every child it spawns afterwards would fail with
+# ENOENT. The live executables are therefore collected into their own set,
+# which the toolchain sweep consults independently of the watched-root filter.
 #
 # A path that is in use is NEVER deleted, at any tier. A live process that
 # holds a path's DIRECT PARENT also protects it: a process whose working
@@ -64,6 +76,12 @@
 # all times, so a general "any parent protects" rule would disable the temp
 # sweep permanently, and walking up to the runner home would disable the whole
 # sweep, because the runner's own processes always hold that.
+#
+# The system-level prune (the apt package index and the crash dumps) is not
+# covered by the in-use scan — those paths are not under a watched root and
+# are not held by a job. They are guarded by their own activity check
+# instead: the apt index is only dropped while no package manager is running,
+# and the crash dumps only while no coredump is being written.
 #
 # ## Mutual exclusion
 #
@@ -145,21 +163,63 @@ log() {
 # The value is split on whitespace, so a path that contains a space cannot
 # be expressed in this list.
 RUNNER_HOMES="${RUNNER_HOMES:-/home/redlexgilgamesh.guest/actions-runner-linux /home/redlexgilgamesh.guest/actions-runner-linux-2}"
-read -r -a RUNNER_HOME_LIST <<<"$RUNNER_HOMES"
 
-# The home directory whose caches are worth reclaiming — the RUNNER user's, not
-# root's. The unit runs as root (it prunes system dirs and docker) and
-# systemd does not export HOME for a root unit, so `$HOME` is both unbound
-# under `set -u` and the wrong directory when it is set. The runner home is
-# <user home>/actions-runner-linux, so the user home is one level up.
+# Every runner home is made absolute before it is used. A relative value
+# would make every path derived from it relative as well, and the cache
+# sweep would then delete paths relative to the unit's working directory
+# (/) — the sweep must never depend on where the unit happens to run.
+read -r -a _runner_homes <<<"$RUNNER_HOMES"
+RUNNER_HOME_LIST=()
+for _runner_home in "${_runner_homes[@]:-}"; do
+  [ -n "$_runner_home" ] || continue
+  case "$_runner_home" in
+    /*) ;;
+    *) _runner_home="$PWD/$_runner_home" ;;
+  esac
+  RUNNER_HOME_LIST+=("$_runner_home")
+done
+unset _runner_home _runner_homes
+
+# The home directories whose caches and toolchains are worth reclaiming —
+# the RUNNER users', not root's. The unit runs as root (it prunes system
+# dirs and docker) and systemd does not export HOME for a root unit, so
+# `$HOME` is both unbound under `set -u` and the wrong directory when it is
+# set. The runner home is <user home>/actions-runner-linux, so the user
+# home is one level up.
+#
+# The knob takes a LIST, so the owner home of EVERY entry is swept, not
+# only the first one: a host with two runner homes owned by two different
+# users has two owner homes, and sweeping only the first one left the
+# second user's toolchains growing without bound while the routine
+# reported green.
 HOME_DIR="${HOME_DIR:-}"
-if [ -z "$HOME_DIR" ]; then
-  if [ "${#RUNNER_HOME_LIST[@]}" -gt 0 ]; then
-    HOME_DIR="$(dirname "${RUNNER_HOME_LIST[0]}")"
-  else
-    HOME_DIR="${HOME:-/root}"
-  fi
+OWNER_HOME_LIST=()
+
+add_owner_home() {
+  local candidate="$1" known
+  [ -n "$candidate" ] || return 0
+  for known in "${OWNER_HOME_LIST[@]:-}"; do
+    [ -n "$known" ] || continue
+    [ "$known" = "$candidate" ] && return 0
+  done
+  OWNER_HOME_LIST+=("$candidate")
+}
+
+# An explicitly named HOME_DIR is an ADDITIONAL owner home: the runner
+# homes' own owners are always swept.
+add_owner_home "$HOME_DIR"
+for _runner_home in "${RUNNER_HOME_LIST[@]:-}"; do
+  [ -n "$_runner_home" ] || continue
+  add_owner_home "$(dirname "$_runner_home")"
+done
+unset _runner_home
+
+if [ "${#OWNER_HOME_LIST[@]}" -eq 0 ]; then
+  OWNER_HOME_LIST=("${HOME:-/root}")
 fi
+# The primary owner home, kept for the messages and for the knob's
+# documented meaning.
+HOME_DIR="${OWNER_HOME_LIST[0]}"
 
 # The filesystem that holds the runner work. On the Colima VM the runner's
 # _work directory is bind-mounted onto the 100G data disk, so it fills
@@ -171,10 +231,10 @@ DATA_MOUNT="${DATA_MOUNT:-/mnt/lima-colima}"
 # routine can be exercised against a sandbox instead of the real /tmp.
 TMP_DIR="${TMP_DIR:-/tmp}"
 
-# The roots this routine is allowed to touch: the runner homes and the home
-# that owns the caches. Used to keep the in-use set small.
+# The roots this routine is allowed to touch: the runner homes and every
+# owner home that holds the caches. Used to keep the in-use set small.
 WATCH_ROOTS=()
-for _root in "$HOME_DIR" "${RUNNER_HOME_LIST[@]:-}"; do
+for _root in "${OWNER_HOME_LIST[@]:-}" "${RUNNER_HOME_LIST[@]:-}"; do
   [ -n "$_root" ] || continue
   case " ${WATCH_ROOTS[*]:-} " in
     *" $_root "*) ;;
@@ -210,8 +270,42 @@ under_watched_root() {
 
 INUSE_PATHS=()
 
-# Linux: read the working directory and open files of EVERY live process
-# straight out of /proc.
+# The executable image of every live process, kept SEPARATELY from the
+# in-use set.
+#
+# /proc/<pid>/exe is a magic symlink: it names the binary the process is
+# RUNNING. It is not an open file descriptor — the kernel keeps no fd for
+# the executable image — so a process that is executing a binary leaves no
+# trace in /proc/<pid>/fd. The in-use set is filtered down to the watched
+# roots to stay small; this set is not, because the toolchain sweep needs
+# to know what is being EXECUTED even when the tree is not under a watched
+# root.
+EXEC_PATHS=()
+
+# The root of the process filesystem. It is a knob so the collectors can be
+# exercised against a synthetic /proc in the sandbox tests — the liveness
+# rules are the safety net of this routine, and they have to be provable on
+# every platform, not only on Linux. It is NEVER set on the host: the
+# routine is installed as a systemd unit that inherits no such variable,
+# and the default is the real /proc.
+PROC_ROOT="${PROC_ROOT:-/proc}"
+
+# The target of every "ls -l" line on stdin.
+#
+# "ls -l" prints "<permissions> <links> <owner> <group> <size> <date>
+# <name> -> <target>", and the target is the LAST field of the line. The
+# separator is therefore the FIRST " -> " in the line: the names in /proc
+# are fixed ("cwd", "exe", a descriptor number), while the target is a
+# path that may itself contain " -> " — a directory called "weird -> dir"
+# is a legal name. Splitting at the first occurrence takes the whole
+# target; splitting at the last one would cut it in half and leave a
+# path that matches nothing, which is a silently broken liveness check.
+ls_link_targets() {
+  awk 'index($0, " -> ") { print substr($0, index($0, " -> ") + 4) }'
+}
+
+# Linux: read the working directory, the open files, the mapped files and
+# the executable of EVERY live process straight out of /proc.
 #
 # There is deliberately no command-line filter here. actions/runner never
 # calls Directory.SetCurrentDirectory, so the runner process itself does not
@@ -237,6 +331,26 @@ INUSE_PATHS=()
 # set (the sandbox test compares them on every Linux run).
 collect_inuse_proc_ls() {
   local target
+  # The executable of every live process.
+  #
+  # `ls` is deliberate: it prints the target of every symlink it lists, so
+  # the whole host is read in ONE process instead of a readlink fork per
+  # live process.
+  # shellcheck disable=SC2012
+  while IFS= read -r target; do
+    [ -n "$target" ] || continue
+    case "$target" in
+      /*) ;;
+      *) continue ;;
+    esac
+    # A binary that was deleted from the filesystem keeps its name with a
+    # " (deleted)" suffix.
+    target="${target% (deleted)}"
+    EXEC_PATHS+=("$target")
+    under_watched_root "$target" && INUSE_PATHS+=("$target")
+  done < <(ls -l "$PROC_ROOT"/[0-9]*/exe 2>/dev/null | ls_link_targets)
+
+  # The working directory and the open files.
   while IFS= read -r target; do
     [ -n "$target" ] || continue
     # The target of a socket, a pipe or an unreadable link is not a path
@@ -246,15 +360,49 @@ collect_inuse_proc_ls() {
     INUSE_PATHS+=("$target")
   done < <(
     {
-      ls -l /proc/[0-9]*/cwd 2>/dev/null
-      ls -l /proc/[0-9]*/fd 2>/dev/null
-    } | awk 'index($0, " -> ") { print substr($0, index($0, " -> ") + 4) }'
+      ls -l "$PROC_ROOT"/[0-9]*/cwd 2>/dev/null
+      ls -l "$PROC_ROOT"/[0-9]*/fd 2>/dev/null
+    } | ls_link_targets
+  )
+
+  collect_inuse_proc_maps
+}
+
+# The file-backed mappings of every live process.
+#
+# /proc/<pid>/maps lists every file the process has mapped, including the
+# shared libraries it loaded. A library that is mapped but not open is in
+# neither /proc/<pid>/fd nor /proc/<pid>/exe, so a toolchain tree that is
+# in use through a library would still be invisible to the sweep.
+collect_inuse_proc_maps() {
+  local target
+  while IFS= read -r target; do
+    [ -n "$target" ] || continue
+    under_watched_root "$target" || continue
+    INUSE_PATHS+=("$target")
+  done < <(
+    cat "$PROC_ROOT"/[0-9]*/maps 2>/dev/null | awk '
+      {
+        path = ""
+        for (i = 6; i <= NF; i++) path = path (i == 6 ? "" : " ") $i
+        if (path == "") next
+        sub(/ \(deleted\)$/, "", path)
+        print path
+      }
+    '
   )
 }
 
 collect_inuse_proc_readlink() {
   local d target fd
-  for d in /proc/[0-9]*; do
+  for d in "$PROC_ROOT"/[0-9]*; do
+    [ -d "$d" ] || continue
+    target="$(readlink "$d/exe" 2>/dev/null)" || target=""
+    if [ -n "$target" ]; then
+      target="${target% (deleted)}"
+      EXEC_PATHS+=("$target")
+      under_watched_root "$target" && INUSE_PATHS+=("$target")
+    fi
     target="$(readlink "$d/cwd" 2>/dev/null)" || target=""
     if [ -n "$target" ] && under_watched_root "$target"; then
       INUSE_PATHS+=("$target")
@@ -269,6 +417,7 @@ collect_inuse_proc_readlink() {
       INUSE_PATHS+=("$target")
     done
   done
+  collect_inuse_proc_maps
 }
 
 collect_inuse_proc() {
@@ -282,24 +431,72 @@ collect_inuse_proc() {
 # Fallback for hosts without /proc (macOS): lsof lists the open files of
 # every process the caller can see. On the VM neither lsof nor fuser exists,
 # so this path never runs there and the mtime rule stands alone.
+#
+# lsof is asked for the FILE TYPE as well as the name, because the name
+# alone cannot tell the running executable apart from an ordinary open
+# file. lsof reports the text segment of the binary a process is RUNNING
+# (and of every library it has mapped) with the type "txt", which is the
+# same information /proc/<pid>/exe and /proc/<pid>/maps carry on Linux.
+# That distinction is the whole point: the executable image of a running
+# process is NOT an open file descriptor, so it is in neither the working
+# directory nor the descriptor list, and a sweep that only reads those two
+# cannot see it.
+#
+# ONE lsof call feeds both sets, because lsof is the expensive part of
+# this path.
 collect_inuse_lsof() {
-  local target
-  while IFS= read -r target; do
-    [ -n "$target" ] || continue
-    # lsof reports every open file on the machine; only paths under a
-    # watched root can ever be pruned, so the set is filtered down to those.
-    under_watched_root "$target" || continue
-    INUSE_PATHS+=("$target")
-  done < <(lsof -Fn 2>/dev/null | sed -n 's/^n//p')
+  local line current_f="" name
+  while IFS= read -r line; do
+    case "$line" in
+      f*) current_f="${line#f}" ;;
+      n*)
+        name="${line#n}"
+        [ -n "$name" ] || continue
+        # A file that was deleted from the filesystem keeps its name with
+        # a " (deleted)" suffix.
+        name="${name% (deleted)}"
+        case "$name" in
+          /*) ;;
+          *) continue ;;
+        esac
+        if [ "$current_f" = "txt" ]; then
+          EXEC_PATHS+=("$name")
+        fi
+        # lsof reports every open file on the machine; only paths under a
+        # watched root can ever be pruned, so the set is filtered down to those.
+        under_watched_root "$name" || continue
+        INUSE_PATHS+=("$name")
+        ;;
+    esac
+  done < <(lsof -F fnt 2>/dev/null)
 }
 
 collect_inuse() {
   INUSE_PATHS=()
-  if [ -d /proc/self ]; then
+  EXEC_PATHS=()
+  if [ -d "$PROC_ROOT/self" ]; then
     collect_inuse_proc
   elif command -v lsof >/dev/null 2>&1; then
     collect_inuse_lsof
   fi
+}
+
+# True when a live process runs under one of the given names.
+#
+# /proc/<pid>/comm is the name of the executable the process runs, so it
+# answers "is a package manager running right now" without reading a
+# command line. It is used for the paths that the in-use scan cannot
+# cover: the apt package index and the crash dumps live outside every
+# watched root, so they are guarded by their own activity check.
+process_running() {
+  local want comm
+  while IFS= read -r comm; do
+    [ -n "$comm" ] || continue
+    for want in "$@"; do
+      [ "$comm" = "$want" ] && return 0
+    done
+  done < <(cat "$PROC_ROOT"/[0-9]*/comm 2>/dev/null)
+  return 1
 }
 
 # A candidate is in use if any live path is equal to it or lives beneath it.
@@ -347,6 +544,105 @@ is_in_use() {
     case "$(dirname "$cand")" in
       */_work) case "$p" in */_work) return 0 ;; esac ;;
     esac
+  done
+  return 1
+}
+
+# True when a live process is EXECUTING something inside the tree.
+#
+# This is the FIRST line of defence for the installed toolchain trees, and
+# it is deliberately independent of the in-use set above:
+#
+#   - the in-use set is filtered down to the watched roots, so it says
+#     nothing about a tree outside them;
+#   - the in-use set is about paths that are HELD — a working directory, an
+#     open descriptor, a mapped file. The executable image of a running
+#     process is none of those: the kernel keeps no descriptor for it, so
+#     a job that is executing a managed CPython would have its interpreter
+#     deleted from under it.
+#
+# The check does not depend on the tree's mtime at all, so it holds even
+# when the tree was touched a long time ago.
+#
+# The access time is NOT used here: it is the second line of defence
+# (toolchain_used_recently below), and it must not decide on its own
+# whether a running process is holding the tree.
+is_executing() {
+  local tree="$1" p physical
+  while [ "$tree" != "/" ] && [ "${tree%/}" != "$tree" ]; do tree="${tree%/}"; done
+  # The physical path as well: the fleet's home is reached through a
+  # symlink (/home/<user>.linux -> <user>.guest), and /proc reports the
+  # resolved path.
+  physical=""
+  if [ -d "$tree" ]; then
+    physical="$(cd "$tree" 2>/dev/null && pwd -P)" || physical=""
+  fi
+  for p in "${EXEC_PATHS[@]:-}"; do
+    [ -n "$p" ] || continue
+    case "$p" in
+      "$tree" | "$tree"/*) return 0 ;;
+    esac
+    if [ -n "$physical" ]; then
+      case "$p" in
+        "$physical" | "$physical"/*) return 0 ;;
+      esac
+    fi
+  done
+  return 1
+}
+
+# How recently an interpreter inside a toolchain tree was RUN, in hours.
+#
+# The window is deliberately short. The toolchain window itself is 30
+# days, and a longer recency window would protect every tree that is
+# used at all — the sweep would then reclaim nothing, which is the thing
+# that has to reclaim the root filesystem.
+TOOLCHAIN_RECENT_HOURS="${TOOLCHAIN_RECENT_HOURS:-24}"
+
+# The access time of a file, in epoch seconds.
+#
+# GNU stat and BSD stat spell it differently, and the routine runs on
+# both, so both are tried. An empty result means "unknown", and an
+# unknown access time never protects anything.
+file_atime() {
+  local f="$1" a
+  a="$(stat -c '%X' "$f" 2>/dev/null || true)"
+  if [ -z "$a" ]; then
+    a="$(stat -f '%a' "$f" 2>/dev/null || true)"
+  fi
+  case "$a" in
+    '' | *[!0-9]*) a="" ;;
+  esac
+  printf '%s' "$a"
+}
+
+# True when an interpreter inside the tree was executed recently.
+#
+# The tree's mtime is the sweep's staleness signal and it says nothing
+# about use: a toolchain installed months ago and used every day has an
+# old mtime and is exactly what the sweep deletes. The access time of
+# the interpreter says "it was run", which is the signal the mtime
+# cannot give.
+#
+# The executables are looked for where they live: <tree>/bin/* for a
+# managed CPython, a mise install and a rust toolchain alike. The check
+# is a handful of stat calls, not a walk of the tree.
+toolchain_used_recently() {
+  local tree="$1" now cutoff f atime
+  [ -d "$tree" ] || return 1
+  now="$(date +%s 2>/dev/null || true)"
+  case "$now" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  cutoff=$((now - TOOLCHAIN_RECENT_HOURS * 3600))
+  for f in "$tree"/bin/* "$tree"/*/bin/*; do
+    [ -f "$f" ] || continue
+    [ -x "$f" ] || continue
+    atime="$(file_atime "$f")"
+    [ -n "$atime" ] || continue
+    if [ "$atime" -ge "$cutoff" ]; then
+      return 0
+    fi
   done
   return 1
 }
@@ -564,68 +860,112 @@ prune_runner_work() {
 }
 
 prune_caches() {
-  local tier="$1" c cache_d tool_d
+  local tier="$1" c cache_d tool_d owner_home
   cache_d="$(scaled_age "$BASE_CACHE_DAYS" "$tier")"
   tool_d="$(scaled_age "$BASE_TOOLCHAIN_DAYS" "$tier")"
 
-  # Download caches. A miss costs one fetch, so the short window applies.
-  for c in "$HOME_DIR/.cache/pip" "$HOME_DIR/.cache/uv" "$HOME_DIR/.npm/_cacache" \
-           "$HOME_DIR/.bun/install/cache" "$HOME_DIR/.cache/pre-commit" \
-           "$HOME_DIR/.cargo/registry/cache" "$HOME_DIR/.cargo/registry/src" \
-           "$HOME_DIR/.rustup/downloads" "$HOME_DIR/.proto/cache"; do
-    [ -d "$c" ] || continue
-    try_remove "$c" "${cache_d} days" "cache"
-  done
+  # EVERY owner home is swept, not just the first one: the knob takes a
+  # list, and a host with two runner homes owned by two different users
+  # has two owner homes. Sweeping only the first one left the second
+  # user's caches and toolchains growing without bound while the routine
+  # reported green.
+  for owner_home in "${OWNER_HOME_LIST[@]:-}"; do
+    [ -n "$owner_home" ] || continue
 
-  # Any other cold entry under ~/.cache.
-  if [ -d "$HOME_DIR/.cache" ]; then
-    for c in "$HOME_DIR/.cache"/*/; do
+    # Download caches. A miss costs one fetch, so the short window applies.
+    for c in "$owner_home/.cache/pip" "$owner_home/.cache/uv" "$owner_home/.npm/_cacache" \
+             "$owner_home/.bun/install/cache" "$owner_home/.cache/pre-commit" \
+             "$owner_home/.cargo/registry/cache" "$owner_home/.cargo/registry/src" \
+             "$owner_home/.rustup/downloads" "$owner_home/.proto/cache"; do
       [ -d "$c" ] || continue
-      case "$c" in
-        */pip/ | */uv/ | */pre-commit/) continue ;;
-        # The Playwright browsers are NOT a cache: the E2E leg needs the
-        # exact binaries that were downloaded, and re-downloading them
-        # costs ~929 MB and a network round trip on the runner. Freshness
-        # alone would keep them for a few days and then delete them, and
-        # the next E2E job would fail with "Executable doesn't exist at
-        # ~/.cache/ms-playwright/chromium-1208/...".
-        */ms-playwright/) continue ;;
-      esac
       try_remove "$c" "${cache_d} days" "cache"
     done
-  fi
 
-  # The installed toolchain trees are the directories that actually grow
-  # the root filesystem: the managed interpreters, the mise installs and
-  # the rust toolchains. The two runners on the Colima VM share ONE home,
-  # so every interpreter one of them resolves is installed once and kept
-  # for every job that follows.
-  #
-  # They are installed state, not a download cache, so they get their own,
-  # much longer window (BASE_TOOLCHAIN_DAYS) and are only reclaimed once
-  # the disk is under real pressure — from the elevated tier up. A miss
-  # costs a re-download of the whole toolchain, and the routine is meant
-  # to cost almost nothing while the disk is still fine.
-  #
-  # The window is scaled by the tier like every other one: half at the
-  # elevated tier, and the one-unit floor at the critical tier, where the
-  # disk has to reclaim something.
-  #
-  # The same discipline as everything else applies: never while a live
-  # process holds them, and never while they are being written to.
-  #
-  # The user's site-packages is deliberately NOT in this list: the
-  # ~/.local/bin shims (ruff, black, the archgate wrapper) are installed
-  # into it, and removing it would break every tool the runners resolve by
-  # name.
-  if [ "$tier" -ge 2 ]; then
-    for c in "$HOME_DIR"/.local/share/uv/python/cpython-* \
-             "$HOME_DIR"/.local/share/mise/installs/*/* \
-             "$HOME_DIR"/.rustup/toolchains/*; do
-      [ -d "$c" ] || continue
-      try_remove "$c" "${tool_d} days" "toolchain"
-    done
-  fi
+    # Any other cold entry under ~/.cache.
+    if [ -d "$owner_home/.cache" ]; then
+      for c in "$owner_home/.cache"/*/; do
+        [ -d "$c" ] || continue
+        case "$c" in
+          */pip/ | */uv/ | */pre-commit/) continue ;;
+          # The Playwright browsers are NOT a cache: the E2E leg needs the
+          # exact binaries that were downloaded, and re-downloading them
+          # costs ~929 MB and a network round trip on the runner. Freshness
+          # alone would keep them for a few days and then delete them, and
+          # the next E2E job would fail with "Executable doesn't exist at
+          # ~/.cache/ms-playwright/chromium-1208/...".
+          */ms-playwright/) continue ;;
+        esac
+        try_remove "$c" "${cache_d} days" "cache"
+      done
+    fi
+
+    # The installed toolchain trees are the directories that actually grow
+    # the root filesystem: the managed interpreters, the mise installs and
+    # the rust toolchains. The two runners on the Colima VM share ONE home,
+    # so every interpreter one of them resolves is installed once and kept
+    # for every job that follows.
+    #
+    # They are installed state, not a download cache, so they get their own,
+    # much longer window (BASE_TOOLCHAIN_DAYS) and are only reclaimed once
+    # the disk is under real pressure — from the elevated tier up. A miss
+    # costs a re-download of the whole toolchain, and the routine is meant
+    # to cost almost nothing while the disk is still fine.
+    #
+    # The window is scaled by the tier like every other one: half at the
+    # elevated tier, and the one-unit floor at the critical tier, where the
+    # disk has to reclaim something.
+    #
+    # The same discipline as everything else applies: never while a live
+    # process holds them, never while a live process is EXECUTING them,
+    # and never while they are being written to.
+    #
+    # The user's site-packages is deliberately NOT in this list: the
+    # ~/.local/bin shims (ruff, black, the archgate wrapper) are installed
+    # into it, and removing it would break every tool the runners resolve by
+    # name.
+    if [ "$tier" -ge 2 ]; then
+      for c in "$owner_home"/.local/share/uv/python/cpython-* \
+               "$owner_home"/.local/share/mise/installs/*/* \
+               "$owner_home"/.rustup/toolchains/*; do
+        [ -d "$c" ] || continue
+        # A tree that a live process is EXECUTING is never removed. The
+        # generic in-use check cannot see it: the executable image of a
+        # running process is not an open file descriptor, so it is in
+        # neither the working directory nor the descriptor list. Without
+        # this check the managed interpreter a job is running is deleted
+        # from under it, and every child the job spawns afterwards fails
+        # with ENOENT.
+        if is_executing "$c"; then
+          log "skipped (executed by a live process) $c"
+          continue
+        fi
+        # The second line of defence: a tree whose interpreter was RUN
+        # RECENTLY is not reclaimed either, even when no process is
+        # running it right now. The tree's mtime is the sweep's staleness
+        # signal and it says nothing about use: a toolchain that was
+        # installed months ago and is used every day has an old mtime and
+        # is exactly what the sweep deletes. The interpreter's ACCESS
+        # time is the signal that says "it was run".
+        #
+        # The window is short and fixed (TOOLCHAIN_RECENT_HOURS, default
+        # 24). A long window would disable the sweep: the toolchain
+        # window itself is 30 days, and a tree used every day would then
+        # never be reclaimable at any tier. The signal is also only ever
+        # ADDITIVE: it protects a tree, it never condemns one.
+        #
+        # The access time is a heuristic and it is a coarse one: a
+        # filesystem mounted with relatime bumps it at most once a day,
+        # and macOS does not update it for reads at all. That is why the
+        # window is a day and why the primary check above does not rely
+        # on it.
+        if toolchain_used_recently "$c"; then
+          log "skipped (used recently) $c"
+          continue
+        fi
+        try_remove "$c" "${tool_d} days" "toolchain"
+      done
+    fi
+  done
 }
 
 # The system-level prune.
@@ -638,6 +978,12 @@ prune_caches() {
 # Every destructive step is behind the dry-run guard. "docker image prune
 # -af" removes EVERY unused image, so an unguarded call in a routine that
 # fires every 15 minutes is a foot-gun, not a cleanup.
+#
+# These paths are NOT under a watched root and are not held by a job, so
+# the in-use scan says nothing about them. Each one is guarded by its own
+# activity check instead: the apt index is only dropped while no package
+# manager is running, and the crash dumps only while no coredump is being
+# written.
 prune_system() {
   local root_tier="$1" data_tier="$2" tmp_d
   tmp_d="$(scaled_age "$BASE_TMP_DAYS" "$root_tier")"
@@ -659,17 +1005,26 @@ prune_system() {
   # tick empties the index, and the next "apt-get install" then fails with
   # "Unable to locate package" until somebody runs "apt-get update".
   # "apt-get clean" alone reclaims most of the space anyway.
+  #
+  # It is also only dropped while no package manager is running: a job that
+  # is installing a package needs the index it is installing FROM, and
+  # removing it mid-install breaks the job with "Unable to locate
+  # package".
   if [ "$root_tier" -ge 2 ]; then
-    if [ "$DRY_RUN" = "1" ]; then
+    if process_running apt apt-get aptitude dpkg dpkg-deb unattended-upgr packagekitd; then
+      log "skipped (a package manager is running) the apt package lists"
+    elif [ "$DRY_RUN" = "1" ]; then
       log "would drop the apt package lists"
     else
       rm -rf /var/lib/apt/lists/* >/dev/null 2>&1 || true
     fi
   fi
 
-  # Crash dumps.
+  # Crash dumps. A coredump that is still being written is left alone.
   if [ -d /var/lib/systemd/coredump ]; then
-    if [ "$DRY_RUN" = "1" ]; then
+    if process_running systemd-coredump; then
+      log "skipped (a coredump is being written) the crash dumps"
+    elif [ "$DRY_RUN" = "1" ]; then
       log "would prune coredumps"
     else
       rm -rf /var/lib/systemd/coredump/* >/dev/null 2>&1 || true
@@ -907,7 +1262,7 @@ main() {
   root_pct="$(pct_for_path /)"
   data_pct="$(work_pct)"
   if [ "$root_pct" -gt "$TARGET_PCT" ] || [ "$data_pct" -gt "$TARGET_PCT" ]; then
-    log "WARNING: still above target after $MAX_PASSES passes (root ${root_pct}%, data ${data_pct}%). Manual cleanup needed: check \$HOME_DIR/.rustup toolchains, \$HOME_DIR/.proto, and \$HOME_DIR/.local."
+    log "WARNING: still above target after $MAX_PASSES passes (root ${root_pct}%, data ${data_pct}%). Manual cleanup needed: check the .rustup toolchains, the .proto cache and the .local tree of every owner home (${OWNER_HOME_LIST[*]:-})."
   fi
 }
 
