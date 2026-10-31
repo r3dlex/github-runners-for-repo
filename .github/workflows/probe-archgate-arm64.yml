@@ -271,7 +271,7 @@ jobs:
           bun build src/cli.ts --compile --bytecode \
             --compile-exec-argv=--use-system-ca \
             --outfile "$GITHUB_WORKSPACE/out/archgate"
-          chmod +x out/archgate
+          chmod +x "$GITHUB_WORKSPACE/out/archgate"
           ls -l "$GITHUB_WORKSPACE/out/archgate"
           file "$GITHUB_WORKSPACE/out/archgate" || true
 
