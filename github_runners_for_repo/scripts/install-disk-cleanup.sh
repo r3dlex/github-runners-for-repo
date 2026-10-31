@@ -579,6 +579,19 @@ install_script() {
 }
 
 install_units() {
+  # A newline in the path is a new line in the unit file. Quoting does
+  # not contain it: whatever follows the newline is a unit directive, so
+  # the install is refused before a file is written.
+  case "$INSTALL_PATH" in
+    *'
+'*)
+      log "ERROR: INSTALL_PATH contains a newline ($INSTALL_PATH)"
+      log "ERROR: a newline would inject unit directives into ExecStart."
+      log "ERROR: install the routine at a path with no newline."
+      exit 1
+      ;;
+  esac
+
   # The unit files are written to a temporary file in the SAME directory
   # and renamed into place. `tee` truncates the live unit in place, and a
   # `systemctl daemon-reload` that races the write loads a half-written
@@ -595,7 +608,7 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=${INSTALL_PATH}
+ExecStart="${INSTALL_PATH}"
 Environment=HOME=/root
 Nice=19
 IOSchedulingClass=idle
@@ -750,8 +763,12 @@ enable_timer() {
     return 0
   fi
   $SUDO systemctl daemon-reload
-  $SUDO systemctl enable --now runner-disk-cleanup.timer
-  log "enabled runner-disk-cleanup.timer (every 15 minutes)"
+  # The path, not the name. `systemctl enable runner-disk-cleanup.timer`
+  # resolves the name through systemd's search path, and
+  # /etc/systemd/system wins over /run and /usr/lib. A run whose units
+  # went to another systemd directory would enable the live timer.
+  $SUDO systemctl enable --now "$TIMER_UNIT"
+  log "enabled $TIMER_UNIT (every 15 minutes)"
 }
 
 run_once() {
@@ -769,7 +786,10 @@ run_once() {
     fi
     return 0
   fi
-  if $SUDO systemctl start runner-disk-cleanup.service; then
+  # The path, not the name, for the same reason as enable_timer: a
+  # name resolves to whichever unit systemd finds first, which may not
+  # be the file this run just wrote.
+  if $SUDO systemctl start "$SERVICE_UNIT"; then
     log "ran the cleanup routine once"
   else
     log "ERROR: the cleanup routine failed; inspect it with:"

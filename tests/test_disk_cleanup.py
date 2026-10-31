@@ -1775,6 +1775,50 @@ class TestExecutableLiveness:
             f"a toolchain whose interpreter was run today must not be reclaimed: {output}"
         )
 
+    def test_an_interpreter_that_starts_during_the_sweep_survives(
+        self, runner_home: Path, tmp_path: Path
+    ) -> None:
+        """A job that starts the interpreter before the delete keeps the tree.
+
+        The sweep asks whether the tree is being executed, then re-reads
+        the live processes immediately before the delete. A job that
+        starts in between is absent from the first answer. The delete
+        has to ask again, or it removes the interpreter the job is running.
+        """
+        tree = _managed_interpreter(tmp_path)
+        _age(tree, 60)
+        script = "\n".join(
+            [
+                'source "$CLEANUP_SCRIPT"',
+                "collect_inuse() {",
+                '  EXEC_PATHS=("$LIVE_TREE/bin/python3")',
+                "  INUSE_PATHS=()",
+                "}",
+                'prune_caches "$TIER"',
+            ]
+        )
+        env = _env(runner_home, tmp_path)
+        env.update(
+            {
+                "CLEANUP_SCRIPT": str(SCRIPT),
+                "TIER": "3",
+                "LIVE_TREE": str(tree),
+            }
+        )
+
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert tree.exists(), (
+            f"an interpreter a job started during the sweep must not be deleted: {result.stdout}"
+        )
+
 
 class TestOwnerHomeSweep:
     """MEDIUM 1: every owner home is swept, not just the first one.
@@ -2014,4 +2058,119 @@ class TestUnitFileWrite:
         )
         assert not list(unit_dir.glob(".runner-disk-cleanup.*")), (
             "the temporary unit files must be renamed away, not left behind"
+        )
+
+    def test_an_install_path_with_a_space_is_one_execstart_argument(self, tmp_path: Path) -> None:
+        """A space in the install path must not split ExecStart.
+
+        systemd splits an unquoted ExecStart on whitespace. The path is
+        one program, so the unit has to quote it.
+        """
+        unit_dir = tmp_path / "units"
+        unit_dir.mkdir()
+        install_path = tmp_path / "my dir" / "runner-disk-cleanup.sh"
+        env = os.environ.copy()
+        env.update(
+            {
+                "RUNNER_HOMES": str(tmp_path / "actions-runner-linux"),
+                "INSTALL_PATH": str(install_path),
+                "UNIT_DIR": str(unit_dir),
+                "INSTALLER": str(INSTALLER),
+            }
+        )
+        result = subprocess.run(
+            ["bash", "-c", 'source "$INSTALLER"; SUDO=""; install_units'],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        service = (unit_dir / "runner-disk-cleanup.service").read_text()
+        assert f'ExecStart="{install_path}"' in service, (
+            f"ExecStart must be one quoted argument, got:\n{service}"
+        )
+
+    def test_an_install_path_with_a_newline_is_refused(self, tmp_path: Path) -> None:
+        """A newline in the install path must not inject unit directives.
+
+        Quoting does not help: the newline is a new line in the unit
+        file, so whatever follows it is a directive. The install is
+        refused and no unit file is written.
+        """
+        unit_dir = tmp_path / "units"
+        unit_dir.mkdir()
+        install_path = f"{tmp_path}/verify/runner-disk-cleanup.sh\nNice=0"
+        env = os.environ.copy()
+        env.update(
+            {
+                "RUNNER_HOMES": str(tmp_path / "actions-runner-linux"),
+                "INSTALL_PATH": install_path,
+                "UNIT_DIR": str(unit_dir),
+                "INSTALLER": str(INSTALLER),
+            }
+        )
+        result = subprocess.run(
+            ["bash", "-c", 'source "$INSTALLER"; SUDO=""; install_units'],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        service = unit_dir / "runner-disk-cleanup.service"
+        assert result.returncode != 0, "a newline in INSTALL_PATH must be refused"
+        assert "INSTALL_PATH" in result.stdout, (
+            f"the refusal has to name the path, got {result.stdout}"
+        )
+        assert not service.exists(), "a refused install must not write the unit file"
+
+
+class TestSystemdUnitResolution:
+    """Enabling the timer must enable the unit file that was just written.
+
+    `systemctl enable runner-disk-cleanup.timer` resolves the name.
+    systemd's search path then decides which file that name is, and
+    /etc/systemd/system wins over /run and /usr/lib. A run whose units
+    went to another systemd directory would enable the live timer.
+    """
+
+    def test_enable_and_start_name_the_unit_file(self, tmp_path: Path) -> None:
+        """The command names the file in UNIT_DIR, not the bare unit name."""
+        stub_dir = tmp_path / "bin"
+        stub_dir.mkdir()
+        log = tmp_path / "systemctl.log"
+        stub = stub_dir / "systemctl"
+        stub.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$STUB_SYSTEMCTL_LOG"\nexit 0\n')
+        stub.chmod(0o755)
+        unit_dir = "/run/systemd/system"
+        env = os.environ.copy()
+        env.update(
+            {
+                "PATH": f"{stub_dir}{os.pathsep}{env.get('PATH', '')}",
+                "STUB_SYSTEMCTL_LOG": str(log),
+                "UNIT_DIR": unit_dir,
+                "INSTALLER": str(INSTALLER),
+            }
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$INSTALLER"; SUDO=""; enable_timer; run_once',
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        calls = log.read_text().splitlines()
+        assert f"enable --now {unit_dir}/runner-disk-cleanup.timer" in calls, (
+            f"enable must name the timer file that was written, got {calls}"
+        )
+        assert f"start {unit_dir}/runner-disk-cleanup.service" in calls, (
+            f"start must name the service file that was written, got {calls}"
         )

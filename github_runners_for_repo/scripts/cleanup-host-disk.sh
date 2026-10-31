@@ -782,6 +782,13 @@ try_remove() {
   # minutes of lock time per pass.
   collect_inuse
   is_in_use "$target" && { log "skipped (in use) $target"; return 1; }
+  # The refresh above also re-reads the executable images. The check
+  # that ran before this function is a snapshot: a job that started the
+  # interpreter since then is in EXEC_PATHS now and was not then. The
+  # in-use set does not carry an executable that is outside a watched
+  # root, so this has to be asked on its own, immediately before the
+  # delete.
+  is_executing "$target" && { log "skipped (executed by a live process) $target"; return 1; }
   if [ "$DRY_RUN" = "1" ]; then
     log "would prune $label $target"
     return 0
