@@ -93,17 +93,46 @@ every tier:
   continuously, so a live job's directory is never stale by mtime. The
   floor is never zero — the top tier prunes what is older than one hour
   (one day for the daily caches), not everything it can reach.
-- **The liveness scan.** On Linux the routine reads the working directory
-  and the open files of *every* live process straight out of `/proc` (it
-  falls back to `lsof` elsewhere), and any path under a watched root counts
-  as in use regardless of age. `actions/runner` never changes its own
-  working directory, so the process that holds a checkout is the child it
-  spawned — `node`, `git`, `bash`. A process whose working directory is
-  `_work` itself holds every checkout below it and protects them all.
+- **The liveness scan.** On Linux the routine reads the working directory,
+  the open files, the mapped files and the **executable** of *every* live
+  process straight out of `/proc` (it falls back to `lsof` elsewhere), and
+  any path under a watched root counts as in use regardless of age.
+  `actions/runner` never changes its own working directory, so the process
+  that holds a checkout is the child it spawned — `node`, `git`, `bash`. A
+  process whose working directory is `_work` itself holds every checkout
+  below it and protects them all.
+- **The executable image.** `/proc/<pid>/exe` is a magic symlink: it names
+  the binary the process is *running*. The kernel keeps no descriptor for
+  it, so it is in neither the working directory nor the descriptor list —
+  a process that is executing a managed CPython leaves no trace in
+  `/proc/<pid>/fd`. The installed toolchain trees are therefore checked
+  against that set separately: a tree that a live process is executing is
+  never removed, and the check does not depend on the tree's mtime at all.
+  On macOS there is no `/proc`, and the `lsof` fallback asks for the file
+  **type** as well as the name: the text segment of the running binary is
+  reported with the type `txt`, which is the same information
+  `/proc/<pid>/exe` and `/proc/<pid>/maps` carry on Linux.
+- **A toolchain used recently is not reclaimed.** The tree's mtime is the
+  sweep's staleness signal and it says nothing about use: a toolchain that
+  a job uses every day was installed months ago, so its mtime is old — and
+  it is exactly what the sweep deletes. The **access time** of the
+  interpreter is the signal that says "it was run", and a tree whose
+  interpreter was run in the last 24 hours is kept even when no process is
+  running it any more. The window is short on purpose: a long one would
+  protect every tree that is used at all, and the sweep would reclaim
+  nothing.
 
 **A path that is in use is never deleted, at any tier.** The in-use set is
-re-collected at the start of every pass, so a job that starts while an
-earlier pass is running is protected by the next one.
+re-collected at the start of every pass **and again immediately before
+every destructive step inside the watched roots**, so a job that picks up a
+checkout *during* a pass keeps it.
+
+The paths that live **outside** the watched roots — the apt package index
+and the crash dumps — are guarded by their own activity check instead: the
+index is only dropped while no package manager is running, and the crash
+dumps only while no coredump is being written. The claim is therefore
+"every destructive step is guarded", not "every destructive step is
+covered by the in-use scan".
 
 A few directories are never swept at all, whatever their age:
 
@@ -114,13 +143,57 @@ A few directories are never swept at all, whatever their age:
   bookkeeping, swept by their own age windows.
 - `_diag/*.log` — the worker logs are the evidence for the "assigned, zero
   steps" signature, so they keep a minimum age at every tier.
+- `~/.cache/ms-playwright` — the Playwright browsers. The E2E leg needs the
+  exact binaries that were downloaded, and re-downloading them costs
+  ~929 MB and a network round trip.
 - A freshly downloaded update archive in the runner home — deleting it
   aborts the update it belongs to.
 
 Docker is pruned on the data disk, and only within limits: **dangling**
-images and build cache only, never a tagged image, and **never** a stopped
-container. The Docker daemon on the runner host also serves the user's own
-long-lived containers, and their state is not the routine's to destroy.
+images and **dangling** build cache only, never a tagged image, and
+**never** a stopped container. The Docker daemon on the runner host also
+serves the user's own long-lived containers, and their state is not the
+routine's to destroy. The whole unused build cache (`docker builder prune
+-a`, ~12 GB on the fleet host) is never dropped — every image would have
+to be rebuilt from scratch.
+
+### What the routine reclaims from the shared home
+
+The two runners on the Colima VM share **one** `$HOME`, so everything a
+job installs is installed once and kept for every job that follows. The
+routine sweeps that home in two classes, and they are not the same.
+
+The knob takes a **list** of runner homes, and the routine sweeps the owner
+home of *every* entry — the directory above each runner home, which is the
+home of the user the runner runs as. A host with two runner homes owned by
+two different users has two owner homes; sweeping only the first one left
+the second user's toolchains growing without bound while the routine
+reported green.
+
+- **Download caches** — pip, uv, npm, bun, pre-commit, the cargo registry,
+  the rustup downloads, the protobuf download cache, and everything else
+  cold under `~/.cache`. A miss costs one fetch, so they get the short
+  window (`BASE_CACHE_DAYS`, three days by default).
+- **Installed toolchain trees** — the uv-managed interpreters
+  (`~/.local/share/uv/python/cpython-*`), the mise installs and the rust
+  toolchains. These are installed state, not a download cache: a miss
+  costs a re-download of the whole toolchain. They get their own, much
+  longer window (`BASE_TOOLCHAIN_DAYS`, 30 days by default) and are only
+  reclaimed from the **elevated tier up** — a disk that is merely under
+  watch is not worth a re-download. The tier logic scales that window like
+  every other one: 15 days at the elevated tier, and the one-unit floor at
+  the critical tier, where the disk has to reclaim something. A tree that
+  a live process is *executing* is never reclaimed, whatever its age.
+
+The user's `site-packages` is deliberately never swept: the `~/.local/bin`
+shims (`ruff`, `black`, the archgate wrapper) are installed into it.
+
+The liveness scan is re-run immediately before every destructive step, so
+a job that picks up a checkout *during* a pass keeps it. That makes the
+scan run once per candidate, and it has to stay cheap: it reads the whole
+host with one `ls -l` per directory of descriptors, not a `readlink` fork
+per open descriptor (~490 ms per scan on the fleet host — minutes of lock
+time per pass).
 
 ### Repairing a bricked action
 
@@ -162,6 +235,14 @@ same lock**: systemd serialises a unit against itself, never against a
 differently named one. The weekly unit lives outside this repository — the
 lock file is the contract between the two.
 
+The two units take the lock in different ways, on purpose. The routine
+takes the lock **itself**, so the 15-minute `runner-disk-cleanup.timer`
+unit deliberately carries **no outer `/usr/bin/flock`** — a unit that locks
+a lock it already holds deadlocks the timer against itself. The weekly
+`runner-cleanup.service` runs a script that takes no lock of its own, so
+**it must keep its `flock -w 300` wrapper**. Do not "fix" one unit to look
+like the other.
+
 ### Installing it
 
 ```bash
@@ -184,6 +265,68 @@ backed up to `runner-disk-cleanup.sh.bak` first:
 ```bash
 github_runners_for_repo/scripts/install-disk-cleanup.sh --force
 ```
+
+### Verifying the installer without touching the fleet
+
+The installer's defaults point at the **live** fleet: the routine goes to
+`/usr/local/bin` and the runner homes are the two Colima runners. A
+verification run that overrides `INSTALL_PATH` but not `RUNNER_HOMES`
+therefore writes the verification's install directory into the **live**
+runners' `.path` file, and every job on them then starts with a dead PATH
+entry. That happened on 2026-10-28: `/tmp/verify/sandbox` ended up as the
+first line of both runners' `.path`.
+
+The installer now fails closed instead of guessing. **Without `SANDBOX`, a run
+is either entirely LIVE (the live default for all three knobs) or entirely
+ISOLATED (its unit files go to a directory systemd does not read).** A mix
+is refused before a single file is written:
+
+- **`SANDBOX=1`** turns the run into a verification. The runner homes, the
+  install path and the unit directory are confined to `SANDBOX_ROOT`
+  (default: `$TMPDIR/install-disk-cleanup-sandbox`); anything that
+  resolves outside it is refused with a non-zero exit before a single
+  file is touched. The timer is not enabled and the routine is not
+  started.
+- **The install directory changed but `RUNNER_HOMES` did not** is refused:
+  the default runner homes are the live ones, so the run would write the
+  verification's directory into the live runners' `.path` file.
+- **The install path changed but the unit directory is still a live systemd
+  directory** is refused: the run would rewrite the **live**
+  `runner-disk-cleanup.service` to execute the verification's path, and the
+  live timer would then fail on every tick. Naming `RUNNER_HOMES` does
+  *not* make this safe — the unit directory has to move as well.
+- **The unit directory is not a systemd directory but the install path is
+  still the live one** is refused: enabling the timer would enable the
+  **live** `runner-disk-cleanup.timer`.
+- **Only `RUNNER_HOMES` was named** is refused: the install path and the
+  unit directory stay at their live defaults, so the run overwrites the
+  live routine, rewrites the live unit and starts the live timer.
+- **`SYSTEMD_UNIT_DIRS` cannot hide a live unit directory.** The
+  directories systemd reads are hard-coded. A non-sandbox run that sets
+  the variable is refused.
+- The install directory is only added to a `.path` file when it exists on
+  disk.
+
+So a verification run without `SANDBOX` has to name all three knobs:
+
+```bash
+RUNNER_HOMES=/tmp/verify/actions-runner-linux \
+INSTALL_PATH=/tmp/verify/bin/runner-disk-cleanup.sh \
+UNIT_DIR=/tmp/verify/units \
+  github_runners_for_repo/scripts/install-disk-cleanup.sh
+```
+
+```bash
+SANDBOX=1 SANDBOX_ROOT=/tmp/verify \
+  github_runners_for_repo/scripts/install-disk-cleanup.sh
+```
+
+The installer never *prunes* a `.path` file: it only ever prepends its
+install directory. The live runners carry a colon-joined line
+(`/usr/games:/usr/local/games:/snap/bin`) whose fragments do not exist on
+the Colima VM, and a cleanup that dropped "missing" fragments — or a whole
+line because one of its fragments was missing — would silently strip PATH
+entries the runners are supposed to have.
 
 ### Runner ownership
 
@@ -217,9 +360,11 @@ rather than guessing.
 
 Each runner's `.path` file is updated atomically — written to a temporary
 file and renamed — and as the runner user, so the runner never reads a
-half-written or root-owned path file. The install directory is added
-exactly once: the file is checked line by line, because that is the format
-the installer writes it in.
+half-written or root-owned path file. `provision-host.sh` writes the
+runner's `.path` file the same way. The install directory is added exactly
+once: the membership test folds the file into one colon-separated stream
+and compares it as a **fixed string**, so a directory whose name contains
+`.`, `*` or `[` is never mistaken for one that is already there.
 
 ### Job timeouts
 

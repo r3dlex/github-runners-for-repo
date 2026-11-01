@@ -43,6 +43,77 @@
 # does it — the install directory is prepended so the runner service can
 # resolve the routine by name.
 #
+# ## Sandbox mode
+#
+# The defaults point at the LIVE fleet: the routine goes to
+# /usr/local/bin, the unit files go to /etc/systemd/system and the runner
+# homes are the two Colima runners. A run that changes ONE of those knobs
+# therefore mixes a sandbox value with a live one, and the mix is what
+# breaks the fleet. The installer refuses to guess which of the two the
+# operator meant:
+#
+#   - SANDBOX=1 makes the run a verification. The runner homes, the
+#     install path and the unit directory are all confined to
+#     SANDBOX_ROOT (default: $TMPDIR/install-disk-cleanup-sandbox);
+#     anything that resolves outside it is refused with a non-zero exit
+#     before a single file is touched. The timer is not enabled and the
+#     routine is not started. Paths are canonicalized before the
+#     check — "." and ".." count even in a component that does not
+#     exist yet — and a symlink in SANDBOX_ROOT or in a write path is
+#     refused rather than followed. A path that canonicalizes to a
+#     live systemd directory, the live install path, or a live runner
+#     home is refused even in a sandbox.
+#   - Without SANDBOX, a run is either entirely LIVE (the live default
+#     for all three knobs) or entirely ISOLATED (its unit files go to a
+#     directory systemd does not read). A MIX is refused before anything
+#     is written:
+#       - the install directory changed but the runner homes did not:
+#         the run would write the verification's directory into the LIVE
+#         runners' .path file, and every job on them would start with a
+#         dead PATH entry;
+#       - the install path changed but the unit directory is still a
+#         live systemd directory: the run would rewrite the LIVE
+#         runner-disk-cleanup.service to execute the new path, and the
+#         live timer would then fail on every tick;
+#       - the unit directory is not a systemd directory but the install
+#         path is still the live one: enabling the timer would enable
+#         the LIVE runner-disk-cleanup.timer;
+#       - the runner homes changed but the install path and the unit
+#         directory did not: the run would overwrite the LIVE routine,
+#         rewrite the LIVE unit and start the LIVE timer.
+#     The "name RUNNER_HOMES explicitly and you are fine" advice that
+#     used to be in this file was wrong: naming the runner homes alone
+#     leaves the unit directory and the install path live.
+#   - SYSTEMD_UNIT_DIRS cannot retarget the live check. The directories
+#     systemd reads are hard-coded. A non-sandbox run that sets the
+#     variable is refused: it used to be the whole answer to "is this a
+#     live unit directory", and setting it to a sandbox path made
+#     /etc/systemd/system look non-live.
+#   - The install directory is only added to a .path file when it exists
+#     on disk.
+#
+# ## The .path file is never pruned
+#
+# The installer only ever PREPENDS its install directory; it never
+# removes an entry. The live runners' .path carries a colon-joined line
+# (/usr/games:/usr/local/games:/snap/bin) whose fragments do not exist on
+# the Colima VM. A cleanup that dropped "missing" fragments — or a whole
+# line because one of its fragments was missing — would silently strip
+# PATH entries the runners are supposed to have. A stale entry costs a
+# failed lookup; a missing one costs a broken tool. If that ever has to
+# change, prune per FRAGMENT and never per line.
+#
+# ## Locking
+#
+# The routine takes the lock itself (an exclusive flock on
+# /run/runner-disk-cleanup.lock), so the 15-minute
+# runner-disk-cleanup.timer unit deliberately carries NO outer
+# /usr/bin/flock: a unit that locks a lock it already holds deadlocks
+# the timer against itself. The weekly runner-cleanup.service on the host
+# is a different unit and its script takes no lock of its own, so IT
+# must keep its own `flock -w 300` wrapper. Both units have to use the
+# same lock file.
+#
 set -euo pipefail
 
 # Umask 022 so the unit files this script writes are 0644 (systemd refuses
@@ -50,19 +121,367 @@ set -euo pipefail
 # runner-owned trees are additionally chmod'ed explicitly below.
 umask 022
 
+log() { printf '[install-disk-cleanup] %s\n' "$*"; }
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_SCRIPT="$SCRIPT_DIR/cleanup-host-disk.sh"
-INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/runner-disk-cleanup.sh}"
-UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
+
+# The defaults point at the LIVE fleet. Whether the operator changed a knob
+# is recorded BEFORE the defaults are applied, because "the install
+# directory was changed but the runner homes were not" is exactly the
+# mixed-mode run that mutates the live runners.
+DEFAULT_INSTALL_PATH="/usr/local/bin/runner-disk-cleanup.sh"
+DEFAULT_UNIT_DIR="/etc/systemd/system"
+DEFAULT_RUNNER_HOMES="/home/redlexgilgamesh.guest/actions-runner-linux /home/redlexgilgamesh.guest/actions-runner-linux-2"
+
+INSTALL_PATH_OVERRIDDEN=0
+if [ -n "${INSTALL_PATH+x}" ]; then INSTALL_PATH_OVERRIDDEN=1; fi
+UNIT_DIR_OVERRIDDEN=0
+if [ -n "${UNIT_DIR+x}" ]; then UNIT_DIR_OVERRIDDEN=1; fi
+RUNNER_HOMES_OVERRIDDEN=0
+if [ -n "${RUNNER_HOMES+x}" ]; then RUNNER_HOMES_OVERRIDDEN=1; fi
+
+INSTALL_PATH="${INSTALL_PATH:-$DEFAULT_INSTALL_PATH}"
+UNIT_DIR="${UNIT_DIR:-$DEFAULT_UNIT_DIR}"
 SERVICE_UNIT="$UNIT_DIR/runner-disk-cleanup.service"
 TIMER_UNIT="$UNIT_DIR/runner-disk-cleanup.timer"
 
 # The runner directories whose .path file is updated. Same knob as the
 # cleanup routine itself, so an operator points both at the same place.
-RUNNER_HOMES="${RUNNER_HOMES:-/home/redlexgilgamesh.guest/actions-runner-linux /home/redlexgilgamesh.guest/actions-runner-linux-2}"
+#
+# The list is SPACE separated: the value is split on whitespace, so a path
+# that contains a space cannot be expressed here.
+RUNNER_HOMES="${RUNNER_HOMES:-$DEFAULT_RUNNER_HOMES}"
 read -r -a RUNNER_HOME_LIST <<<"$RUNNER_HOMES"
 
-log() { printf '[install-disk-cleanup] %s\n' "$*"; }
+# The sandbox opt-in. SANDBOX=1 turns the run into a verification that is
+# confined to SANDBOX_ROOT; see the header for the contract.
+SANDBOX="${SANDBOX:-0}"
+case "$SANDBOX" in
+  1 | true | yes | on) SANDBOX=1 ;;
+  0 | false | no | off) SANDBOX=0 ;;
+  *)
+    log "ERROR: SANDBOX must be 0 or 1 (got '$SANDBOX')"
+    exit 1
+    ;;
+esac
+SANDBOX_ROOT="${SANDBOX_ROOT:-${TMPDIR:-/tmp}/install-disk-cleanup-sandbox}"
+
+# Collapse "." and ".." without touching the filesystem.
+#
+# A missing component must not keep a later ".." from being resolved.
+# /sandbox/missing/../../victim is /victim, not a path under /sandbox.
+# Appending the missing tail unchanged made the string prefix check pass
+# and mkdir then created the missing component and followed "..".
+lexical_path() {
+  local input="$1" rest part
+  case "$input" in
+    /*) ;;
+    *) input="$PWD/$input" ;;
+  esac
+  local -a stack=()
+  rest="${input#/}"
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      */*)
+        part="${rest%%/*}"
+        rest="${rest#*/}"
+        ;;
+      *)
+        part="$rest"
+        rest=""
+        ;;
+    esac
+    case "$part" in
+      "" | .) ;;
+      ..)
+        if [ "${#stack[@]}" -gt 0 ]; then
+          stack=("${stack[@]:0:${#stack[@]}-1}")
+        fi
+        ;;
+      *) stack+=("$part") ;;
+    esac
+  done
+  if [ "${#stack[@]}" -eq 0 ]; then
+    printf '/'
+    return
+  fi
+  local joined="" item
+  for item in "${stack[@]}"; do
+    joined="${joined}/${item}"
+  done
+  printf '%s' "$joined"
+}
+
+# True when an existing component of the path is a symlink.
+#
+# The walk does NOT collapse ".." first. lexical_path("$root/link/..") is
+# $root, so the symlink is gone before it can be seen, and mkdir then
+# follows the link and applies ".." against the target. A symlink is
+# reported as soon as the walk lands on it, before a later ".." is applied.
+# The walk stops at the first component that does not exist, so a missing
+# tail cannot hide a symlink in the prefix. `-L` is tested before `-e`:
+# `-d` follows the link and would answer about the target.
+path_has_symlink() {
+  local input="$1" rest part current="/"
+  case "$input" in
+    /*) ;;
+    *) input="$PWD/$input" ;;
+  esac
+  rest="${input#/}"
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      */*)
+        part="${rest%%/*}"
+        rest="${rest#*/}"
+        ;;
+      *)
+        part="$rest"
+        rest=""
+        ;;
+    esac
+    case "$part" in
+      "" | .) continue ;;
+      ..)
+        # The component we would pop was already inspected when we landed
+        # on it. Popping here must not skip a symlink we have not visited.
+        current="$(dirname -- "$current")"
+        [ -n "$current" ] || current="/"
+        continue
+        ;;
+    esac
+    if [ "$current" = "/" ]; then
+      current="/$part"
+    else
+      current="$current/$part"
+    fi
+    if [ -L "$current" ]; then
+      return 0
+    fi
+    if [ ! -e "$current" ]; then
+      return 1
+    fi
+  done
+  return 1
+}
+
+# The absolute, symlink-resolved form of a path, whether or not it exists.
+#
+# Existing components are resolved physically (cd+pwd -P, which follows a
+# symlink) and ".." is applied to that physical path, so a link followed
+# by ".." is the parent of the target — the path mkdir will actually
+# create. ".." in a tail that does not exist yet is collapsed only after
+# that, so /sandbox/missing/../../victim is still /victim. `readlink -f`
+# is GNU-only. On macOS /tmp is a symlink to /private/tmp.
+resolve_path() {
+  local input="$1" rest part head="/" next
+  case "$input" in
+    /*) ;;
+    *) input="$PWD/$input" ;;
+  esac
+  rest="${input#/}"
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      */*)
+        part="${rest%%/*}"
+        rest="${rest#*/}"
+        ;;
+      *)
+        part="$rest"
+        rest=""
+        ;;
+    esac
+    case "$part" in
+      "" | .) continue ;;
+      ..)
+        if [ -d "$head" ] || [ -L "$head" ]; then
+          head="$(cd -- "$head/.." 2>/dev/null && pwd -P)" || head="$(dirname -- "$head")"
+          [ -n "$head" ] || head="/"
+          continue
+        fi
+        # The head does not exist. The ".." and whatever follows are a
+        # missing tail; collapse them against the head we have.
+        if [ -n "$rest" ]; then
+          lexical_path "${head%/}/../$rest"
+        else
+          lexical_path "${head%/}/.."
+        fi
+        return
+        ;;
+    esac
+    if [ "$head" = "/" ]; then
+      next="/$part"
+    else
+      next="$head/$part"
+    fi
+    if [ -e "$next" ] || [ -L "$next" ]; then
+      if [ -d "$next" ] || [ -L "$next" ]; then
+        head="$(cd -- "$next" 2>/dev/null && pwd -P)" || head="$next"
+        continue
+      fi
+      # A file. Further components cannot be directories.
+      if [ -n "$rest" ]; then
+        lexical_path "$next/$rest"
+      else
+        printf '%s' "$next"
+      fi
+      return
+    fi
+    if [ -n "$rest" ]; then
+      lexical_path "$next/$rest"
+    else
+      lexical_path "$next"
+    fi
+    return
+  done
+  printf '%s' "$head"
+}
+
+# True when $1 is $2 or lives under it. Both sides must already have been
+# resolved with resolve_path.
+path_under() {
+  local path="$1" root="$2"
+  case "$path" in
+    "$root") return 0 ;;
+    "$root"/*) return 0 ;;
+  esac
+  return 1
+}
+
+# The systemd unit directories. A unit file written into one of them is a
+# LIVE unit: systemd reads it on the next daemon-reload and runs it.
+#
+# The list is HARD-CODED. It used to be an environment variable, and a
+# non-sandbox run that set SYSTEMD_UNIT_DIRS to a sandbox path made
+# is_systemd_unit_dir answer false for /etc/systemd/system. The guard
+# then let the run rewrite the live unit. An environment variable must
+# not be able to hide a directory systemd actually reads.
+LIVE_SYSTEMD_UNIT_DIRS="/etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system"
+# Sandbox tests add a directory to the live set so they can prove a
+# refused run did not write a unit file. The addition never replaces
+# the hard-coded list, and a non-sandbox run that sets it is refused
+# below — the knob cannot retarget the live check.
+SYSTEMD_UNIT_DIRS_OVERRIDDEN=0
+if [ -n "${SYSTEMD_UNIT_DIRS+x}" ]; then SYSTEMD_UNIT_DIRS_OVERRIDDEN=1; fi
+SYSTEMD_UNIT_DIRS="${SYSTEMD_UNIT_DIRS:-}"
+
+# True when the directory is one systemd reads units from.
+is_systemd_unit_dir() {
+  local dir="$1" candidate extras=""
+  dir="$(resolve_path "$dir")"
+  # The extra directories are consulted only in a sandbox run. Outside
+  # one they are refused before this function is asked, but a caller
+  # that reaches here anyway must still not be able to hide a live dir.
+  if [ "$SANDBOX" = "1" ]; then
+    extras="$SYSTEMD_UNIT_DIRS"
+  fi
+  for candidate in $LIVE_SYSTEMD_UNIT_DIRS $extras; do
+    [ -n "$candidate" ] || continue
+    candidate="$(resolve_path "$candidate")"
+    if [ "$dir" = "$candidate" ]; then
+      return 0
+    fi
+    case "$dir" in
+      "$candidate"/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# True when the path is one the live fleet already uses.
+#
+# A sandbox run that canonicalizes onto one of these still writes the
+# live unit, the live script, or a live runner home. The string prefix
+# check does not see that when SANDBOX_ROOT itself was followed onto
+# the live tree.
+is_live_fleet_path() {
+  local path="$1" home resolved
+  resolved="$(resolve_path "$path")"
+  if is_systemd_unit_dir "$resolved"; then
+    return 0
+  fi
+  if [ "$resolved" = "$(resolve_path "$DEFAULT_INSTALL_PATH")" ]; then
+    return 0
+  fi
+  for home in $DEFAULT_RUNNER_HOMES; do
+    [ -n "$home" ] || continue
+    home="$(resolve_path "$home")"
+    if [ "$resolved" = "$home" ]; then
+      return 0
+    fi
+    # A path under a live runner home is that home's tree. Equality
+    # alone accepted .../actions-runner-linux/_work.
+    case "$resolved" in
+      "$home"/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Refuse a sandbox write that would leave the sandbox or touch the live fleet.
+#
+# Called before anything is written, and again after a mkdir: creating
+# the missing component must not turn a path that escaped into one the
+# check now accepts.
+assert_sandbox_writes() {
+  local target resolved
+  [ "$SANDBOX" = "1" ] || return 0
+  if path_has_symlink "$SANDBOX_ROOT"; then
+    log "ERROR: SANDBOX_ROOT is a symlink or contains one ($SANDBOX_ROOT)."
+    log "ERROR: following it would make the containment root the live fleet."
+    exit 1
+  fi
+  for target in "$INSTALL_PATH" "$UNIT_DIR" "${RUNNER_HOME_LIST[@]:-}"; do
+    [ -n "$target" ] || continue
+    if path_has_symlink "$target"; then
+      log "ERROR: refusing a symlink in a sandbox path ($target)."
+      log "ERROR: a symlink is followed by mkdir and would write outside the sandbox."
+      exit 1
+    fi
+    resolved="$(resolve_path "$target")"
+    if ! path_under "$resolved" "$SANDBOX_ROOT_RESOLVED"; then
+      log "ERROR: SANDBOX=1, but $target resolves to $resolved,"
+      log "ERROR: which is outside the sandbox root $SANDBOX_ROOT_RESOLVED."
+      log "ERROR: refusing to touch anything outside the sandbox."
+      exit 1
+    fi
+    if is_live_fleet_path "$resolved"; then
+      log "ERROR: $target resolves to a live fleet path ($resolved)."
+      log "ERROR: a sandbox run must not write the live unit, the live script, or a live runner home."
+      exit 1
+    fi
+  done
+}
+
+# The runner homes as absolute, resolved paths, joined by a space.
+#
+# A relative runner home would make every path derived from it relative as
+# well, and the routine's cache sweep would then delete paths relative to
+# the unit's working directory (/).
+resolved_runner_homes() {
+  local -a homes=() out=() home
+  local joined=""
+  read -r -a homes <<<"$1"
+  for home in "${homes[@]:-}"; do
+    [ -n "$home" ] || continue
+    out+=("$(resolve_path "$home")")
+  done
+  for home in "${out[@]:-}"; do
+    [ -n "$home" ] || continue
+    joined="$joined $home"
+  done
+  printf '%s' "${joined# }"
+}
+
+# Replace the runner home list with the resolved one.
+normalize_runner_homes() {
+  local joined
+  joined="$(resolved_runner_homes "$RUNNER_HOMES")"
+  RUNNER_HOME_LIST=()
+  if [ -n "$joined" ]; then
+    read -r -a RUNNER_HOME_LIST <<<"$joined"
+  fi
+}
 
 # --force is required to overwrite a host copy of the routine that differs
 # from the repo copy. The host copy is the one that has been proven under
@@ -88,6 +507,138 @@ done
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
   SUDO="sudo"
+fi
+
+# A sandbox run writes only into the sandbox, which the invoking user owns,
+# so it never needs sudo — and must never wait for a password prompt.
+if [ "$SANDBOX" = "1" ]; then
+  SUDO=""
+fi
+
+# A symlinked sandbox root is refused before it is resolved. pwd -P
+# would follow it and then treat the target as the containment root,
+# so every "inside the sandbox" write would land on the live fleet.
+if [ "$SANDBOX" = "1" ] && path_has_symlink "$SANDBOX_ROOT"; then
+  log "ERROR: SANDBOX_ROOT is a symlink or contains one ($SANDBOX_ROOT)."
+  log "ERROR: following it would make the containment root the live fleet."
+  exit 1
+fi
+SANDBOX_ROOT_RESOLVED="$(resolve_path "$SANDBOX_ROOT")"
+
+if [ "$SANDBOX" = "1" ]; then
+  # Everything the run writes into is forced into the sandbox unless the
+  # operator names it explicitly.
+  if [ "$RUNNER_HOMES_OVERRIDDEN" -eq 0 ]; then
+    RUNNER_HOMES="$SANDBOX_ROOT/actions-runner-linux"
+  fi
+  if [ "$INSTALL_PATH_OVERRIDDEN" -eq 0 ]; then
+    INSTALL_PATH="$SANDBOX_ROOT/bin/runner-disk-cleanup.sh"
+  fi
+  if [ "$UNIT_DIR_OVERRIDDEN" -eq 0 ]; then
+    UNIT_DIR="$SANDBOX_ROOT/systemd"
+  fi
+  SERVICE_UNIT="$UNIT_DIR/runner-disk-cleanup.service"
+  TIMER_UNIT="$UNIT_DIR/runner-disk-cleanup.timer"
+  read -r -a RUNNER_HOME_LIST <<<"$RUNNER_HOMES"
+  # Check the paths as named, before they are rewritten to their physical
+  # form. A symlink is invisible once resolve_path has followed it.
+  assert_sandbox_writes
+  normalize_runner_homes
+  log "sandbox mode: everything stays under $SANDBOX_ROOT_RESOLVED"
+else
+  # SYSTEMD_UNIT_DIRS used to BE the live-directory list. A non-sandbox
+  # run that set it to a sandbox path made /etc/systemd/system look
+  # non-live, and the run rewrote the live unit. The hard-coded list
+  # above is what the guard trusts; setting the variable is refused
+  # rather than silently ignored, so the operator sees why.
+  if [ "$SYSTEMD_UNIT_DIRS_OVERRIDDEN" = "1" ]; then
+    log "ERROR: SYSTEMD_UNIT_DIRS cannot retarget the live unit directories."
+    log "ERROR: a non-sandbox run that sets it would hide /etc/systemd/system"
+    log "ERROR: and rewrite the LIVE runner-disk-cleanup.service."
+    log "ERROR: unset SYSTEMD_UNIT_DIRS, or run with SANDBOX=1."
+    exit 1
+  fi
+
+  # The runner homes are compared RESOLVED: a home that is spelled through
+  # a symlink (/home/<user>.linux -> <user>.guest) IS the live home, and a
+  # run that names it has to be treated as one.
+  runner_homes_resolved="$(resolved_runner_homes "$RUNNER_HOMES")"
+  default_runner_homes_resolved="$(resolved_runner_homes "$DEFAULT_RUNNER_HOMES")"
+  install_path_resolved="$(resolve_path "$INSTALL_PATH")"
+  default_install_path_resolved="$(resolve_path "$DEFAULT_INSTALL_PATH")"
+
+  # A run that changes the install directory but not the runner homes
+  # would write that directory into the LIVE runners' .path file, which is
+  # the pollution that put a dead PATH entry into every job on the fleet.
+  install_bin_dir="$(resolve_path "$(dirname -- "$INSTALL_PATH")")"
+  default_bin_dir="$(resolve_path "$(dirname -- "$DEFAULT_INSTALL_PATH")")"
+  if [ "$runner_homes_resolved" = "$default_runner_homes_resolved" ] &&
+    [ "$install_bin_dir" != "$default_bin_dir" ]; then
+    log "ERROR: INSTALL_PATH was overridden to $INSTALL_PATH but RUNNER_HOMES was not."
+    log "ERROR: the default RUNNER_HOMES point at the LIVE runners, so this run"
+    log "ERROR: would write $install_bin_dir into their .path file."
+    log "ERROR: set RUNNER_HOMES explicitly, or run with SANDBOX=1."
+    exit 1
+  fi
+
+  # The mirror image of the rule above, and the one that used to be
+  # missing: a run that changes the install path but leaves the unit
+  # directory at the LIVE one rewrites
+  # /etc/systemd/system/runner-disk-cleanup.service to execute the new
+  # path. The live timer runs that unit every 15 minutes, so a path that
+  # does not exist — or that the sweep removes — makes the disk cleanup
+  # die silently on every tick, the root filesystem fills, and both Linux
+  # runners go offline with zero-step jobs.
+  #
+  # The guard does not care whether RUNNER_HOMES was named: a run is
+  # either entirely LIVE (the live defaults for all three knobs) or
+  # entirely ISOLATED (its units go to a directory systemd does not
+  # read). The documented "name RUNNER_HOMES and you are fine" advice was
+  # wrong, and following it broke the live unit.
+  if is_systemd_unit_dir "$UNIT_DIR" &&
+    [ "$install_path_resolved" != "$default_install_path_resolved" ]; then
+    log "ERROR: UNIT_DIR is a live systemd unit directory ($UNIT_DIR) and INSTALL_PATH is not the default ($INSTALL_PATH)."
+    log "ERROR: this run would rewrite the LIVE runner-disk-cleanup.service to"
+    log "ERROR: execute $INSTALL_PATH, and the live timer would then fail on every tick."
+    log "ERROR: set UNIT_DIR to a directory systemd does not read, or run with SANDBOX=1."
+    exit 1
+  fi
+
+  # And the other way round: units that systemd does not read, but that
+  # point at the LIVE install path, would enable the LIVE timer while the
+  # operator believes the run is isolated.
+  if ! is_systemd_unit_dir "$UNIT_DIR" &&
+    [ "$install_path_resolved" = "$default_install_path_resolved" ]; then
+    log "ERROR: UNIT_DIR is not a systemd unit directory ($UNIT_DIR) but INSTALL_PATH is the live default ($INSTALL_PATH)."
+    log "ERROR: enabling the timer would enable the LIVE runner-disk-cleanup.timer."
+    log "ERROR: set INSTALL_PATH to a non-default path, or use the live defaults for both."
+    exit 1
+  fi
+
+  # Backstop for a mix the guards above do not name. Naming only
+  # RUNNER_HOMES leaves the install path and the unit directory at their
+  # live defaults: the run overwrites the live routine, rewrites the live
+  # unit and starts the live timer, while the operator believes the run
+  # is scoped to the scratch home.
+  live_count=0
+  if [ "$install_path_resolved" = "$default_install_path_resolved" ]; then
+    live_count=$((live_count + 1))
+  fi
+  if is_systemd_unit_dir "$UNIT_DIR"; then
+    live_count=$((live_count + 1))
+  fi
+  if [ "$runner_homes_resolved" = "$default_runner_homes_resolved" ]; then
+    live_count=$((live_count + 1))
+  fi
+  if [ "$live_count" -ne 0 ] && [ "$live_count" -ne 3 ]; then
+    log "ERROR: a non-sandbox run must be entirely LIVE or entirely ISOLATED."
+    log "ERROR: INSTALL_PATH, UNIT_DIR and RUNNER_HOMES are mixed"
+    log "ERROR: ($live_count of 3 still at the live default)."
+    log "ERROR: set all three, or none of them, or run with SANDBOX=1."
+    exit 1
+  fi
+
+  normalize_runner_homes
 fi
 
 uname_s="$(uname -s)"
@@ -152,7 +703,8 @@ as_user() {
 # runner home is just a proxy for it, and that proxy is wrong exactly in the
 # case this install exists to repair: a root-owned runner home.
 runner_service_user() {
-  local unit user
+  local runner_dir="${1:-}" unit user work
+  [ -n "$runner_dir" ] || return 1
   for unit in "$UNIT_DIR"/actions.runner.*.service; do
     [ -f "$unit" ] || continue
     user="$(sed -n 's/^User[[:space:]]*=[[:space:]]*//p' "$unit" 2>/dev/null | head -n 1)"
@@ -160,6 +712,12 @@ runner_service_user() {
     # A unit can name a user that does not exist on this host; that is not a
     # user to chown anything to.
     id "$user" >/dev/null 2>&1 || continue
+    # The first unit on the host is not this runner's unit. Two runners
+    # owned by different users would otherwise hand the first user's
+    # identity to every root-owned home.
+    work="$(sed -n 's/^WorkingDirectory[[:space:]]*=[[:space:]]*//p' "$unit" 2>/dev/null | head -n 1)"
+    [ -n "$work" ] || continue
+    [ "$(resolve_path "$work")" = "$(resolve_path "$runner_dir")" ] || continue
     printf '%s' "$user"
     return 0
   done
@@ -186,7 +744,7 @@ runner_owner_and_group() {
   group="$(dir_group "$runner_dir")"
   case "$owner" in
     root | 0)
-      svc_owner="$(runner_service_user || true)"
+      svc_owner="$(runner_service_user "$runner_dir" || true)"
       if [ -z "$svc_owner" ]; then
         log "WARN: $runner_dir is root-owned and no runner service unit names a user"
         return 1
@@ -238,14 +796,39 @@ install_script() {
 }
 
 install_units() {
-  $SUDO tee "$SERVICE_UNIT" >/dev/null <<UNIT
+  # A newline in the path is a new line in the unit file. Quoting does
+  # not contain it: whatever follows the newline is a unit directive, so
+  # the install is refused before a file is written.
+  # A newline is a new line in the unit file. A quote, backslash, percent,
+  # dollar or backtick breaks the ExecStart quoting or is a systemd
+  # specifier. The install is refused before a file is written.
+  case "$INSTALL_PATH" in
+    *'"'* | *"'"* | *'\'* | *'%'* | *'$'* | *'`'* | *'
+'*)
+      log "ERROR: INSTALL_PATH contains a character that would break ExecStart ($INSTALL_PATH)"
+      log "ERROR: a quote, backslash, percent, dollar, backtick or newline would split or inject the unit."
+      log "ERROR: install the routine at a path with none of those characters."
+      exit 1
+      ;;
+  esac
+
+  # The unit files are written to a temporary file in the SAME directory
+  # and renamed into place. `tee` truncates the live unit in place, and a
+  # `systemctl daemon-reload` that races the write loads a half-written
+  # unit; a rename(2) within the directory is atomic, so systemd only
+  # ever sees the complete unit.
+  local service_tmp timer_tmp
+  service_tmp="$UNIT_DIR/.runner-disk-cleanup.service.$$"
+  timer_tmp="$UNIT_DIR/.runner-disk-cleanup.timer.$$"
+
+  $SUDO tee "$service_tmp" >/dev/null <<UNIT
 [Unit]
 Description=Reclaim disk space used by the self-hosted GitHub Actions runners
 After=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=${INSTALL_PATH}
+ExecStart="${INSTALL_PATH}"
 Environment=HOME=/root
 Nice=19
 IOSchedulingClass=idle
@@ -253,8 +836,10 @@ IOSchedulingClass=idle
 # skipped one, because the next pass would also queue behind it.
 TimeoutStartSec=600
 UNIT
+  $SUDO chmod 0644 "$service_tmp"
+  $SUDO mv -f -- "$service_tmp" "$SERVICE_UNIT"
 
-  $SUDO tee "$TIMER_UNIT" >/dev/null <<'UNIT'
+  $SUDO tee "$timer_tmp" >/dev/null <<'UNIT'
 [Unit]
 Description=Run the runner disk cleanup every 15 minutes
 
@@ -267,6 +852,8 @@ Unit=runner-disk-cleanup.service
 [Install]
 WantedBy=timers.target
 UNIT
+  $SUDO chmod 0644 "$timer_tmp"
+  $SUDO mv -f -- "$timer_tmp" "$TIMER_UNIT"
 
   log "installed $SERVICE_UNIT"
   log "installed $TIMER_UNIT"
@@ -289,10 +876,19 @@ fix_runner_ownership() {
       log "WARN: runner home $runner_dir does not exist; skipping it"
       continue
     fi
+    # A sandbox run must not change the ownership of anything outside its
+    # root: the live runners' tree is not a verification target, and a
+    # recursive chown there is a fleet-wide mutation.
+    if [ "$SANDBOX" = "1" ] && ! path_under "$(resolve_path "$runner_dir")" "$SANDBOX_ROOT_RESOLVED"; then
+      log "WARN: $runner_dir is outside the sandbox root $SANDBOX_ROOT_RESOLVED; leaving its ownership untouched"
+      continue
+    fi
 
     if ! owner_group="$(runner_owner_and_group "$runner_dir")"; then
-      log "WARN: the user that must own $runner_dir could not be determined; leaving it untouched"
-      continue
+      log "ERROR: the user that must own $runner_dir could not be determined"
+      log "ERROR: a root-owned runner home with no runner service unit is refused"
+      log "ERROR: the install will not guess, and it will not report success"
+      exit 1
     fi
     owner="${owner_group%% *}"
     group="${owner_group##* }"
@@ -343,9 +939,14 @@ verify_runner_writable() {
       continue
     fi
 
+    if [ "$SANDBOX" = "1" ]; then
+      assert_sandbox_writes
+    fi
     if ! owner_group="$(runner_owner_and_group "$runner_dir")"; then
-      log "WARN: skipping the write check for $runner_dir"
-      continue
+      log "ERROR: the user that must own $runner_dir could not be determined"
+      log "ERROR: a root-owned runner home with no runner service unit is refused"
+      log "ERROR: the install will not guess, and it will not report success"
+      exit 1
     fi
     owner="${owner_group%% *}"
 
@@ -379,13 +980,43 @@ verify_runner_writable() {
 }
 
 enable_timer() {
+  # A unit that systemd does not read cannot be enabled — and
+  # `systemctl enable runner-disk-cleanup.timer` resolves the NAME, so it
+  # would enable the LIVE timer while the operator believes the run is
+  # isolated. The live fleet's timer is not this run's to touch.
+  if ! is_systemd_unit_dir "$UNIT_DIR"; then
+    log "the unit directory $UNIT_DIR is not a systemd unit directory;"
+    log "the timer was not enabled (enabling it would enable the LIVE timer)"
+    return 0
+  fi
   $SUDO systemctl daemon-reload
-  $SUDO systemctl enable --now runner-disk-cleanup.timer
-  log "enabled runner-disk-cleanup.timer (every 15 minutes)"
+  # The path, not the name. `systemctl enable runner-disk-cleanup.timer`
+  # resolves the name through systemd's search path, and
+  # /etc/systemd/system wins over /run and /usr/lib. A run whose units
+  # went to another systemd directory would enable the live timer.
+  $SUDO systemctl enable --now "$TIMER_UNIT"
+  log "enabled $TIMER_UNIT (every 15 minutes)"
 }
 
 run_once() {
-  if $SUDO systemctl start runner-disk-cleanup.service; then
+  # The same reason as in enable_timer: `systemctl start` resolves the
+  # unit NAME, so it would run the LIVE service. An isolated run verifies
+  # the installed routine directly instead.
+  if ! is_systemd_unit_dir "$UNIT_DIR"; then
+    log "the unit directory $UNIT_DIR is not a systemd unit directory;"
+    log "verifying the installed routine directly instead of through systemd"
+    if "$INSTALL_PATH" --status >/dev/null 2>&1; then
+      log "the installed routine at $INSTALL_PATH ran (--status)"
+    else
+      log "ERROR: the installed routine at $INSTALL_PATH failed to run"
+      exit 1
+    fi
+    return 0
+  fi
+  # The path, not the name, for the same reason as enable_timer: a
+  # name resolves to whichever unit systemd finds first, which may not
+  # be the file this run just wrote.
+  if $SUDO systemctl start "$SERVICE_UNIT"; then
     log "ran the cleanup routine once"
   else
     log "ERROR: the cleanup routine failed; inspect it with:"
@@ -396,21 +1027,26 @@ run_once() {
 
 # True when the .path file already lists the directory.
 #
-# The runner reads .path as a list of PATH entries, one per line, and this
-# installer writes one directory per line. The membership test therefore has
-# to be a LINE test: the old colon-delimited token match against the whole
-# file never matched the format this installer writes, so the entry was
-# prepended again on every single run (3 lines, then 4, then 5).
-#
-# Older writers (scripts/provision-host.sh) put several directories on one
-# colon-joined line, so the colon form is checked as well — otherwise the
-# first install after such a write would duplicate the entry once.
+# The runner's runsvc.sh does `export PATH=$(cat .path)`. A newline is not
+# a separator, so this installer writes one colon-joined line. The
+# membership test still accepts a fragment on its own line, because older
+# files have that shape, and a colon-joined line, so a re-run does not
+# prepend the directory again.
 path_file_has() {
   local path_file="$1" bin_dir="$2"
   grep -Fxq -- "$bin_dir" "$path_file" 2>/dev/null && return 0
-  case ":$(tr '\n' ':' <"$path_file" 2>/dev/null):" in
-    *":${bin_dir}:"*) return 0 ;;
-  esac
+  # The fragment is compared as a FIXED string. The old `case` pattern only
+  # matched literally because the expansion happened to sit inside double
+  # quotes — an expansion that lost its quotes would turn the fragment
+  # into a glob, and a directory whose name contains ".", "*" or "[" would
+  # then match far more than it should: a home directory called
+  # "runner[1]" would look like it was already in the file, and the entry
+  # would never be added and the runner would lose the tool.
+  # The stream is wrapped in colons so that a fragment at either end of
+  # the file is still delimited: the first fragment of the file has no
+  # colon in front of it.
+  printf '%s' ":$(tr '\n' ':' <"$path_file" 2>/dev/null):" |
+    grep -Fq -- ":${bin_dir}:" && return 0
   return 1
 }
 
@@ -424,6 +1060,14 @@ path_file_has() {
 ensure_runner_path() {
   local runner_dir path_file current bin_dir owner tmp_file rc=0
   bin_dir="$(dirname "$INSTALL_PATH")"
+  # The install directory has to exist before it goes into a .path file: a
+  # dead entry costs every job on that runner a failed lookup, and the
+  # guarantee the entry exists for ("the routine resolves by name") is
+  # dead by default when the directory is missing.
+  if [ ! -d "$bin_dir" ]; then
+    log "WARN: the install directory $bin_dir does not exist; not adding it to any .path file"
+    return 0
+  fi
   for runner_dir in "${RUNNER_HOME_LIST[@]:-}"; do
     [ -n "$runner_dir" ] || continue
     if [ ! -d "$runner_dir" ]; then
@@ -446,9 +1090,22 @@ ensure_runner_path() {
     # Written as the runner user, so the runner owns the result and no
     # root-owned artefact is left behind. The single quotes are deliberate:
     # $1..$3 are expanded by that shell at runtime.
+    #
+    # An empty .path file gets the entry and nothing else: a trailing blank
+    # line is a PATH fragment that does not exist.
+    # runsvc.sh does `export PATH=$(cat .path)`. A newline is not a
+    # separator, so a new line glued to the first old entry drops both
+    # from PATH. Fold the existing body into the same colon-joined line.
     # shellcheck disable=SC2016
     if ! as_user "$owner" sh -c '
-        printf "%s\n%s\n" "$1" "$2" > "$3"
+        folded=$(printf "%s" "$2" | tr "\n" ":")
+        folded=${folded%:}
+        folded=${folded#:}
+        if [ -n "$folded" ]; then
+          printf "%s:%s\n" "$1" "$folded" > "$3"
+        else
+          printf "%s\n" "$1" > "$3"
+        fi
       ' sh "$bin_dir" "$current" "$tmp_file"; then
       log "ERROR: could not write $tmp_file as $owner"
       rc=1
@@ -467,33 +1124,66 @@ ensure_runner_path() {
   return "$rc"
 }
 
+# Create the directories a sandbox install writes into, so a verification
+# run can complete end to end. Nothing outside the sandbox is touched.
+sandbox_prepare() {
+  local runner_dir
+  [ "$SANDBOX" = "1" ] || return 0
+  # Before mkdir, and again after: creating the missing component must
+  # not turn an escape into a path the check now accepts.
+  assert_sandbox_writes
+  mkdir -p "$(dirname -- "$INSTALL_PATH")" "$UNIT_DIR"
+  for runner_dir in "${RUNNER_HOME_LIST[@]:-}"; do
+    [ -n "$runner_dir" ] || continue
+    mkdir -p "$runner_dir"
+  done
+  assert_sandbox_writes
+}
+
+# The install itself. Enabling the timer and running the routine once are
+# the only steps that need a live systemd, so a sandbox run skips them.
+run_install() {
+  sandbox_prepare
+  install_script
+  install_units
+  fix_runner_ownership
+  # Fail closed: a runner that cannot write its work directory is worse
+  # than no install at all, so this must not report success.
+  if ! verify_runner_writable; then
+    log "ERROR: install aborted — the runner user cannot write its work directory"
+    exit 1
+  fi
+  if ! ensure_runner_path; then
+    log "WARN: at least one runner's .path file could not be updated"
+    log "WARN: the runner service may not find the routine by name"
+  fi
+  if [ "$SANDBOX" = "1" ]; then
+    log "sandbox mode: the timer was not enabled and the routine was not started"
+    log "sandbox install complete (nothing outside $SANDBOX_ROOT_RESOLVED was touched)"
+    return 0
+  fi
+  enable_timer
+  run_once
+  log "disk cleanup installed (timer enabled, routine verified)"
+}
+
 # Run the install when the script is executed. When it is sourced — the
 # sandbox tests do that to exercise the .path handling in isolation —
 # nothing is installed and the functions are simply available.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 case "$uname_s" in
   Linux)
-    install_script
-    install_units
-    fix_runner_ownership
-    # Fail closed: a runner that cannot write its work directory is worse
-    # than no install at all, so this must not report success.
-    if ! verify_runner_writable; then
-      log "ERROR: install aborted — the runner user cannot write its work directory"
-      exit 1
-    fi
-    if ! ensure_runner_path; then
-      log "WARN: at least one runner's .path file could not be updated"
-      log "WARN: the runner service may not find the routine by name"
-    fi
-    enable_timer
-    run_once
-    log "disk cleanup installed (timer enabled, routine verified)"
+    run_install
     log "the runner services were left running"
     ;;
   Darwin)
-    log "macOS: systemd timers are Linux-only, nothing installed"
-    log "macOS: the Linux runners live in the Colima VM — run this script there"
+    if [ "$SANDBOX" = "1" ]; then
+      log "sandbox mode: installing into $SANDBOX_ROOT_RESOLVED (macOS has no systemd)"
+      run_install
+    else
+      log "macOS: systemd timers are Linux-only, nothing installed"
+      log "macOS: the Linux runners live in the Colima VM — run this script there"
+    fi
     ;;
   *)
     log "ERROR: unsupported OS '$uname_s' (expected Linux or Darwin)"
