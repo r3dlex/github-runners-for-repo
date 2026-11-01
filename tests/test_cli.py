@@ -22,7 +22,14 @@ class TestCLI:
     def test_provision_command(self, mock_load, mock_provision):
         mock_load.return_value = "config"
         main(["provision"])
-        mock_provision.assert_called_once_with("config")
+        mock_provision.assert_called_once_with("config", non_interactive=False)
+
+    @patch("github_runners_for_repo.cli.provision")
+    @patch("github_runners_for_repo.cli.load_config")
+    def test_provision_command_non_interactive(self, mock_load, mock_provision):
+        mock_load.return_value = "config"
+        main(["provision", "--non-interactive"])
+        mock_provision.assert_called_once_with("config", non_interactive=True)
 
     @patch("github_runners_for_repo.cli.install")
     @patch("github_runners_for_repo.cli.load_config")

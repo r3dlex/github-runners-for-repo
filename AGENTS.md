@@ -96,7 +96,7 @@ uv run gh-runners remove --name <NAME>
 │   ├── github_api.py            # GitHub API interactions
 │   ├── runner_manager.py        # Native actions/runner binary lifecycle
 │   └── scripts/
-│       ├── provision-host.sh    # Idempotent host toolchain provisioning (Node/npm, pipx)
+│       ├── provision-host.sh    # Idempotent host toolchain provisioning (Node/npm, pipx, gh)
 │       ├── cleanup-host-disk.sh # Pressure-adaptive disk reclaim routine (timer-driven)
 │       └── install-disk-cleanup.sh  # Installs the routine + its two systemd units
 ├── tools/
@@ -147,19 +147,98 @@ the CLI in each. There is no Docker, no custom runner agent, and no
 `actions/runner-images` indirection.
 
 A self-hosted host needs the same toolchain a GitHub-hosted runner ships
-with (Node/npm, pipx); a bare host (fresh Colima VM, clean macOS box) does
-not have it, and jobs that call `npm`/`node` fail with `command not found`,
-silently falling back to the GitHub-hosted leg. `gh-runners provision`
+with (Node/npm, pipx, gh); a bare host (fresh Colima VM, clean macOS box)
+does not have it, and jobs that call `npm`/`node`/`gh` fail with
+`command not found`, silently falling back to the GitHub-hosted leg.
+`gh-runners provision`
 runs the bundled idempotent `scripts/provision-host.sh` to close that gap
 once per host. This is the permanent home of that lesson — do not delete
 it; if a host rebuild loses the toolchain, re-running `provision` restores
 it.
 
+`provision` is normally run **as root** (the toolchain goes to `/usr/local`
+and the npm prefix in the runner user's home has to be chowned). Run as
+the runner user instead and
+every privileged step escalates with `sudo`, interactively by default so a
+watched invocation can answer the password prompt;
+`gh-runners provision --non-interactive` uses `sudo -n` instead, where a
+missing password fails the provisioning rather than hanging on a prompt.
+On Linux the provisioning ends with a check that the **runner user** can
+really run `gh` under the default job `PATH`; on macOS the equivalent
+check is that Homebrew's `gh` is on the runner's `.path` file. The runner
+user is the owner of the runner home, named by the `RUNNER_HOMES` knob
+with **absolute paths** (same knob as `install-disk-cleanup.sh`) — never
+a hardcoded name, and never taken from the invoking user's `$HOME` alone:
+provisioning runs as root and root's home holds no runner directory. A
+runner home under the invoking account's own home is found as well,
+and on Linux the homes one level below `/home` are scanned (`/Users` on
+macOS). `RUNNER_HOME_PARENTS` overrides that scan; an explicitly empty
+value scans nothing. Every runner home on the host is checked,
+and a runner home owned by root is skipped: root is not a runner user,
+and a check that ran as root would prove nothing. Without a runner home
+other than a root-owned one the provisioning says so loudly and checks
+the install the other way round — the binary has to be executable by
+every user on the host — rather than verifying the invoking user, which
+would pass for a `gh` the runner user cannot execute.
+
+**The runner-user check fails the install when it cannot run.** A host
+whose runner user cannot be switched to has verified nothing, and
+reporting success for an unverified install is the exact failure the
+check exists for. The check runs `gh` **by name** under the default job
+`PATH` — not the absolute path, because a binary that is not on the job
+`PATH` is a binary the jobs never find — and the `gh` that `PATH`
+resolves has to be the one that was installed. The fallback is not a
+skip: with no runner user the property is **proved** for every user on
+the host (the binary has to be executable by all of them, and the dir
+that holds it traversable by all of them), and with a runner user but
+no way to switch to it the install **fails**.
+
+**The GitHub CLI release is pinned, and the pin is the anchor.**
+`GH_VERSION=latest` is **refused**: a release that is named at install
+time has no recorded digest, and the upstream checksum file is not an
+alternative — it arrives from the same origin as the tarball, so it
+cannot vouch for it. The digest recorded in `gh_expected_sha256` is the
+only trust anchor, and a release without one is not installed. The
+install path is also checked against the default job `PATH` **before**
+anything is downloaded: a gh outside the PATH a job gets is a gh no job
+can find, and there is no point fetching a release that lands where
+nothing looks for it.
+
+The GitHub CLI is a **host-wide** binary: `/usr/local/bin/gh` belongs to
+root, and so does the directory that holds it. `unlink(2)` and
+`rename(2)` are governed by the write permission on the **containing
+directory**, not by the ownership or the mode of the file, so a
+root-owned `gh` inside a runner-writable `/usr/local/bin` can still be
+deleted and replaced by the runner user — and the runner user runs
+arbitrary pull-request code. The provisioning therefore keeps the npm
+prefix in the runner user's own home (`$TOOL_HOME/.npm`, the passwd home,
+not the invoking `$HOME`), never in a prefix
+shared with the host binaries, and it verifies that the directory of
+`GH_INSTALL_PATH` is root-owned and neither group nor other writable.
+Do not weaken that check: it is the difference between a host-wide `gh`
+and a `gh` any job on the host can replace.
+
+**The directory that holds the gh is verified, not taken over.** The
+provisioning checks it (root-owned, not group or other writable) and
+refuses it otherwise; it never chowns it and never chmods it. The mode
+of a host-wide directory is not the provisioning's to decide, and
+`/usr/local/bin` holds every host-wide binary on the host. A directory
+that the provisioning **creates** is created `0755` — the host's umask
+would otherwise hand out a group-writable dir that the check refuses —
+and a directory that is already there is left exactly as it is. The
+check runs **before** the binary is staged into the dir, because a check
+after the fact is worth nothing: a dir that was replaced between the
+check and the install is exactly the race the check exists to close. The
+repair is **binary-only** — the mode and the owner of the `gh` itself
+are set on every path, root-owned and world executable, never owned by
+the user that runs the provisioning.
+
 The flow for one runner:
 
 0. `gh-runners provision` — one-time per host; installs the toolchain
    (Node/npm via NodeSource on Linux or Homebrew on macOS, npm global
-   prefix repointed to a user-writable dir on Linux, pip + pipx).
+   prefix repointed to a user-writable dir on Linux, pip + pipx, the
+   GitHub CLI — the pinned release on Linux, Homebrew on macOS).
 1. `gh-runners install` — downloads and extracts the official
    `actions-runner-<os>-<arch>-<ver>.tar.gz` from the GitHub release into
    a target directory.
