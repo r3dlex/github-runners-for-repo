@@ -356,11 +356,14 @@ class TestRunnerPathFile:
         self._update(home, install_path)
         self._update(home, install_path)
 
-        lines = path_file.read_text().splitlines()
-        assert lines.count(str(install_path.parent)) == 1, (
-            f"the install directory must be added exactly once, got {lines}"
+        text = path_file.read_text()
+        assert text.count(str(install_path.parent)) == 1, (
+            f"the install directory must be added exactly once, got {text!r}"
         )
-        assert len(lines) == 2, f"the .path file must not grow on every run: {lines}"
+        # runsvc.sh does PATH=$(cat .path). One line, colon-joined, or the
+        # newline glues the new dir to the first old entry and both leave PATH.
+        assert text.count("\n") == 1 and text.endswith("\n"), text
+        assert "/usr/local/bin:/usr/bin" in text
 
     def test_entry_inside_a_colon_joined_line_is_not_duplicated(self, tmp_path: Path) -> None:
         home = tmp_path / "actions-runner-linux"
@@ -398,10 +401,9 @@ class TestRunnerPathFile:
 
         self._update(home, install_path)
 
-        lines = path_file.read_text().splitlines()
-        assert joined in lines, (
-            f"the colon-joined line must survive the install untouched, got {lines}"
-        )
+        text = path_file.read_text()
+        assert joined in text, f"the colon-joined fragments must survive the install, got {text!r}"
+        assert text.startswith(str(install_path.parent) + ":"), text
 
     def test_a_fragment_with_glob_characters_is_not_taken_for_present(self, tmp_path: Path) -> None:
         """The membership test must compare FIXED strings.
@@ -618,6 +620,31 @@ class TestInstallerSandbox:
         assert "symlink" in result.stdout.lower(), result.stdout
         assert not (target / "bin").exists()
         assert not (target / "systemd").exists()
+
+    def test_sandbox_refuses_a_symlink_followed_by_dotdot(self, tmp_path: Path) -> None:
+        """mkdir follows a symlink and then applies "..". Collapsing first hides the link."""
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        link = sandbox / "link"
+        link.symlink_to(outside)
+
+        result = _installer(
+            {
+                "SANDBOX": "1",
+                "SANDBOX_ROOT": str(sandbox),
+                "UNIT_DIR": f"{sandbox}/link/../units",
+                "INSTALL_PATH": f"{sandbox}/link/../bin/runner-disk-cleanup.sh",
+                "RUNNER_HOMES": f"{sandbox}/link/../runner",
+            },
+            'source "$INSTALLER"',
+        )
+
+        assert result.returncode != 0, result.stdout
+        assert "symlink" in result.stdout.lower(), result.stdout
+        assert not (outside / "units").exists()
+        assert not (tmp_path / "units").exists()
 
     def test_a_dotdot_unit_dir_is_not_treated_as_isolated(self, tmp_path: Path) -> None:
         """A non-sandbox UNIT_DIR that canonicalizes onto systemd is live.

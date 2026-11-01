@@ -215,13 +215,20 @@ lexical_path() {
 
 # True when an existing component of the path is a symlink.
 #
+# The walk does NOT collapse ".." first. lexical_path("$root/link/..") is
+# $root, so the symlink is gone before it can be seen, and mkdir then
+# follows the link and applies ".." against the target. A symlink is
+# reported as soon as the walk lands on it, before a later ".." is applied.
 # The walk stops at the first component that does not exist, so a missing
 # tail cannot hide a symlink in the prefix. `-L` is tested before `-e`:
 # `-d` follows the link and would answer about the target.
 path_has_symlink() {
-  local target="$1" rest part current="/"
-  target="$(lexical_path "$target")"
-  rest="${target#/}"
+  local input="$1" rest part current="/"
+  case "$input" in
+    /*) ;;
+    *) input="$PWD/$input" ;;
+  esac
+  rest="${input#/}"
   while [ -n "$rest" ]; do
     case "$rest" in
       */*)
@@ -233,7 +240,16 @@ path_has_symlink() {
         rest=""
         ;;
     esac
-    [ -n "$part" ] || continue
+    case "$part" in
+      "" | .) continue ;;
+      ..)
+        # The component we would pop was already inspected when we landed
+        # on it. Popping here must not skip a symlink we have not visited.
+        current="$(dirname -- "$current")"
+        [ -n "$current" ] || current="/"
+        continue
+        ;;
+    esac
     if [ "$current" = "/" ]; then
       current="/$part"
     else
@@ -251,44 +267,74 @@ path_has_symlink() {
 
 # The absolute, symlink-resolved form of a path, whether or not it exists.
 #
-# "." and ".." are collapsed first, including in a tail that does not
-# exist yet. The longest existing prefix is then resolved with cd+pwd -P
-# (`readlink -f` is GNU-only) so a symlink in that prefix is visible to
-# the containment check. On macOS /tmp is a symlink to /private/tmp, and
-# a relative path must not slip past one.
+# Existing components are resolved physically (cd+pwd -P, which follows a
+# symlink) and ".." is applied to that physical path, so a link followed
+# by ".." is the parent of the target — the path mkdir will actually
+# create. ".." in a tail that does not exist yet is collapsed only after
+# that, so /sandbox/missing/../../victim is still /victim. `readlink -f`
+# is GNU-only. On macOS /tmp is a symlink to /private/tmp.
 resolve_path() {
-  local target tail="" head
-  target="$(lexical_path "$1")"
-  while [ ! -d "$target" ] || [ -L "$target" ]; do
-    if [ "$target" = "/" ]; then break; fi
-    # A symlink is not a directory we want to cd into and lose: the
-    # physical target is appended as the new head below, via pwd -P,
-    # only when the component is a real directory. A symlink stops the
-    # walk so the caller can refuse it. `-d` follows, so test `-L` first.
-    if [ -L "$target" ]; then
-      break
-    fi
-    if [ ! -d "$target" ]; then
-      tail="/$(basename -- "$target")$tail"
-      target="$(dirname -- "$target")"
-      continue
-    fi
-    break
-  done
-  if [ -d "$target" ] && [ ! -L "$target" ]; then
-    head="$(cd -- "$target" 2>/dev/null && pwd -P)" || head="$target"
-  elif [ -L "$target" ]; then
-    # Physicalize the symlink itself so a link to /etc is /etc, not the
-    # path that named the link. The containment check then sees the escape.
-    head="$(cd -- "$target" 2>/dev/null && pwd -P)" || head="$target"
-  else
-    head="/"
-  fi
-  case "$head" in
-    /) target="/${tail#/}" ;;
-    *) target="${head%/}$tail" ;;
+  local input="$1" rest part head="/" next
+  case "$input" in
+    /*) ;;
+    *) input="$PWD/$input" ;;
   esac
-  lexical_path "$target"
+  rest="${input#/}"
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      */*)
+        part="${rest%%/*}"
+        rest="${rest#*/}"
+        ;;
+      *)
+        part="$rest"
+        rest=""
+        ;;
+    esac
+    case "$part" in
+      "" | .) continue ;;
+      ..)
+        if [ -d "$head" ] || [ -L "$head" ]; then
+          head="$(cd -- "$head/.." 2>/dev/null && pwd -P)" || head="$(dirname -- "$head")"
+          [ -n "$head" ] || head="/"
+          continue
+        fi
+        # The head does not exist. The ".." and whatever follows are a
+        # missing tail; collapse them against the head we have.
+        if [ -n "$rest" ]; then
+          lexical_path "${head%/}/../$rest"
+        else
+          lexical_path "${head%/}/.."
+        fi
+        return
+        ;;
+    esac
+    if [ "$head" = "/" ]; then
+      next="/$part"
+    else
+      next="$head/$part"
+    fi
+    if [ -e "$next" ] || [ -L "$next" ]; then
+      if [ -d "$next" ] || [ -L "$next" ]; then
+        head="$(cd -- "$next" 2>/dev/null && pwd -P)" || head="$next"
+        continue
+      fi
+      # A file. Further components cannot be directories.
+      if [ -n "$rest" ]; then
+        lexical_path "$next/$rest"
+      else
+        printf '%s' "$next"
+      fi
+      return
+    fi
+    if [ -n "$rest" ]; then
+      lexical_path "$next/$rest"
+    else
+      lexical_path "$next"
+    fi
+    return
+  done
+  printf '%s' "$head"
 }
 
 # True when $1 is $2 or lives under it. Both sides must already have been
@@ -359,9 +405,15 @@ is_live_fleet_path() {
   fi
   for home in $DEFAULT_RUNNER_HOMES; do
     [ -n "$home" ] || continue
-    if [ "$resolved" = "$(resolve_path "$home")" ]; then
+    home="$(resolve_path "$home")"
+    if [ "$resolved" = "$home" ]; then
       return 0
     fi
+    # A path under a live runner home is that home's tree. Equality
+    # alone accepted .../actions-runner-linux/_work.
+    case "$resolved" in
+      "$home"/*) return 0 ;;
+    esac
   done
   return 1
 }
@@ -975,15 +1027,11 @@ run_once() {
 
 # True when the .path file already lists the directory.
 #
-# The runner reads .path as a list of PATH entries, one per line, and this
-# installer writes one directory per line. The membership test therefore has
-# to be a LINE test: the old colon-delimited token match against the whole
-# file never matched the format this installer writes, so the entry was
-# prepended again on every single run (3 lines, then 4, then 5).
-#
-# Older writers (scripts/provision-host.sh) put several directories on one
-# colon-joined line, so the colon form is checked as well — otherwise the
-# first install after such a write would duplicate the entry once.
+# The runner's runsvc.sh does `export PATH=$(cat .path)`. A newline is not
+# a separator, so this installer writes one colon-joined line. The
+# membership test still accepts a fragment on its own line, because older
+# files have that shape, and a colon-joined line, so a re-run does not
+# prepend the directory again.
 path_file_has() {
   local path_file="$1" bin_dir="$2"
   grep -Fxq -- "$bin_dir" "$path_file" 2>/dev/null && return 0
@@ -1045,10 +1093,16 @@ ensure_runner_path() {
     #
     # An empty .path file gets the entry and nothing else: a trailing blank
     # line is a PATH fragment that does not exist.
+    # runsvc.sh does `export PATH=$(cat .path)`. A newline is not a
+    # separator, so a new line glued to the first old entry drops both
+    # from PATH. Fold the existing body into the same colon-joined line.
     # shellcheck disable=SC2016
     if ! as_user "$owner" sh -c '
-        if [ -n "$2" ]; then
-          printf "%s\n%s\n" "$1" "$2" > "$3"
+        folded=$(printf "%s" "$2" | tr "\n" ":")
+        folded=${folded%:}
+        folded=${folded#:}
+        if [ -n "$folded" ]; then
+          printf "%s:%s\n" "$1" "$folded" > "$3"
         else
           printf "%s\n" "$1" > "$3"
         fi

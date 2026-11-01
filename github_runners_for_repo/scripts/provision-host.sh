@@ -269,9 +269,14 @@ ensure_user_path_in_runner() {
       # An empty .path file gets the entries and nothing else: a trailing
       # blank line is a PATH fragment that does not exist.
       # shellcheck disable=SC2016
+      # runsvc.sh does PATH=$(cat .path). A newline is not a separator,
+      # so the last new dir and the first old entry would leave PATH.
       if ! as_user "$owner" sh -c '
-          if [ -n "$2" ]; then
-            printf "%s\n%s\n" "$1" "$2" > "$3"
+          folded=$(printf "%s" "$2" | tr "\n" ":")
+          folded=${folded%:}
+          folded=${folded#:}
+          if [ -n "$folded" ]; then
+            printf "%s:%s\n" "$1" "$folded" > "$3"
           else
             printf "%s\n" "$1" > "$3"
           fi

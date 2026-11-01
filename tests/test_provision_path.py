@@ -217,8 +217,8 @@ class TestRunnerHomeEnumeration:
         assert content.count(str(fleet / ".local/bin")) == 1, (
             f"the entry must be added exactly once: {content!r}"
         )
-        assert len(content.splitlines()) == 2, (
-            f"the .path file must not grow on every run: {content!r}"
+        assert content.count("\n") == 1, (
+            f"runsvc.sh reads .path with $(cat); a second line glues entries: {content!r}"
         )
 
     def test_a_fragment_that_ends_a_line_is_not_re_added(self, tmp_path: Path) -> None:
@@ -345,8 +345,12 @@ class TestPathFileUpdate:
             "the file was truncated in place instead of replaced: the reader "
             f"that holds it open sees the NEW content: {reader_output!r}"
         )
-        assert path_file.read_text().count("\n") == 2, (
-            "the file itself must carry the new entries and the old line"
+        written = path_file.read_text()
+        assert ".local/bin" in written and "/usr/local/bin:/usr/bin" in written, (
+            f"the file itself must carry the new entries and the old line: {written!r}"
+        )
+        assert written.count("\n") == 1, (
+            f"runsvc.sh reads .path with cat; a second line glues entries: {written!r}"
         )
 
     def test_a_fragment_with_glob_characters_is_not_taken_for_present(self, tmp_path: Path) -> None:
