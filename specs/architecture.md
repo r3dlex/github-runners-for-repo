@@ -117,6 +117,58 @@ User runs `gh-runners remove --name r3dlex-runner-1`
     └─► DELETE /orgs/{org}/actions/runners/{id}
 ```
 
+### Host provisioning (once per host)
+
+```
+User runs `gh-runners provision`  (optionally `--non-interactive`)
+    │
+    ├─► Python CLI shells out to scripts/provision-host.sh
+    │
+    └─► provision-host.sh
+        ├─ resolve_tool_dirs  → the tool user, npm prefix and PATH
+        ├─ Linux:  NodeSource (Node/npm) → pipx → GitHub CLI
+        │          macOS:  Homebrew  (Node/npm) → pipx → Homebrew gh
+        ├─ uv, bun, archgate, ar
+        └─ verify_gh_runnable  → run `gh` as the runner user under the
+                                 default job PATH
+```
+
+`provision` is a **host-level** step, not a per-runner one: it installs
+the toolchain that a GitHub-hosted runner image ships with (Node/npm,
+pipx, `gh`, uv, bun) onto a bare host. It is idempotent — a second run
+checks what is there and only installs what is missing — so it is also
+the way to restore a host after a rebuild.
+
+The privileged steps escalate with `sudo`: interactively by default, so
+a watched invocation can answer the password prompt, and with `sudo -n`
+under `--non-interactive`, where a missing password **fails** the
+provisioning instead of hanging on a prompt.
+
+The GitHub CLI is installed from a **pinned** release on Linux
+(`GH_VERSION`, default `v2.103.3`) to `GH_INSTALL_PATH` (default
+`/usr/local/bin/gh`). The digest recorded in the script
+(`gh_expected_sha256`) is the only trust anchor; `GH_VERSION=latest` is
+refused, because a release named at install time has no recorded digest
+and the upstream checksum file arrives from the same origin as the
+tarball. On macOS the pinned release is Linux-only, so `gh` comes from
+Homebrew and the Homebrew prefix is put on the runner's `.path` file.
+
+The install path is checked against the default job `PATH` **before**
+anything is downloaded, and the directory that holds the `gh` is checked
+**before** the binary is staged into it. The directory is verified, not
+taken over: it has to belong to root and must not be group or other
+writable, and the provisioning never chowns it and never chmods it. The
+binary itself is repaired on every path — mode `0755`, owner
+`root:root`, never the user that runs the provisioning — because
+`/usr/local/bin/gh` is shared by every job on the host.
+
+The final check runs the `gh` **as the runner user** (the owner of the
+runner home, named by the `RUNNER_HOMES` knob) under the default job
+`PATH`: root bypasses the mode bits, so a root-only check would pass for
+a binary the runner user cannot execute. With no runner user on the
+host the property is proved for *every* user instead, and a runner user
+that cannot be switched to fails the provisioning.
+
 ## Scaling
 
 There is no built-in `--count` flag. Scale by creating one directory per

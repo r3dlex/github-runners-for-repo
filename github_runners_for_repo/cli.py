@@ -35,9 +35,17 @@ def main(argv: list[str] | None = None) -> None:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser(
+    provision_p = subparsers.add_parser(
         "provision",
-        help="Provision the host with the toolchain jobs expect (Node/npm, pipx)",
+        help="Provision the host with the toolchain jobs expect (Node/npm, pipx, gh)",
+    )
+    provision_p.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help=(
+            "Do not prompt for a password when the privileged steps escalate; "
+            "a missing password fails the provisioning instead"
+        ),
     )
 
     install_p = subparsers.add_parser(
@@ -131,7 +139,7 @@ def main(argv: list[str] | None = None) -> None:
     config = load_config(args.env_file)
 
     if args.command == "provision":
-        provision(config)
+        provision(config, non_interactive=args.non_interactive)
     elif args.command == "install":
         install(config, args.target_dir, version=args.version)
     elif args.command == "configure":
