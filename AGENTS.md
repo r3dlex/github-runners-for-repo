@@ -438,7 +438,12 @@ filled up. The rules now are:
   install path and the unit directory are confined to `SANDBOX_ROOT`
   (default `$TMPDIR/install-disk-cleanup-sandbox`), anything that
   resolves outside it is refused with a non-zero exit before a file is
-  touched, and the timer is neither enabled nor started.
+  touched, and the timer is neither enabled nor started. The check
+  canonicalizes `.` and `..` before the prefix test, including in a
+  component that does not exist yet, and refuses a symlink in
+  `SANDBOX_ROOT` or in a write path rather than following it. A path
+  that canonicalizes to a live systemd directory, the live install
+  path, or a live runner home is refused even in a sandbox.
 - **Without `SANDBOX`**, a run is either entirely **LIVE** (the live
   default for all three knobs) or entirely **ISOLATED** (its units go
   to a directory systemd does not read). A **mix is refused before

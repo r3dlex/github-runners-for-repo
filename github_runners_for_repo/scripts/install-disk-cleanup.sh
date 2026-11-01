@@ -57,7 +57,12 @@
 #     SANDBOX_ROOT (default: $TMPDIR/install-disk-cleanup-sandbox);
 #     anything that resolves outside it is refused with a non-zero exit
 #     before a single file is touched. The timer is not enabled and the
-#     routine is not started.
+#     routine is not started. Paths are canonicalized before the
+#     check — "." and ".." count even in a component that does not
+#     exist yet — and a symlink in SANDBOX_ROOT or in a write path is
+#     refused rather than followed. A path that canonicalizes to a
+#     live systemd directory, the live install path, or a live runner
+#     home is refused even in a sandbox.
 #   - Without SANDBOX, a run is either entirely LIVE (the live default
 #     for all three knobs) or entirely ISOLATED (its unit files go to a
 #     directory systemd does not read). A MIX is refused before anything
@@ -162,32 +167,128 @@ case "$SANDBOX" in
 esac
 SANDBOX_ROOT="${SANDBOX_ROOT:-${TMPDIR:-/tmp}/install-disk-cleanup-sandbox}"
 
+# Collapse "." and ".." without touching the filesystem.
+#
+# A missing component must not keep a later ".." from being resolved.
+# /sandbox/missing/../../victim is /victim, not a path under /sandbox.
+# Appending the missing tail unchanged made the string prefix check pass
+# and mkdir then created the missing component and followed "..".
+lexical_path() {
+  local input="$1" rest part
+  case "$input" in
+    /*) ;;
+    *) input="$PWD/$input" ;;
+  esac
+  local -a stack=()
+  rest="${input#/}"
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      */*)
+        part="${rest%%/*}"
+        rest="${rest#*/}"
+        ;;
+      *)
+        part="$rest"
+        rest=""
+        ;;
+    esac
+    case "$part" in
+      "" | .) ;;
+      ..)
+        if [ "${#stack[@]}" -gt 0 ]; then
+          stack=("${stack[@]:0:${#stack[@]}-1}")
+        fi
+        ;;
+      *) stack+=("$part") ;;
+    esac
+  done
+  if [ "${#stack[@]}" -eq 0 ]; then
+    printf '/'
+    return
+  fi
+  local joined="" item
+  for item in "${stack[@]}"; do
+    joined="${joined}/${item}"
+  done
+  printf '%s' "$joined"
+}
+
+# True when an existing component of the path is a symlink.
+#
+# The walk stops at the first component that does not exist, so a missing
+# tail cannot hide a symlink in the prefix. `-L` is tested before `-e`:
+# `-d` follows the link and would answer about the target.
+path_has_symlink() {
+  local target="$1" rest part current="/"
+  target="$(lexical_path "$target")"
+  rest="${target#/}"
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      */*)
+        part="${rest%%/*}"
+        rest="${rest#*/}"
+        ;;
+      *)
+        part="$rest"
+        rest=""
+        ;;
+    esac
+    [ -n "$part" ] || continue
+    if [ "$current" = "/" ]; then
+      current="/$part"
+    else
+      current="$current/$part"
+    fi
+    if [ -L "$current" ]; then
+      return 0
+    fi
+    if [ ! -e "$current" ]; then
+      return 1
+    fi
+  done
+  return 1
+}
+
 # The absolute, symlink-resolved form of a path, whether or not it exists.
 #
-# `readlink -f` is GNU-only, so the longest existing prefix is resolved
-# with cd+pwd -P and the missing tail is appended unchanged. A containment
-# check needs this: on macOS /tmp is a symlink to /private/tmp, and a
-# relative path must not slip past one.
+# "." and ".." are collapsed first, including in a tail that does not
+# exist yet. The longest existing prefix is then resolved with cd+pwd -P
+# (`readlink -f` is GNU-only) so a symlink in that prefix is visible to
+# the containment check. On macOS /tmp is a symlink to /private/tmp, and
+# a relative path must not slip past one.
 resolve_path() {
-  local target="$1" tail="" head
-  case "$target" in
-    /*) ;;
-    *) target="$PWD/$target" ;;
-  esac
-  while [ ! -d "$target" ]; do
+  local target tail="" head
+  target="$(lexical_path "$1")"
+  while [ ! -d "$target" ] || [ -L "$target" ]; do
     if [ "$target" = "/" ]; then break; fi
-    tail="/$(basename -- "$target")$tail"
-    target="$(dirname -- "$target")"
+    # A symlink is not a directory we want to cd into and lose: the
+    # physical target is appended as the new head below, via pwd -P,
+    # only when the component is a real directory. A symlink stops the
+    # walk so the caller can refuse it. `-d` follows, so test `-L` first.
+    if [ -L "$target" ]; then
+      break
+    fi
+    if [ ! -d "$target" ]; then
+      tail="/$(basename -- "$target")$tail"
+      target="$(dirname -- "$target")"
+      continue
+    fi
+    break
   done
-  if [ -d "$target" ]; then
+  if [ -d "$target" ] && [ ! -L "$target" ]; then
+    head="$(cd -- "$target" 2>/dev/null && pwd -P)" || head="$target"
+  elif [ -L "$target" ]; then
+    # Physicalize the symlink itself so a link to /etc is /etc, not the
+    # path that named the link. The containment check then sees the escape.
     head="$(cd -- "$target" 2>/dev/null && pwd -P)" || head="$target"
   else
     head="/"
   fi
   case "$head" in
-    /) printf '%s' "/${tail#/}" ;;
-    *) printf '%s' "${head%/}$tail" ;;
+    /) target="/${tail#/}" ;;
+    *) target="${head%/}$tail" ;;
   esac
+  lexical_path "$target"
 }
 
 # True when $1 is $2 or lives under it. Both sides must already have been
@@ -239,6 +340,65 @@ is_systemd_unit_dir() {
     esac
   done
   return 1
+}
+
+# True when the path is one the live fleet already uses.
+#
+# A sandbox run that canonicalizes onto one of these still writes the
+# live unit, the live script, or a live runner home. The string prefix
+# check does not see that when SANDBOX_ROOT itself was followed onto
+# the live tree.
+is_live_fleet_path() {
+  local path="$1" home resolved
+  resolved="$(resolve_path "$path")"
+  if is_systemd_unit_dir "$resolved"; then
+    return 0
+  fi
+  if [ "$resolved" = "$(resolve_path "$DEFAULT_INSTALL_PATH")" ]; then
+    return 0
+  fi
+  for home in $DEFAULT_RUNNER_HOMES; do
+    [ -n "$home" ] || continue
+    if [ "$resolved" = "$(resolve_path "$home")" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Refuse a sandbox write that would leave the sandbox or touch the live fleet.
+#
+# Called before anything is written, and again after a mkdir: creating
+# the missing component must not turn a path that escaped into one the
+# check now accepts.
+assert_sandbox_writes() {
+  local target resolved
+  [ "$SANDBOX" = "1" ] || return 0
+  if path_has_symlink "$SANDBOX_ROOT"; then
+    log "ERROR: SANDBOX_ROOT is a symlink or contains one ($SANDBOX_ROOT)."
+    log "ERROR: following it would make the containment root the live fleet."
+    exit 1
+  fi
+  for target in "$INSTALL_PATH" "$UNIT_DIR" "${RUNNER_HOME_LIST[@]:-}"; do
+    [ -n "$target" ] || continue
+    if path_has_symlink "$target"; then
+      log "ERROR: refusing a symlink in a sandbox path ($target)."
+      log "ERROR: a symlink is followed by mkdir and would write outside the sandbox."
+      exit 1
+    fi
+    resolved="$(resolve_path "$target")"
+    if ! path_under "$resolved" "$SANDBOX_ROOT_RESOLVED"; then
+      log "ERROR: SANDBOX=1, but $target resolves to $resolved,"
+      log "ERROR: which is outside the sandbox root $SANDBOX_ROOT_RESOLVED."
+      log "ERROR: refusing to touch anything outside the sandbox."
+      exit 1
+    fi
+    if is_live_fleet_path "$resolved"; then
+      log "ERROR: $target resolves to a live fleet path ($resolved)."
+      log "ERROR: a sandbox run must not write the live unit, the live script, or a live runner home."
+      exit 1
+    fi
+  done
 }
 
 # The runner homes as absolute, resolved paths, joined by a space.
@@ -303,6 +463,14 @@ if [ "$SANDBOX" = "1" ]; then
   SUDO=""
 fi
 
+# A symlinked sandbox root is refused before it is resolved. pwd -P
+# would follow it and then treat the target as the containment root,
+# so every "inside the sandbox" write would land on the live fleet.
+if [ "$SANDBOX" = "1" ] && path_has_symlink "$SANDBOX_ROOT"; then
+  log "ERROR: SANDBOX_ROOT is a symlink or contains one ($SANDBOX_ROOT)."
+  log "ERROR: following it would make the containment root the live fleet."
+  exit 1
+fi
 SANDBOX_ROOT_RESOLVED="$(resolve_path "$SANDBOX_ROOT")"
 
 if [ "$SANDBOX" = "1" ]; then
@@ -320,20 +488,10 @@ if [ "$SANDBOX" = "1" ]; then
   SERVICE_UNIT="$UNIT_DIR/runner-disk-cleanup.service"
   TIMER_UNIT="$UNIT_DIR/runner-disk-cleanup.timer"
   read -r -a RUNNER_HOME_LIST <<<"$RUNNER_HOMES"
+  # Check the paths as named, before they are rewritten to their physical
+  # form. A symlink is invisible once resolve_path has followed it.
+  assert_sandbox_writes
   normalize_runner_homes
-
-  # Fail closed: a sandbox run that reaches outside its root is refused
-  # before anything is touched.
-  for sandbox_target in "${RUNNER_HOME_LIST[@]:-}" "$INSTALL_PATH" "$UNIT_DIR"; do
-    [ -n "$sandbox_target" ] || continue
-    sandbox_target_resolved="$(resolve_path "$sandbox_target")"
-    if ! path_under "$sandbox_target_resolved" "$SANDBOX_ROOT_RESOLVED"; then
-      log "ERROR: SANDBOX=1, but $sandbox_target resolves to $sandbox_target_resolved,"
-      log "ERROR: which is outside the sandbox root $SANDBOX_ROOT_RESOLVED."
-      log "ERROR: refusing to touch anything outside the sandbox."
-      exit 1
-    fi
-  done
   log "sandbox mode: everything stays under $SANDBOX_ROOT_RESOLVED"
 else
   # SYSTEMD_UNIT_DIRS used to BE the live-directory list. A non-sandbox
@@ -493,7 +651,8 @@ as_user() {
 # runner home is just a proxy for it, and that proxy is wrong exactly in the
 # case this install exists to repair: a root-owned runner home.
 runner_service_user() {
-  local unit user
+  local runner_dir="${1:-}" unit user work
+  [ -n "$runner_dir" ] || return 1
   for unit in "$UNIT_DIR"/actions.runner.*.service; do
     [ -f "$unit" ] || continue
     user="$(sed -n 's/^User[[:space:]]*=[[:space:]]*//p' "$unit" 2>/dev/null | head -n 1)"
@@ -501,6 +660,12 @@ runner_service_user() {
     # A unit can name a user that does not exist on this host; that is not a
     # user to chown anything to.
     id "$user" >/dev/null 2>&1 || continue
+    # The first unit on the host is not this runner's unit. Two runners
+    # owned by different users would otherwise hand the first user's
+    # identity to every root-owned home.
+    work="$(sed -n 's/^WorkingDirectory[[:space:]]*=[[:space:]]*//p' "$unit" 2>/dev/null | head -n 1)"
+    [ -n "$work" ] || continue
+    [ "$(resolve_path "$work")" = "$(resolve_path "$runner_dir")" ] || continue
     printf '%s' "$user"
     return 0
   done
@@ -527,7 +692,7 @@ runner_owner_and_group() {
   group="$(dir_group "$runner_dir")"
   case "$owner" in
     root | 0)
-      svc_owner="$(runner_service_user || true)"
+      svc_owner="$(runner_service_user "$runner_dir" || true)"
       if [ -z "$svc_owner" ]; then
         log "WARN: $runner_dir is root-owned and no runner service unit names a user"
         return 1
@@ -582,12 +747,15 @@ install_units() {
   # A newline in the path is a new line in the unit file. Quoting does
   # not contain it: whatever follows the newline is a unit directive, so
   # the install is refused before a file is written.
+  # A newline is a new line in the unit file. A quote, backslash, percent,
+  # dollar or backtick breaks the ExecStart quoting or is a systemd
+  # specifier. The install is refused before a file is written.
   case "$INSTALL_PATH" in
-    *'
+    *'"'* | *"'"* | *'\'* | *'%'* | *'$'* | *'`'* | *'
 '*)
-      log "ERROR: INSTALL_PATH contains a newline ($INSTALL_PATH)"
-      log "ERROR: a newline would inject unit directives into ExecStart."
-      log "ERROR: install the routine at a path with no newline."
+      log "ERROR: INSTALL_PATH contains a character that would break ExecStart ($INSTALL_PATH)"
+      log "ERROR: a quote, backslash, percent, dollar, backtick or newline would split or inject the unit."
+      log "ERROR: install the routine at a path with none of those characters."
       exit 1
       ;;
   esac
@@ -665,8 +833,10 @@ fix_runner_ownership() {
     fi
 
     if ! owner_group="$(runner_owner_and_group "$runner_dir")"; then
-      log "WARN: the user that must own $runner_dir could not be determined; leaving it untouched"
-      continue
+      log "ERROR: the user that must own $runner_dir could not be determined"
+      log "ERROR: a root-owned runner home with no runner service unit is refused"
+      log "ERROR: the install will not guess, and it will not report success"
+      exit 1
     fi
     owner="${owner_group%% *}"
     group="${owner_group##* }"
@@ -717,9 +887,14 @@ verify_runner_writable() {
       continue
     fi
 
+    if [ "$SANDBOX" = "1" ]; then
+      assert_sandbox_writes
+    fi
     if ! owner_group="$(runner_owner_and_group "$runner_dir")"; then
-      log "WARN: skipping the write check for $runner_dir"
-      continue
+      log "ERROR: the user that must own $runner_dir could not be determined"
+      log "ERROR: a root-owned runner home with no runner service unit is refused"
+      log "ERROR: the install will not guess, and it will not report success"
+      exit 1
     fi
     owner="${owner_group%% *}"
 
@@ -900,11 +1075,15 @@ ensure_runner_path() {
 sandbox_prepare() {
   local runner_dir
   [ "$SANDBOX" = "1" ] || return 0
+  # Before mkdir, and again after: creating the missing component must
+  # not turn an escape into a path the check now accepts.
+  assert_sandbox_writes
   mkdir -p "$(dirname -- "$INSTALL_PATH")" "$UNIT_DIR"
   for runner_dir in "${RUNNER_HOME_LIST[@]:-}"; do
     [ -n "$runner_dir" ] || continue
     mkdir -p "$runner_dir"
   done
+  assert_sandbox_writes
 }
 
 # The install itself. Enabling the timer and running the routine once are

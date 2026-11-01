@@ -560,6 +560,91 @@ class TestInstallerSandbox:
         for home in homes:
             assert str(sandbox) in home, f"{home} must live inside the sandbox"
 
+    def test_sandbox_refuses_a_dotdot_escape(self, tmp_path: Path) -> None:
+        """A missing component must not hide ".." from the containment check.
+
+        /sandbox/missing/../../victim is /victim. The old resolver appended
+        the missing tail unchanged, the string prefix check passed, and
+        mkdir created the missing component and followed "..".
+        """
+        sandbox = tmp_path / "sandbox"
+        victim = tmp_path / "victim"
+        result = _installer(
+            {
+                "SANDBOX": "1",
+                "SANDBOX_ROOT": str(sandbox),
+                "UNIT_DIR": f"{sandbox}/missing/../../victim/units",
+                "INSTALL_PATH": f"{sandbox}/missing/../../victim/bin/runner-disk-cleanup.sh",
+                "RUNNER_HOMES": f"{sandbox}/missing/../../victim/runner",
+            },
+            'source "$INSTALLER"',
+        )
+
+        assert result.returncode != 0, (
+            "a sandbox path that canonicalizes outside the sandbox must be refused"
+        )
+        assert "sandbox" in result.stdout.lower(), result.stdout
+        assert not victim.exists(), "the escape must be refused before anything is created"
+
+    def test_sandbox_prepare_refuses_a_dotdot_escape(self, tmp_path: Path) -> None:
+        """The write itself re-checks. A path mutated after source must not mkdir out."""
+        sandbox = tmp_path / "sandbox"
+        victim = tmp_path / "victim"
+        result = _installer(
+            {"SANDBOX": "1", "SANDBOX_ROOT": str(sandbox)},
+            'source "$INSTALLER"; '
+            f'INSTALL_PATH="{sandbox}/missing/../../victim/bin/runner-disk-cleanup.sh"; '
+            f'UNIT_DIR="{sandbox}/missing/../../victim/units"; '
+            f'RUNNER_HOME_LIST=("{sandbox}/missing/../../victim/runner"); '
+            "sandbox_prepare",
+        )
+
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert not victim.exists(), "sandbox_prepare must not create the escaped path"
+
+    def test_sandbox_refuses_a_symlinked_root(self, tmp_path: Path) -> None:
+        """A symlinked SANDBOX_ROOT must not become the containment root."""
+        target = tmp_path / "victim"
+        target.mkdir()
+        link = tmp_path / "sandbox-link"
+        link.symlink_to(target)
+
+        result = _installer(
+            {"SANDBOX": "1", "SANDBOX_ROOT": str(link)},
+            'source "$INSTALLER"',
+        )
+
+        assert result.returncode != 0, "a symlinked sandbox root must be refused"
+        assert "symlink" in result.stdout.lower(), result.stdout
+        assert not (target / "bin").exists()
+        assert not (target / "systemd").exists()
+
+    def test_a_dotdot_unit_dir_is_not_treated_as_isolated(self, tmp_path: Path) -> None:
+        """A non-sandbox UNIT_DIR that canonicalizes onto systemd is live.
+
+        The old resolver left the ".." in the missing tail, so
+        is_systemd_unit_dir answered false and the run was accepted as
+        isolated.
+        """
+        missing = tmp_path / "missing"
+        ups = len(missing.parts) - 1
+        unit = missing.joinpath(*([".."] * ups), "etc", "systemd", "system")
+
+        result = _installer(
+            {
+                "UNIT_DIR": str(unit),
+                "INSTALL_PATH": str(tmp_path / "bin" / "runner-disk-cleanup.sh"),
+                "RUNNER_HOMES": str(tmp_path / "runner"),
+            },
+            'source "$INSTALLER"',
+        )
+
+        assert result.returncode != 0, (
+            f"{unit} canonicalizes to a live systemd directory and must be refused, "
+            f"got {result.stdout}"
+        )
+        assert "systemd" in result.stdout.lower() or "live" in result.stdout.lower(), result.stdout
+
     def test_overriding_only_the_install_path_does_not_touch_the_live_runners(
         self, tmp_path: Path
     ) -> None:
@@ -951,10 +1036,12 @@ class TestRunnerOwnerDerivation:
     ) -> subprocess.CompletedProcess[str]:
         unit_dir = tmp_path / "units"
         unit_dir.mkdir(exist_ok=True)
-        if unit_user is not None:
-            (unit_dir / "actions.runner.test.service").write_text(f"[Service]\nUser={unit_user}\n")
         runner_home = tmp_path / "runner"
         runner_home.mkdir(exist_ok=True)
+        if unit_user is not None:
+            (unit_dir / "actions.runner.test.service").write_text(
+                f"[Service]\nUser={unit_user}\nWorkingDirectory={runner_home}\n"
+            )
         env = os.environ.copy()
         env.update(
             {
@@ -1022,9 +1109,11 @@ class TestRunnerOwnerDerivation:
         current_user = subprocess.run(
             ["id", "-un"], capture_output=True, text=True, check=True
         ).stdout.strip()
-        (unit_dir / "actions.runner.test.service").write_text(f"[Service]\nUser = {current_user}\n")
         runner_home = tmp_path / "runner"
         runner_home.mkdir(exist_ok=True)
+        (unit_dir / "actions.runner.test.service").write_text(
+            f"[Service]\nUser = {current_user}\nWorkingDirectory={runner_home}\n"
+        )
         env = os.environ.copy()
         env.update(
             {
@@ -1034,7 +1123,7 @@ class TestRunnerOwnerDerivation:
                 "INSTALLER": str(INSTALLER),
             }
         )
-        script = 'source "$INSTALLER"; runner_service_user'
+        script = 'source "$INSTALLER"; runner_service_user "$RUNNER_HOMES"'
         result = subprocess.run(
             ["bash", "-c", script],
             env=env,
@@ -1043,6 +1132,69 @@ class TestRunnerOwnerDerivation:
             check=False,
         )
         assert result.stdout.strip() == current_user
+
+    def test_runner_service_user_is_the_unit_for_that_home(self, tmp_path: Path) -> None:
+        """The first unit on the host is not every runner's unit."""
+        unit_dir = tmp_path / "units"
+        unit_dir.mkdir()
+        home = tmp_path / "runner-b"
+        home.mkdir()
+        other = tmp_path / "runner-a"
+        other.mkdir()
+        (unit_dir / "actions.runner.a.service").write_text(
+            f"[Service]\nUser=alice\nWorkingDirectory={other}\n"
+        )
+        (unit_dir / "actions.runner.b.service").write_text(
+            f"[Service]\nUser=bob\nWorkingDirectory={home}\n"
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "RUNNER_HOMES": str(home),
+                "UNIT_DIR": str(unit_dir),
+                "INSTALL_PATH": str(tmp_path / "verify" / "runner-disk-cleanup.sh"),
+                "INSTALLER": str(INSTALLER),
+                "HOME_UNDER_TEST": str(home),
+            }
+        )
+        script = 'source "$INSTALLER"; id() { return 0; }; runner_service_user "$HOME_UNDER_TEST"'
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip().splitlines()[-1] == "bob", (
+            f"the unit whose WorkingDirectory is the runner home must win, got {result.stdout}"
+        )
+
+    def test_an_existing_root_owned_home_without_a_unit_fails_the_install(
+        self, tmp_path: Path
+    ) -> None:
+        """The install itself refuses. Returning 1 from the helper is not enough
+        if the caller warns and continues and then reports success.
+        """
+        runner = tmp_path / "runner"
+        runner.mkdir()
+        result = _installer(
+            {
+                "RUNNER_HOMES": str(runner),
+                "INSTALL_PATH": str(tmp_path / "bin" / "runner-disk-cleanup.sh"),
+                "UNIT_DIR": str(tmp_path / "units"),
+            },
+            'source "$INSTALLER"; '
+            "dir_owner() { echo root; }; "
+            "dir_group() { echo root; }; "
+            "fix_runner_ownership",
+        )
+
+        assert result.returncode != 0, (
+            "an existing root-owned home with no unit must fail the install"
+        )
+        assert "root-owned" in result.stdout
 
 
 class TestInUseSnapshot:
@@ -2124,6 +2276,33 @@ class TestUnitFileWrite:
         assert "INSTALL_PATH" in result.stdout, (
             f"the refusal has to name the path, got {result.stdout}"
         )
+        assert not service.exists(), "a refused install must not write the unit file"
+
+    def test_an_install_path_with_a_quote_is_refused(self, tmp_path: Path) -> None:
+        """A quote in the install path must not split ExecStart."""
+        unit_dir = tmp_path / "units"
+        unit_dir.mkdir()
+        install_path = f'{tmp_path}/verify/foo"bar/runner-disk-cleanup.sh'
+        env = os.environ.copy()
+        env.update(
+            {
+                "RUNNER_HOMES": str(tmp_path / "actions-runner-linux"),
+                "INSTALL_PATH": install_path,
+                "UNIT_DIR": str(unit_dir),
+                "INSTALLER": str(INSTALLER),
+            }
+        )
+        result = subprocess.run(
+            ["bash", "-c", 'source "$INSTALLER"; SUDO=""; install_units'],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        service = unit_dir / "runner-disk-cleanup.service"
+        assert result.returncode != 0, "a quote in INSTALL_PATH must be refused"
+        assert "INSTALL_PATH" in result.stdout, result.stdout
         assert not service.exists(), "a refused install must not write the unit file"
 
 
